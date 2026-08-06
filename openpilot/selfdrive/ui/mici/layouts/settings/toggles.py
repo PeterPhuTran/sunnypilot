@@ -21,6 +21,9 @@ class TogglesLayoutMici(NavScroller):
     record_front = BigParamControl("record & upload driver camera", "RecordFront", toggle_callback=restart_needed_callback)
     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
     enable_openpilot = BigParamControl("enable sunnypilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
+    blind_spot = BigParamControl("blind spot warnings", "BlindSpot")
+    vision_bsm = BigParamControl("camera blind spot monitor", "VisionBsm", toggle_callback=restart_needed_callback)
+    blind_spot_camera = BigParamControl("blind spot camera view", "BlindSpotCamera")
 
     self._scroller.add_widgets([
       self._personality_toggle,
@@ -28,6 +31,9 @@ class TogglesLayoutMici(NavScroller):
       is_metric_toggle,
       ldw_toggle,
       always_on_dm_toggle,
+      blind_spot,
+      vision_bsm,
+      blind_spot_camera,
       record_front,
       record_mic,
       enable_openpilot,
@@ -39,10 +45,16 @@ class TogglesLayoutMici(NavScroller):
       ("IsMetric", is_metric_toggle),
       ("IsLdwEnabled", ldw_toggle),
       ("AlwaysOnDM", always_on_dm_toggle),
+      ("BlindSpot", blind_spot),
+      ("VisionBsm", vision_bsm),
+      ("BlindSpotCamera", blind_spot_camera),
       ("RecordFront", record_front),
       ("RecordAudio", record_mic),
       ("OpenpilotEnabledToggle", enable_openpilot),
     )
+
+    # the camera view is only meaningful once the detector is running
+    blind_spot_camera.set_enabled(lambda: ui_state.params.get_bool("VisionBsm"))
 
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
     record_front.set_enabled(False if ui_state.params.get_bool("RecordFrontLock") else (lambda: not ui_state.engaged))

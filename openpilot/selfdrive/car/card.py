@@ -71,7 +71,7 @@ class Car:
 
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
-    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'])
+    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP', 'visionBlindspotSP'])
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'liveTracks'] + ['carParamsSP', 'carStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
@@ -222,6 +222,12 @@ class Car:
     # TODO: mirror the carState.cruiseState struct?
     CS.vCruise = float(self.v_cruise_helper.v_cruise_kph)
     CS.vCruiseCluster = float(self.v_cruise_helper.v_cruise_cluster_kph)
+
+    # a camera detected blind spot reads exactly like a factory one, so the
+    # indicator, the chime and the lane change logic all pick it up unchanged
+    if self.sm.alive['visionBlindspotSP'] and self.sm.valid['visionBlindspotSP']:
+      CS.leftBlindspot = CS.leftBlindspot or self.sm['visionBlindspotSP'].left
+      CS.rightBlindspot = CS.rightBlindspot or self.sm['visionBlindspotSP'].right
 
     return CS, CS_SP, RD
 

@@ -193,8 +193,9 @@ class UIStateSP:
       if not CP.alphaLongitudinalAvailable:
         self.params.remove("AlphaLongitudinalEnabled")
 
-      # BSM not available: clear BSM-dependent settings
-      if not CP.enableBsm:
+      # BSM not available: clear BSM-dependent settings. The camera blind spot
+      # monitor feeds the same carState fields, so it counts as available too.
+      if not CP.enableBsm and not self.params.get_bool("VisionBsm"):
         self.params.remove("AutoLaneChangeBsmDelay")
     else:
       # No CarParams: clear all car-dependent params as safety default

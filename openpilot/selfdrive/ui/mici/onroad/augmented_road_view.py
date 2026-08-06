@@ -15,6 +15,7 @@ from openpilot.system.ui.lib.application import FontWeight, gui_app, MousePos, M
 from openpilot.system.ui.widgets.label import UnifiedLabel
 from openpilot.system.ui.widgets import Widget
 from openpilot.common.filter_simple import BounceFilter
+from openpilot.common.params import Params
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
 from enum import IntEnum
@@ -27,6 +28,8 @@ OpState = log.SelfdriveState.OpenpilotState
 CALIBRATED = log.LiveCalibrationData.Status.calibrated
 ROAD_CAM = VisionStreamType.VISION_STREAM_ROAD
 WIDE_CAM = VisionStreamType.VISION_STREAM_WIDE_ROAD
+DRIVER_CAM = VisionStreamType.VISION_STREAM_DRIVER
+BSM_PARAM_INTERVAL = 2.0  # seconds between blind spot camera param reads
 DEFAULT_DEVICE_CAMERA = DEVICE_CAMERAS["tici", "ar0231"]
 
 
@@ -163,6 +166,54 @@ class AugmentedRoadView(CameraView):
 
     self._fade_texture = gui_app.texture("icons_mici/onroad/onroad_fade.png")
 
+    # blind spot camera view
+    self._params = Params()
+    self._bsm_zone: tuple[float, float, float, float] | None = None
+    self._bsm_left = True
+    self._bsm_zones: dict = {}
+    self._bsm_enabled = False
+    self._bsm_params_checked = 0.0
+
+  def _refresh_bsm_params(self):
+    now = rl.get_time()
+    if now - self._bsm_params_checked < BSM_PARAM_INTERVAL:
+      return
+    self._bsm_params_checked = now
+    self._bsm_enabled = self._params.get_bool("BlindSpotCamera") and self._params.get_bool("VisionBsm")
+    self._bsm_zones = self._params.get("VisionBsmZones") or {} if self._bsm_enabled else {}
+
+  def _bsm_bounds(self, side: str) -> tuple[float, float, float, float] | None:
+    """Bounding box of a side's calibrated polygons, as (x, y, w, h) in 0..1."""
+    xs, ys = [], []
+    for polygon in self._bsm_zones.get(side, []):
+      for point in polygon:
+        if len(point) == 2:
+          xs.append(float(point[0]))
+          ys.append(float(point[1]))
+    if not xs:
+      return None
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    if x1 <= x0 or y1 <= y0:
+      return None
+    return x0, y0, x1 - x0, y1 - y0
+
+  def _update_bsm(self) -> bool:
+    """The signalled side's window takes the whole screen while that blinker is on."""
+    self._refresh_bsm_params()
+    if not self._bsm_enabled:
+      self._bsm_zone = None
+      return False
+
+    CS = ui_state.sm['carState']
+    left, right = CS.leftBlinker, CS.rightBlinker
+    if left == right:  # neither, or hazards
+      self._bsm_zone = None
+      return False
+
+    self._bsm_left = left
+    self._bsm_zone = self._bsm_bounds("left" if left else "right")
+    return self._bsm_zone is not None
+
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""
     return self._bookmark_icon.is_swiping_left()
@@ -190,6 +241,7 @@ class AugmentedRoadView(CameraView):
       self._offroad_label.render(self._rect)
       return
 
+    blind_spot_view = self._update_bsm()
     self._switch_stream_if_needed(ui_state.sm)
 
     # Update calibration before rendering
@@ -215,8 +267,10 @@ class AugmentedRoadView(CameraView):
     # Render the base camera view
     super()._render(self._content_rect)
 
-    # Draw all UI overlays
-    self._model_renderer.render(self._content_rect)
+    # Draw all UI overlays. The driving path makes no sense drawn over a view out
+    # of a side window, but alerts still have to reach the driver.
+    if not blind_spot_view:
+      self._model_renderer.render(self._content_rect)
 
     # Fade out bottom of overlays for looks
     rl.draw_texture_ex(self._fade_texture, rl.Vector2(self._content_rect.x, self._content_rect.y), 0.0, 1.0, rl.WHITE)
@@ -249,6 +303,11 @@ class AugmentedRoadView(CameraView):
     self._bookmark_icon.render(self.rect)
 
   def _switch_stream_if_needed(self, sm):
+    if self._bsm_zone is not None and DRIVER_CAM in self.available_streams:
+      if self.stream_type != DRIVER_CAM:
+        self.switch_stream(DRIVER_CAM)
+      return
+
     if sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
       v_ego = sm['carState'].vEgo
       if v_ego < WIDE_CAM_MAX_SPEED:
@@ -288,6 +347,27 @@ class AugmentedRoadView(CameraView):
       self.view_from_wide_calib = view_frame_from_device_frame @ wide_from_device @ device_from_calib
 
   def _calc_frame_matrix(self, rect: rl.Rectangle) -> np.ndarray:
+    # blind spot view: magnify the driver frame until only the signalled window is left
+    if self._bsm_zone is not None and self.stream_type == DRIVER_CAM and self.frame:
+      x0, y0, w, h = self._bsm_zone
+      zx, zy = 1.0 / w, 1.0 / h
+
+      # keep the crop's real shape rather than stretching it to the screen
+      zone_ratio = (w * self.frame.width) / (h * self.frame.height)
+      rect_ratio = rect.width / rect.height
+      if zone_ratio < rect_ratio:
+        zx *= zone_ratio / rect_ratio
+      else:
+        zy *= rect_ratio / zone_ratio
+
+      # the driver stream is drawn mirrored, so x is measured from the far side
+      cx, cy = x0 + w / 2, y0 + h / 2
+      return np.array([
+        [zx, 0.0, zx * (2.0 * cx - 1.0)],
+        [0.0, zy, zy * (1.0 - 2.0 * cy)],
+        [0.0, 0.0, 1.0],
+      ])
+
     cache_key = (
       ui_state.sm.recv_frame['liveCalibration'],
       int(self._content_rect.width),

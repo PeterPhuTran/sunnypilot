@@ -19,6 +19,9 @@ WEBCAM = os.getenv("USE_WEBCAM") is not None
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
 
+def vision_bsm(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and params.get_bool("VisionBsm")
+
 def notcar(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and CP.notCar
 
@@ -181,6 +184,9 @@ procs += [
 
   # Backup
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
+
+  # Vision blind spot monitor
+  PythonProcess("visionbsmd", "openpilot.sunnypilot.vision_bsm", vision_bsm),
 
   # mapd
   NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),
