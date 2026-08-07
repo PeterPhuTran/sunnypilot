@@ -21,6 +21,7 @@ class TogglesLayoutMici(NavScroller):
     record_front = BigParamControl("record & upload driver camera", "RecordFront", toggle_callback=restart_needed_callback)
     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
     enable_openpilot = BigParamControl("enable sunnypilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
+    mads = BigParamControl("modular assistive driving (MADS)", "Mads", toggle_callback=restart_needed_callback)
     blind_spot = BigParamControl("blind spot warnings", "BlindSpot")
     vision_bsm = BigParamControl("camera blind spot monitor", "VisionBsm", toggle_callback=restart_needed_callback)
     blind_spot_camera = BigParamControl("blind spot camera view", "BlindSpotCamera")
@@ -31,6 +32,7 @@ class TogglesLayoutMici(NavScroller):
       is_metric_toggle,
       ldw_toggle,
       always_on_dm_toggle,
+      mads,
       blind_spot,
       vision_bsm,
       blind_spot_camera,
@@ -45,6 +47,7 @@ class TogglesLayoutMici(NavScroller):
       ("IsMetric", is_metric_toggle),
       ("IsLdwEnabled", ldw_toggle),
       ("AlwaysOnDM", always_on_dm_toggle),
+      ("Mads", mads),
       ("BlindSpot", blind_spot),
       ("VisionBsm", vision_bsm),
       ("BlindSpotCamera", blind_spot_camera),
