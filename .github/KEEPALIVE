@@ -1,0 +1,5 @@
+Scheduled workflows in a fork are disabled after 60 days without
+repository activity. This file is touched monthly so the daily
+vbsm rebase keeps running.
+
+last touched: 2026-08-07
