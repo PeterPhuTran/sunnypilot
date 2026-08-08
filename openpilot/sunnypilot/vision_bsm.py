@@ -17,7 +17,8 @@ Two detectors run together, because each fails where the other works:
           background, which is exactly the car you must not miss.
   model   YOLOv10n over ONNX Runtime on the CPU. Sees parked and pacing cars
           that motion cannot, and can tell a car from a shadow. Costs ~450 ms
-          per zone on this device, so only one zone is checked at a time.
+          per scale on this device and runs two scales, so only one zone is
+          checked at a time and the side being signalled goes first.
 
 The model runs on the CPU on purpose. The GPU belongs to modeld at 20Hz and a
 blind spot monitor must never compete with the model that drives the car.
@@ -80,12 +81,29 @@ WARMUP_FRAMES = 20
 # model
 MODEL_NET = 640
 MODEL_THREADS = 2
-MODEL_SCORE = 0.25
+# Measured against 36 hand labelled windows from a real drive (18 with a
+# vehicle, 18 empty). A single crop at 0.30 padding found less than half the
+# cars, and a third of them scored exactly zero - invisible, not merely below
+# threshold - so no amount of threshold tuning could recover them.
+#
+# The two paddings fail on different cars and agree on the easy ones. A car
+# filling the window needs the tight crop; a car with room around it needs the
+# wide one. Running both and taking the best took recall from 0.44 to 0.83 at a
+# precision of 0.94, for the cost of a second inference.
+# Measured through this exact code path on 36 labelled windows. 0.20 was the
+# highest confidence any empty window reached, so it warns on 13 of 18 cars and
+# never on an empty road. 0.15 catches 16 of 18 but cried wolf 3 times, and a
+# chime that fires on empty road is one the driver learns to ignore. Repeated
+# sampling favours precision too: while signalling each side is rechecked twice
+# a second and a hit is held for MODEL_HOLD, so a car missed on one pass is
+# usually caught on the next, whereas one false hit warns for 2.5s.
+# Override with "model_score" in the config after a drive.
+MODEL_SCORE_DEFAULT = 0.20
+# collect scores down to here so the daemon's own numbers can be swept against
+# labels; only the threshold decides whether a warning is raised
+MODEL_FLOOR = 0.02
 MODEL_HOLD = 2.5           # a confirmed vehicle stays raised this long
-# Generous context around the window: the model scores a car in the next lane
-# roughly three times higher at 0.30 than at 0.06, because it can see what
-# surrounds the car rather than just the car.
-MODEL_PAD = 0.30
+MODEL_PADS = (0.0, 0.30)
 MODEL_GREY = 114
 # Fraction of a detection box that must lie on the traced glass to count. Real
 # traffic measured 55-83%; the driver and the ego car's own interior, which the
@@ -167,7 +185,7 @@ class SideState:
     return now - self.last_positive < HOLD_TIME
 
 
-def polygon_bbox(polygons, pad=MODEL_PAD):
+def polygon_bbox(polygons, pad):
   points = [p for polygon in polygons for p in polygon]
   xs = [p[0] for p in points]
   ys = [p[1] for p in points]
@@ -205,10 +223,11 @@ def nv12_to_rgb(buf, box):
 class ModelDetector:
   """YOLOv10n on the CPU. Absent or broken, the daemon runs on motion alone."""
 
-  def __init__(self, model_path=MODEL_PATH):
+  def __init__(self, model_path=MODEL_PATH, threshold=MODEL_SCORE_DEFAULT):
     self.session = None
     self.input_name = None
     self.masks = {}
+    self.threshold = threshold
     if SITE_PACKAGES not in sys.path:
       sys.path.append(SITE_PACKAGES)
     try:
@@ -246,8 +265,8 @@ class ModelDetector:
       mask = np.array(img, dtype=bool)
       self.masks[key] = mask
       # geometry only changes when the zones are re-traced, so never grow past
-      # the two sides currently in play
-      if len(self.masks) > 4:
+      # one entry per side per scale
+      if len(self.masks) > 2 * len(MODEL_PADS):
         self.masks = {key: mask}
     return mask
 
@@ -264,30 +283,59 @@ class ModelDetector:
     return float(mask[y0:y1, x0:x1].mean())
 
   def prepare(self, buf, side, polygons):
-    """Cut the crop out of the shared camera buffer, on the sampling thread.
+    """Cut the crops out of the shared camera buffer, on the sampling thread.
 
     This has to happen here rather than in the worker: the VisionIPC buffer is
     recycled as soon as the next frame arrives, so handing one to another thread
     would race. nv12_to_rgb copies, so what the worker gets is its own.
+
+    Returns one (crop, mask) per padding - see MODEL_PADS for why there is more
+    than one.
     """
-    x0, y0, x1, y1 = polygon_bbox(polygons)
-    box = (int(x0 * buf.width), int(y0 * buf.height),
-           int(x1 * buf.width), int(y1 * buf.height))
-    crop = nv12_to_rgb(buf, box)
-    if crop is None:
-      return None, None
-    mask = self._mask_for(side, polygons, box, crop.shape[:2], (buf.width, buf.height))
-    return crop, mask
+    jobs = []
+    for pad in MODEL_PADS:
+      x0, y0, x1, y1 = polygon_bbox(polygons, pad)
+      box = (int(x0 * buf.width), int(y0 * buf.height),
+             int(x1 * buf.width), int(y1 * buf.height))
+      crop = nv12_to_rgb(buf, box)
+      if crop is None:
+        continue
+      mask = self._mask_for(side, polygons, box, crop.shape[:2], (buf.width, buf.height))
+      jobs.append((crop, mask))
+    return jobs
 
   def detect(self, buf, side, polygons):
     """(vehicle_seen, person_on_the_glass) for one window - synchronous."""
-    crop, mask = self.prepare(buf, side, polygons)
-    if crop is None:
+    jobs = self.prepare(buf, side, polygons)
+    if not jobs:
       return False, False
-    return self.infer(crop, mask)
+    return self.infer(jobs)
 
-  def infer(self, crop, mask):
-    """(vehicle_seen, person_on_the_glass); safe to call off the main thread."""
+  def infer(self, jobs):
+    """(vehicle_seen, person_on_the_glass) across every scale; thread safe."""
+    score, person = self.score(jobs)
+    return score >= self.threshold, person
+
+  def score(self, jobs):
+    """(best vehicle score on the glass, person_on_the_glass) across scales.
+
+    Kept separate from the threshold so the daemon's own numbers can be
+    measured against labels, rather than measuring a reimplementation of it and
+    hoping the two agree - they did not, the first time this was checked.
+
+    Best-of rather than agreement: the paddings are complementary, so requiring
+    both would discard exactly the cars only one of them can see.
+    """
+    best = 0.0
+    person = False
+    for crop, mask in jobs:
+      s, p = self._infer_one(crop, mask)
+      best = max(best, s)
+      person = person or p
+    return best, person
+
+  def _infer_one(self, crop, mask):
+    """One crop through the model, filtered to detections on the glass."""
     img = Image.fromarray(crop)
     scale = min(MODEL_NET / img.width, MODEL_NET / img.height)
     new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
@@ -302,10 +350,11 @@ class ModelDetector:
     # YOLOv10 is NMS free: (1, 300, 6) of x0,y0,x1,y1,score,class, score sorted
     out = self.session.run(None, {self.input_name: arr})[0][0]
 
-    vehicle = person = False
+    best = 0.0
+    person = False
     for det in out:
       score = float(det[4])
-      if score < MODEL_SCORE:
+      if score < MODEL_FLOOR:
         break                                  # sorted, so nothing below matters
       cls = int(det[5])
       if cls not in VEHICLE_CLASSES and cls != PERSON_CLASS:
@@ -316,10 +365,10 @@ class ModelDetector:
       if self._inside_fraction(mask, det_box) < MODEL_INSIDE:
         continue                               # the driver, or our own bodywork
       if cls == PERSON_CLASS:
-        person = True
+        person = person or score >= self.threshold
       else:
-        vehicle = True
-    return vehicle, person
+        best = max(best, score)
+    return best, person
 
 
 class ModelWorker:
@@ -352,11 +401,11 @@ class ModelWorker:
     self.wake.set()
     self.thread.join(timeout=5.0)
 
-  def submit(self, side, crop, mask):
+  def submit(self, side, jobs):
     with self.lock:
       if self.busy:
         return False
-      self.pending = (side, crop, mask)
+      self.pending = (side, jobs)
       self.busy = True
     self.wake.set()
     return True
@@ -379,9 +428,9 @@ class ModelWorker:
           self.busy = False
         continue
 
-      side, crop, mask = job
+      side, jobs = job
       try:
-        vehicle, person = self.model.infer(crop, mask)
+        vehicle, person = self.model.infer(jobs)
       except Exception:
         cloudlog.exception("vision_bsm: model inference failed")
         vehicle = person = False
@@ -444,10 +493,10 @@ class Detector:
       state = self.states[side]
       if now - state.last_model_run < self._model_interval(side, blinkers):
         continue
-      crop, mask = self.model.prepare(buf, side, self.polygons[side])
-      if crop is None:
+      jobs = self.model.prepare(buf, side, self.polygons[side])
+      if not jobs:
         return
-      if self.worker.submit(side, crop, mask):
+      if self.worker.submit(side, jobs):
         state.last_model_run = now
         self.next_side = "left" if side == "right" else "right"
       return
@@ -517,7 +566,14 @@ def read_config():
       if not polygons:
         return None
       zones[side] = polygons
-    return {"zones": zones, "fusion": config.get("fusion", FUSION_DEFAULT)}
+    try:
+      threshold = float(config.get("model_score", MODEL_SCORE_DEFAULT))
+    except (TypeError, ValueError):
+      threshold = MODEL_SCORE_DEFAULT
+    if not 0.0 < threshold < 1.0:
+      threshold = MODEL_SCORE_DEFAULT
+    return {"zones": zones, "fusion": config.get("fusion", FUSION_DEFAULT),
+            "model_score": threshold}
   except (KeyError, TypeError, ValueError):
     return None
 
@@ -567,8 +623,10 @@ def vision_bsm_thread():
           if not model.available and fusion == "model":
             fusion = "motion"
             cloudlog.warning("vision_bsm: no model, falling back to motion only")
+          model.threshold = config["model_score"]
           detector = Detector(config["zones"], model, fusion)
-          cloudlog.info(f"vision_bsm: zones loaded, fusion={fusion}")
+          cloudlog.info(f"vision_bsm: zones loaded, fusion={fusion}, "
+                        f"score={model.threshold}")
         left = right = False
       last_config_check = now
 
