@@ -257,7 +257,17 @@ class AugmentedRoadView(CameraView):
       self._bsm_zone = None
       return False
 
-    CS = ui_state.sm['carState']
+    # Only trust the blinker while carState is actually flowing. During the
+    # memory-exhaustion drive the comms broke down, SubMaster kept returning the
+    # last message it ever got, and a frozen leftBlinker=True held the driver
+    # camera on screen long after the signal ended. When in doubt, show the
+    # road, not the window.
+    sm = ui_state.sm
+    if not (sm.alive['carState'] and sm.valid['carState']):
+      self._bsm_zone = None
+      return False
+
+    CS = sm['carState']
     left, right = CS.leftBlinker, CS.rightBlinker
     if left == right:  # neither, or hazards
       self._bsm_zone = None
