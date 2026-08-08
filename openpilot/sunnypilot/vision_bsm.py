@@ -46,6 +46,7 @@ CONFIG_PATH: {"enabled": bool, "camera_view": bool,
 STATE_PATH:  {"left": bool, "right": bool, "night": bool, "model": bool,
               "ts": <CLOCK_BOOTTIME seconds>}
 """
+import gc
 import json
 import os
 import sys
@@ -58,7 +59,6 @@ from msgq.visionipc import VisionIpcClient, VisionStreamType
 from PIL import Image, ImageDraw
 
 import openpilot.cereal.messaging as messaging
-from openpilot.common.realtime import Priority, config_realtime_process
 from openpilot.common.swaglog import cloudlog
 
 CONFIG_PATH = "/data/vision_bsm.json"
@@ -248,6 +248,10 @@ class ModelDetector:
       opts = ort.SessionOptions()
       opts.intra_op_num_threads = MODEL_THREADS
       opts.inter_op_num_threads = 1
+      # The arena keeps inference workspace allocated between calls. Measured,
+      # it costs 19 MB and saves nothing - 196 ms per inference either way - and
+      # this device has run out of memory mid-drive, so it goes.
+      opts.enable_cpu_mem_arena = False
       # ORT_ENABLE_ALL fuses a QuickGelu kernel that throws "GetElementType is
       # not implemented" on this build, and a throwing inference is a missed
       # car. EXTENDED keeps the optimizations that matter without that fusion.
@@ -431,6 +435,18 @@ class ModelWorker:
       return dict(self.results)
 
   def _run(self):
+    # A thread inherits the scheduling policy of whoever created it, so say
+    # plainly that the expensive half of this daemon is the lowest priority
+    # thing on the device. If anything else wants the CPU, it gets it.
+    try:
+      os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+    except (OSError, AttributeError, ValueError):
+      pass
+    try:
+      os.nice(10)
+    except OSError:
+      pass
+
     while self.running:
       self.wake.wait()
       self.wake.clear()
@@ -611,16 +627,31 @@ def publish(left, right, night=False, model=False):
 
 
 def vision_bsm_thread():
-  # Pinning to a big core fails with EINVAL whenever that core is offline, which
-  # is how the device sits while parked. Not worth dying over: run unpinned.
+  # Deliberately NOT config_realtime_process. That helper disables the garbage
+  # collector, raises the process to SCHED_FIFO and pins it to one core - all
+  # reasonable for the cheap background-subtraction loop this used to be, and all
+  # harmful now that it runs a CNN.
+  #
+  # A drive reported the device running out of memory and openpilot dropping out
+  # with take-control alerts. Both follow from those settings: this loop
+  # allocates numpy arrays and PIL images every cycle, so a disabled collector
+  # lets cycles accumulate, and two threads of 640x640 inference at realtime
+  # priority on a single core preempt whatever openpilot needs on it.
+  #
+  # Nothing here is safety critical - it raises a warning, it does not steer - so
+  # it runs at normal priority, unpinned, and yields to everything that matters.
+  gc.enable()
   try:
-    config_realtime_process(5, Priority.CTRL_LOW)
+    os.nice(10)
   except OSError:
-    cloudlog.warning("vision_bsm: could not pin to core 5, running unpinned")
+    pass
 
   client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_DRIVER, True)
   sm = messaging.SubMaster(['carState'])
-  model = ModelDetector()
+  # Loaded on first use, not here: the model and its runtime cost ~100 MB, and
+  # building them up front meant switching the mod off in settings left every
+  # byte of it resident. Off should mean off.
+  model = None
   detector = None
   connected = False
   config = None
@@ -639,6 +670,8 @@ def vision_bsm_thread():
         if config is None:
           detector = None
         else:
+          if model is None:
+            model = ModelDetector()
           # without the model nothing would ever raise a warning in "model"
           # mode, so fall back to motion rather than going silently blind
           fusion = config["fusion"]
@@ -691,7 +724,7 @@ def vision_bsm_thread():
       right = detector.combine("right", motion_right, now)
 
     if now - last_publish > 1.0 / PUBLISH_RATE:
-      publish(left, right, detector.night, model.available)
+      publish(left, right, detector.night, model is not None and model.available)
       last_publish = now
 
 
