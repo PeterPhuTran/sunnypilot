@@ -23,16 +23,22 @@ Two detectors run together, because each fails where the other works:
 The model runs on the CPU on purpose. The GPU belongs to modeld at 20Hz and a
 blind spot monitor must never compete with the model that drives the car.
 
-Occupants are rejected by geometry, not by blanking pixels. The crop around a
-window also contains the driver, whom the model reports as a person in nearly
-every frame, and the car's own interior, which it reports as a car. Blanking
-everything outside the traced glass removes both, but it also removes the
-surroundings the model needs to recognise a car at all - measured on real
-frames, masking took a confident 0.71 detection down to nothing. So the model
-gets the full crop with generous context, and a detection only counts when
-enough of its box lies on the glass. On recorded frames that dropped 41 of 41
-occupant boxes and every ego-car box (all at 8% inside or less) while keeping
-the real traffic, which sits at 55-83%.
+What the model reports has to be filtered by where it is, not by blanking
+pixels. The crop around a window also contains the driver, whom it reports as a
+person in nearly every frame, and the car's own interior, which it reports as a
+car - correctly, that is what it is. Blanking everything outside the traced
+glass removes both, but it also removes the surroundings the model needs to
+recognise a car at all: measured on real frames, masking took a confident 0.71
+detection down to nothing.
+
+So the model gets the full crop, and detections are rejected on geometry. Being
+mostly on the glass (MODEL_INSIDE) removes the occupants, whose boxes sit at 8%
+or less against real traffic's 55-83%. Not filling the whole crop
+(MAX_BOX_COVERAGE) removes the cabin, which the on-glass test cannot catch
+because a box covering everything overlaps the window wherever it is.
+
+Thresholds are per side and were calibrated against 48 hand labelled windows,
+because the two sides do not behave alike - see MODEL_SCORE_DEFAULT.
 
 CONFIG_PATH: {"enabled": bool, "camera_view": bool,
               "zones": {"left": [[[x,y],...],...], "right": [...]}}
@@ -81,34 +87,41 @@ WARMUP_FRAMES = 20
 # model
 MODEL_NET = 640
 MODEL_THREADS = 2
-# Measured against 36 hand labelled windows from a real drive (18 with a
-# vehicle, 18 empty). A single crop at 0.30 padding found less than half the
-# cars, and a third of them scored exactly zero - invisible, not merely below
-# threshold - so no amount of threshold tuning could recover them.
+# Per side, because the two windows do not behave alike. Measured through this
+# code path on 48 labelled windows, with the ego-car boxes excluded: empty left
+# windows reach 0.050 while empty right windows never leave 0.000, and right
+# side vehicles top out at 0.123 where left ones reach 0.78. One number cannot
+# serve both - it has to thread a gap 0.009 wide - so each side gets a
+# threshold with room around it.
 #
-# The two paddings fail on different cars and agree on the easy ones. A car
-# filling the window needs the tight crop; a car with room around it needs the
-# wide one. Running both and taking the best took recall from 0.44 to 0.83 at a
-# precision of 0.94, for the cost of a second inference.
-# Measured through this exact code path on 36 labelled windows. 0.20 was the
-# highest confidence any empty window reached, so it warns on 13 of 18 cars and
-# never on an empty road. 0.15 catches 16 of 18 but cried wolf 3 times, and a
-# chime that fires on empty road is one the driver learns to ignore. Repeated
-# sampling favours precision too: while signalling each side is rechecked twice
-# a second and a hit is held for MODEL_HOLD, so a car missed on one pass is
-# usually caught on the next, whereas one false hit warns for 2.5s.
-# Override with "model_score" in the config after a drive.
-MODEL_SCORE_DEFAULT = 0.20
+# Both are low because the scores are small once the cabin is excluded; see
+# MAX_BOX_COVERAGE. Override with "model_score" in the config, either a single
+# number for both sides or {"left": x, "right": y}.
+MODEL_SCORE_DEFAULT = {"left": 0.08, "right": 0.03}
 # collect scores down to here so the daemon's own numbers can be swept against
 # labels; only the threshold decides whether a warning is raised
 MODEL_FLOOR = 0.02
 MODEL_HOLD = 2.5           # a confirmed vehicle stays raised this long
+# A single crop at 0.30 padding found less than half the cars in the labelled
+# set, and a third of them scored exactly zero - invisible, not merely below
+# threshold - so no amount of threshold tuning could recover them. The wide crop
+# was destroying them: a car filling the window needs the tight crop, a car with
+# room around it needs the wide one, and the two disagree on which cars they can
+# see. Running both and taking the best is what makes the tight crop usable,
+# which in turn is what makes MAX_BOX_COVERAGE necessary.
 MODEL_PADS = (0.0, 0.30)
 MODEL_GREY = 114
 # Fraction of a detection box that must lie on the traced glass to count. Real
 # traffic measured 55-83%; the driver and the ego car's own interior, which the
 # model reports as a person and a car respectively, never exceeded 8%.
 MODEL_INSIDE = 0.30
+# The model reports the cabin we are sitting in as a car - correctly, it is one -
+# with a box spanning the whole crop. On-glass filtering cannot catch that: a box
+# covering everything overlaps the window wherever the window is. On the right
+# side, where the window is a large share of the tight crop, it sailed through at
+# up to 0.66 and drowned the real cars, which score under 0.13 there. A vehicle
+# in the next lane never fills the entire frame, so anything that does is us.
+MAX_BOX_COVERAGE = 0.95
 # how long continued movement keeps a confirmed car up for, and the ceiling on
 # that. Without a ceiling the warning latches: motion is active on ~74% of left
 # frames, so scenery alone would keep re-extending a car that has long gone.
@@ -223,11 +236,11 @@ def nv12_to_rgb(buf, box):
 class ModelDetector:
   """YOLOv10n on the CPU. Absent or broken, the daemon runs on motion alone."""
 
-  def __init__(self, model_path=MODEL_PATH, threshold=MODEL_SCORE_DEFAULT):
+  def __init__(self, model_path=MODEL_PATH, thresholds=None):
     self.session = None
     self.input_name = None
     self.masks = {}
-    self.threshold = threshold
+    self.thresholds = dict(thresholds or MODEL_SCORE_DEFAULT)
     if SITE_PACKAGES not in sys.path:
       sys.path.append(SITE_PACKAGES)
     try:
@@ -309,14 +322,14 @@ class ModelDetector:
     jobs = self.prepare(buf, side, polygons)
     if not jobs:
       return False, False
-    return self.infer(jobs)
+    return self.infer(jobs, side)
 
-  def infer(self, jobs):
+  def infer(self, jobs, side):
     """(vehicle_seen, person_on_the_glass) across every scale; thread safe."""
-    score, person = self.score(jobs)
-    return score >= self.threshold, person
+    score, person = self.score(jobs, side)
+    return score >= self.thresholds[side], person
 
-  def score(self, jobs):
+  def score(self, jobs, side):
     """(best vehicle score on the glass, person_on_the_glass) across scales.
 
     Kept separate from the threshold so the daemon's own numbers can be
@@ -329,12 +342,12 @@ class ModelDetector:
     best = 0.0
     person = False
     for crop, mask in jobs:
-      s, p = self._infer_one(crop, mask)
+      s, p = self._infer_one(crop, mask, side)
       best = max(best, s)
       person = person or p
     return best, person
 
-  def _infer_one(self, crop, mask):
+  def _infer_one(self, crop, mask, side):
     """One crop through the model, filtered to detections on the glass."""
     img = Image.fromarray(crop)
     scale = min(MODEL_NET / img.width, MODEL_NET / img.height)
@@ -362,10 +375,13 @@ class ModelDetector:
       # letterboxed network pixels back to crop pixels
       det_box = ((det[0] - offset[0]) / scale, (det[1] - offset[1]) / scale,
                  (det[2] - offset[0]) / scale, (det[3] - offset[1]) / scale)
+      area = max(0.0, det_box[2] - det_box[0]) * max(0.0, det_box[3] - det_box[1])
+      if area > MAX_BOX_COVERAGE * crop.shape[0] * crop.shape[1]:
+        continue                               # the car we are sitting in
       if self._inside_fraction(mask, det_box) < MODEL_INSIDE:
         continue                               # the driver, or our own bodywork
       if cls == PERSON_CLASS:
-        person = person or score >= self.threshold
+        person = person or score >= self.thresholds[side]
       else:
         best = max(best, score)
     return best, person
@@ -430,7 +446,7 @@ class ModelWorker:
 
       side, jobs = job
       try:
-        vehicle, person = self.model.infer(jobs)
+        vehicle, person = self.model.infer(jobs, side)
       except Exception:
         cloudlog.exception("vision_bsm: model inference failed")
         vehicle = person = False
@@ -566,14 +582,20 @@ def read_config():
       if not polygons:
         return None
       zones[side] = polygons
-    try:
-      threshold = float(config.get("model_score", MODEL_SCORE_DEFAULT))
-    except (TypeError, ValueError):
-      threshold = MODEL_SCORE_DEFAULT
-    if not 0.0 < threshold < 1.0:
-      threshold = MODEL_SCORE_DEFAULT
+    # accepts a single number for both sides or {"left": x, "right": y};
+    # anything unparseable or out of range falls back per side
+    raw = config.get("model_score", MODEL_SCORE_DEFAULT)
+    thresholds = dict(MODEL_SCORE_DEFAULT)
+    for side in ("left", "right"):
+      value = raw.get(side) if isinstance(raw, dict) else raw
+      try:
+        value = float(value)
+      except (TypeError, ValueError):
+        continue
+      if 0.0 < value < 1.0:
+        thresholds[side] = value
     return {"zones": zones, "fusion": config.get("fusion", FUSION_DEFAULT),
-            "model_score": threshold}
+            "model_score": thresholds}
   except (KeyError, TypeError, ValueError):
     return None
 
@@ -623,10 +645,10 @@ def vision_bsm_thread():
           if not model.available and fusion == "model":
             fusion = "motion"
             cloudlog.warning("vision_bsm: no model, falling back to motion only")
-          model.threshold = config["model_score"]
+          model.thresholds = config["model_score"]
           detector = Detector(config["zones"], model, fusion)
           cloudlog.info(f"vision_bsm: zones loaded, fusion={fusion}, "
-                        f"score={model.threshold}")
+                        f"score={model.thresholds}")
         left = right = False
       last_config_check = now
 
