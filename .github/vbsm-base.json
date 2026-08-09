@@ -1,0 +1,11 @@
+{
+  "base": "3cfb155351bce88c773d82033c110268525b1bec",
+  "files": [
+    "openpilot/sunnypilot/vision_bsm.py",
+    "openpilot/system/manager/process_config.py",
+    "openpilot/selfdrive/car/card.py",
+    "openpilot/selfdrive/selfdrived/selfdrived.py",
+    "openpilot/selfdrive/ui/mici/layouts/settings/toggles.py",
+    "openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py"
+  ]
+}
