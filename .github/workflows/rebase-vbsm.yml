@@ -45,7 +45,10 @@ jobs:
           git remote add upstream https://github.com/sunnypilot/sunnypilot.git
           git fetch --filter=blob:none upstream staging
 
-          base=$(git merge-base HEAD upstream/staging)
+          if ! base=$(git merge-base HEAD upstream/staging 2>/dev/null); then
+            echo "::error::No common ancestor: sunnypilot force-pushed staging and rewrote its history. Rebase cannot work; re-port the mod content-wise onto the new staging (see the archive/ branches for prior history)."
+            exit 1
+          fi
           target=$(git rev-parse upstream/staging)
           if [ "$base" = "$target" ]; then
             echo "upstream staging has not moved; nothing to do"
