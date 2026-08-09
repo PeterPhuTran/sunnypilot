@@ -46,6 +46,7 @@ CONFIG_PATH: {"enabled": bool, "camera_view": bool,
 STATE_PATH:  {"left": bool, "right": bool, "night": bool, "model": bool,
               "ts": <CLOCK_BOOTTIME seconds>}
 """
+import ctypes
 import gc
 import json
 import os
@@ -83,6 +84,13 @@ RECONNECT_TIMEOUT = 50
 REFERENCE_ZONE = [(0.36, 0.42), (0.60, 0.42), (0.60, 0.62), (0.36, 0.62)]
 CONFIG_CHECK_TIME = 5.0
 WARMUP_FRAMES = 20
+# Hard ceiling on this process's resident set. Steady state measures ~98 MB on
+# device; if it ever passes this, something is leaking and the only safe move
+# is to exit before the kernel starts shooting openpilot processes instead.
+# manager restarts the daemon within seconds, so a leak costs a blink in
+# detection rather than the cascade of faults it caused on 2026-08-08.
+RSS_LIMIT_MB = 250
+RSS_CHECK_INTERVAL = 10.0
 
 # model
 MODEL_NET = 640
@@ -217,9 +225,18 @@ def nv12_to_rgb(buf, box):
   if x1 - x0 < 2 or y1 - y0 < 2:
     return None
 
+  # Slice both planes by their true extent, never by "the rest of the buffer".
+  # Real VisionIPC buffers carry alignment padding after the UV plane, so
+  # data[uv_offset:] is not a whole number of rows - reshaping it crashed on
+  # every real frame, which no synthetic test buffer ever reproduced. That
+  # crash looped the daemon through a fresh ONNX session every ~5s, which was
+  # the 140 MB/min "leak" of 2026-08-08 23:40.
   data = np.frombuffer(buf.data, dtype=np.uint8)
-  y = data[:buf.uv_offset].reshape((-1, buf.stride))[y0:y1, x0:x1].astype(np.float32)
-  uv = data[buf.uv_offset:].reshape((-1, buf.stride))[y0 // 2:y1 // 2, x0:x1]
+  y_len = buf.height * buf.stride
+  uv_len = (buf.height // 2) * buf.stride
+  y = data[:y_len].reshape((buf.height, buf.stride))[y0:y1, x0:x1].astype(np.float32)
+  uv = data[buf.uv_offset:buf.uv_offset + uv_len] \
+      .reshape((buf.height // 2, buf.stride))[y0 // 2:y1 // 2, x0:x1]
   u = uv[:, 0::2].astype(np.float32) - 128.0
   v = uv[:, 1::2].astype(np.float32) - 128.0
   # nearest neighbour upsample back to luma resolution
@@ -517,6 +534,13 @@ class Detector:
         state.last_model_hit = done_at
         state.model_hits += 1
 
+    # An inference takes ~1s and this runs at 5Hz, so most calls find the
+    # worker busy. Bail before building anything: the crops cost tens of
+    # megabytes of temporaries, and building them only to throw them away was
+    # the bulk of the allocation churn behind the 2026-08-08 leak.
+    if self.worker.busy:
+      return
+
     # the side being signalled always wins, otherwise alternate
     order = [s for s in ("left", "right") if blinkers.get(s)]
     order += [self.next_side, "left" if self.next_side == "right" else "right"]
@@ -616,6 +640,17 @@ def read_config():
     return None
 
 
+def rss_mb():
+  try:
+    with open("/proc/self/status") as f:
+      for line in f:
+        if line.startswith("VmRSS:"):
+          return int(line.split()[1]) / 1024.0
+  except OSError:
+    pass
+  return 0.0
+
+
 def publish(left, right, night=False, model=False):
   state = {"left": bool(left), "right": bool(right), "night": bool(night),
            "model": bool(model), "ts": time.clock_gettime(time.CLOCK_BOOTTIME)}
@@ -626,7 +661,29 @@ def publish(left, right, night=False, model=False):
   os.replace(tmp, STATE_PATH)
 
 
+def tame_glibc():
+  """Stop glibc from hoarding the temporaries this process churns through.
+
+  The 2026-08-08 23:40 drive leaked 140 MB/min to 1.5 GB and took openpilot
+  down with it, yet the same code soaked flat single-threaded. The difference
+  is the worker thread: with inference on one thread and multi-megabyte
+  NV12/PIL temporaries churning on another, glibc raises its dynamic mmap
+  threshold, the big buffers move onto per-thread heap arenas, and freed
+  chunks stay pinned there instead of returning to the kernel.
+
+  Two knobs close that path: cap the arenas, and pin the mmap threshold so
+  every multi-megabyte temporary is mmap'd and genuinely returned on free.
+  """
+  try:
+    libc = ctypes.CDLL("libc.so.6")
+    libc.mallopt(-8, 2)             # M_ARENA_MAX = 2
+    libc.mallopt(-3, 128 * 1024)    # M_MMAP_THRESHOLD pinned, no dynamic growth
+  except OSError:
+    cloudlog.warning("vision_bsm: mallopt unavailable, relying on the RSS limit")
+
+
 def vision_bsm_thread():
+  tame_glibc()
   # Deliberately NOT config_realtime_process. That helper disables the garbage
   # collector, raises the process to SCHED_FIFO and pins it to one core - all
   # reasonable for the cheap background-subtraction loop this used to be, and all
@@ -661,80 +718,121 @@ def vision_bsm_thread():
   last_publish = 0.0
   left = right = False
 
-  while True:
-    now = time.monotonic()
-    if now - last_config_check > CONFIG_CHECK_TIME:
-      new_config = read_config()
-      if new_config != config:
-        config = new_config
-        if config is None:
-          detector = None
-        else:
-          if model is None:
-            model = ModelDetector()
-          # without the model nothing would ever raise a warning in "model"
-          # mode, so fall back to motion rather than going silently blind
-          fusion = config["fusion"]
-          if not model.available and fusion == "model":
-            fusion = "motion"
-            cloudlog.warning("vision_bsm: no model, falling back to motion only")
-          model.thresholds = config["model_score"]
-          detector = Detector(config["zones"], model, fusion)
-          cloudlog.info(f"vision_bsm: zones loaded, fusion={fusion}, "
-                        f"score={model.thresholds}")
-        left = right = False
-      last_config_check = now
+  last_rss_check = 0.0
+  frame_errors = 0
 
-    if config is None:
-      if now - last_publish > 1.0 / PUBLISH_RATE:
-        publish(False, False)
-        last_publish = now
-      time.sleep(1.0 / PUBLISH_RATE)
-      continue
+  try:
+    while True:
+      now = time.monotonic()
 
-    if not connected:
-      if not client.connect(False):
-        time.sleep(1)
+      if now - last_rss_check > RSS_CHECK_INTERVAL:
+        last_rss_check = now
+        rss = rss_mb()
+        if rss > RSS_LIMIT_MB:
+          cloudlog.error(f"vision_bsm: RSS {rss:.0f} MB over the {RSS_LIMIT_MB} MB "
+                         "limit - exiting so manager restarts us clean")
+          sys.exit(1)
+
+      if now - last_config_check > CONFIG_CHECK_TIME:
+        new_config = read_config()
+        if new_config != config:
+          config = new_config
+          # a replaced Detector must take its worker thread with it, or the old
+          # thread keeps the model alive from the shadows
+          if detector is not None and detector.worker is not None:
+            detector.worker.stop()
+          if config is None:
+            detector = None
+          else:
+            if model is None:
+              model = ModelDetector()
+            # without the model nothing would ever raise a warning in "model"
+            # mode, so fall back to motion rather than going silently blind
+            fusion = config["fusion"]
+            if not model.available and fusion == "model":
+              fusion = "motion"
+              cloudlog.warning("vision_bsm: no model, falling back to motion only")
+            model.thresholds = config["model_score"]
+            detector = Detector(config["zones"], model, fusion)
+            cloudlog.info(f"vision_bsm: zones loaded, fusion={fusion}, "
+                          f"score={model.thresholds}")
+          left = right = False
+        last_config_check = now
+
+      if config is None:
+        if now - last_publish > 1.0 / PUBLISH_RATE:
+          publish(False, False)
+          last_publish = now
+        time.sleep(1.0 / PUBLISH_RATE)
         continue
-      connected = True
-      detector.warmup = WARMUP_FRAMES
 
-    buf = client.recv()
-    if buf is None:
-      missed_frames += 1
-      if missed_frames > RECONNECT_TIMEOUT:
-        client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_DRIVER, True)
-        connected = False
-        missed_frames = 0
-      continue
-    missed_frames = 0
+      if not connected:
+        if not client.connect(False):
+          time.sleep(1)
+          continue
+        connected = True
+        detector.warmup = WARMUP_FRAMES
 
-    # SubMaster hands back a default carState until one arrives, so this is safe
-    # before the car is up; both blinkers simply read False.
-    sm.update(0)
-    blinkers = {"left": bool(sm['carState'].leftBlinker),
-                "right": bool(sm['carState'].rightBlinker)}
+      buf = client.recv()
+      if buf is None:
+        missed_frames += 1
+        if missed_frames > RECONNECT_TIMEOUT:
+          client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_DRIVER, True)
+          connected = False
+          missed_frames = 0
+        continue
+      missed_frames = 0
 
-    frame_count += 1
-    if frame_count % FRAME_SKIP == 0:
-      y_plane = np.frombuffer(buf.data[:buf.uv_offset], dtype=np.uint8).reshape((-1, buf.stride))[:buf.height, :buf.width]
-      motion_left, motion_right = detector.process(y_plane, now)
-      detector.run_model(buf, now, blinkers)
-      left = detector.combine("left", motion_left, now)
-      right = detector.combine("right", motion_right, now)
+      # SubMaster hands back a default carState until one arrives, so this is safe
+      # before the car is up; both blinkers simply read False.
+      sm.update(0)
+      blinkers = {"left": bool(sm['carState'].leftBlinker),
+                  "right": bool(sm['carState'].rightBlinker)}
 
-    if now - last_publish > 1.0 / PUBLISH_RATE:
-      publish(left, right, detector.night, model is not None and model.available)
-      last_publish = now
+      frame_count += 1
+      if frame_count % FRAME_SKIP == 0:
+        # A processing failure must cost one frame, not the process. The old
+        # handler tore down and rebuilt everything - client, SubMaster, model -
+        # on any exception, and when the exception recurred per frame, that
+        # rebuild churn WAS the memory leak that took the device down.
+        try:
+          y_plane = np.frombuffer(buf.data[:buf.height * buf.stride], dtype=np.uint8) \
+                      .reshape((buf.height, buf.stride))[:, :buf.width]
+          motion_left, motion_right = detector.process(y_plane, now)
+          detector.run_model(buf, now, blinkers)
+          left = detector.combine("left", motion_left, now)
+          right = detector.combine("right", motion_right, now)
+        except Exception:
+          frame_errors += 1
+          if frame_errors in (1, 10) or frame_errors % 100 == 0:
+            cloudlog.exception(f"vision_bsm: frame processing failed ({frame_errors} so far)")
+
+      if now - last_publish > 1.0 / PUBLISH_RATE:
+        publish(left, right, detector.night, model is not None and model.available)
+        last_publish = now
+  finally:
+    # whatever ends this loop - exception, RSS exit - the worker thread and
+    # the model it references must die with it, not linger into a retry
+    if detector is not None and detector.worker is not None:
+      detector.worker.stop()
 
 
 def main():
-  while True:
+  # One in-process retry for transient failures, then exit and let manager
+  # start a fresh process. The old loop retried forever, and every retry
+  # rebuilt the ONNX session while the previous worker thread kept the old one
+  # alive - so a repeating exception became a ratchet that leaked a session
+  # every five seconds until the kernel started killing openpilot instead.
+  # A process exit cannot leak: everything dies with it.
+  for attempt in (1, 2):
     try:
       vision_bsm_thread()
+      return
     except Exception:
-      cloudlog.exception("vision_bsm crashed")
+      cloudlog.exception(f"vision_bsm crashed (attempt {attempt})")
       time.sleep(5)
+  cloudlog.error("vision_bsm: crashing repeatedly, exiting for a clean restart")
+  sys.exit(1)
 
 
 if __name__ == "__main__":
