@@ -2,7 +2,7 @@ name: rebase vbsm onto sunnypilot staging
 
 # Keeps the camera blind spot monitor branch current with upstream sunnypilot.
 #
-# The comma tracks refs/heads/vbsm on this fork instead of sunnypilot staging,
+# The comma tracks refs/heads/vbsm-sp-staging-v2026.003.000 on this fork instead of sunnypilot staging,
 # so upstream changes only reach the device once this branch is rebased onto
 # them. Running daily keeps the lag under a day.
 #
@@ -30,7 +30,7 @@ jobs:
       - name: check out vbsm
         uses: actions/checkout@v4
         with:
-          ref: vbsm
+          ref: vbsm-sp-staging-v2026.003.000
           fetch-depth: 0
           # the repo carries prebuilt binaries and is several GB; fetch commits
           # now and blobs only if the rebase actually needs them
@@ -56,7 +56,7 @@ jobs:
           echo "rebasing $(git rev-list --count "$base"..HEAD) commit(s) onto $(git rev-parse --short "$target")"
           if ! git rebase --onto upstream/staging "$base"; then
             git rebase --abort || true
-            echo "::error::Rebase conflict: sunnypilot changed a file the blind spot mod patches. Resolve by hand, then push vbsm."
+            echo "::error::Rebase conflict: sunnypilot changed a file the blind spot mod patches. Resolve by hand, then push vbsm-sp-staging-v2026.003.000."
             exit 1
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -85,4 +85,4 @@ jobs:
 
       - name: publish
         if: steps.rebase.outputs.changed == 'true'
-        run: git push --force-with-lease origin vbsm
+        run: git push --force-with-lease origin vbsm-sp-staging-v2026.003.000
