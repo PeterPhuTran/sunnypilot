@@ -92,12 +92,8 @@ jobs:
           git update-index --add --cacheinfo "100644,$mblob,$MANIFEST"
 
           TREE=$(git write-tree)
-          COMMIT=$(git commit-tree "$TREE" -p "$NEW" -p "$OLD_HEAD" \
-            -m "vision_bsm: port onto sunnypilot staging ${NEW:0:8}
-
-Upstream's tree with the mod overlaid, carried unchanged from ${OLD_HEAD:0:8}.
-A merge of both parents, so the branch history stays reachable whether
-upstream advanced or rewrote staging.")
+          MSG=$(printf 'vision_bsm: port onto sunnypilot staging %s\n\nUpstream tree with the mod overlaid, carried unchanged from %s.\nA merge of both parents, so the branch history stays reachable whether\nupstream advanced or rewrote staging.\n' "${NEW:0:8}" "${OLD_HEAD:0:8}")
+          COMMIT=$(printf '%s' "$MSG" | git commit-tree "$TREE" -p "$NEW" -p "$OLD_HEAD")
           git update-ref "refs/heads/$BRANCH" "$COMMIT"
           echo "ported: $COMMIT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
