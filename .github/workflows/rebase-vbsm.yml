@@ -1,91 +1,129 @@
-name: rebase vbsm onto sunnypilot staging
+name: port vbsm onto sunnypilot staging
 
-# Keeps the camera blind spot monitor branch current with upstream sunnypilot.
+# Keeps the camera blind spot monitor branch current with upstream sunnypilot
+# by CONTENT, not by history. sunnypilot force-pushes staging (observed
+# 2026-08-09: same release, rewritten history), which makes rebase-based
+# tracking structurally fragile. Instead this takes upstream's tree wholesale,
+# overlays the mod's files carried from the current branch head, and commits
+# the result as a merge of both - so the branch survives force-pushes, keeps
+# its own history reachable, and works identically for ordinary advances.
 #
-# The comma tracks refs/heads/vbsm-sp-staging-v2026.003.000 on this fork instead of sunnypilot staging,
-# so upstream changes only reach the device once this branch is rebased onto
-# them. Running daily keeps the lag under a day.
+# The one thing it refuses to do is guess: if upstream changed any file the
+# mod manages (relative to the recorded base in .github/vbsm-base.json), it
+# fails loudly and leaves the branch alone. The device keeps running the last
+# good build until a human merges.
 #
-# A conflict here is the signal that sunnypilot has edited one of the six files
-# the mod touches. The job fails loudly and stops publishing rather than
-# resolving it blindly - the device keeps running the last good build until a
-# human looks, which is the safe direction to fail.
-#
-# Lives on the default branch because scheduled workflows only run from there,
-# which also keeps it out of the vbsm diff against upstream.
+# Everything runs on git plumbing against a blobless clone - no worktree
+# checkout, so the multi-gigabyte prebuilts are never downloaded.
 
 on:
   schedule:
     - cron: '17 9 * * *'
   workflow_dispatch:
+    inputs:
+      force_port:
+        description: rebuild the port even if already based on current staging
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+env:
+  BRANCH: vbsm-sp-staging-v2026.003.000
+  MANIFEST: .github/vbsm-base.json
+
 jobs:
-  rebase:
+  port:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
-      - name: check out vbsm
+      - name: check out the mod branch
         uses: actions/checkout@v4
         with:
           ref: vbsm-sp-staging-v2026.003.000
           fetch-depth: 0
-          # the repo carries prebuilt binaries and is several GB; fetch commits
-          # now and blobs only if the rebase actually needs them
           filter: blob:none
 
-      - name: rebase onto upstream staging
-        id: rebase
+      - name: port the mod onto upstream staging
+        id: port
         run: |
           set -euo pipefail
-          git config user.name 'vbsm rebase'
+          git config user.name 'vbsm port'
           git config user.email 'noreply@github.com'
           git remote add upstream https://github.com/sunnypilot/sunnypilot.git
           git fetch --filter=blob:none upstream staging
 
-          if ! base=$(git merge-base HEAD upstream/staging 2>/dev/null); then
-            echo "::error::No common ancestor: sunnypilot force-pushed staging and rewrote its history. Rebase cannot work; re-port the mod content-wise onto the new staging (see the archive/ branches for prior history)."
-            exit 1
-          fi
-          target=$(git rev-parse upstream/staging)
-          if [ "$base" = "$target" ]; then
-            echo "upstream staging has not moved; nothing to do"
+          NEW=$(git rev-parse upstream/staging)
+          OLD_HEAD=$(git rev-parse HEAD)
+
+          if [ "${{ inputs.force_port }}" != "true" ] \
+             && git merge-base --is-ancestor "$NEW" HEAD 2>/dev/null; then
+            echo "already based on current staging (${NEW:0:8}); nothing to do"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "rebasing $(git rev-list --count "$base"..HEAD) commit(s) onto $(git rev-parse --short "$target")"
-          if ! git rebase --onto upstream/staging "$base"; then
-            git rebase --abort || true
-            echo "::error::Rebase conflict: sunnypilot changed a file the blind spot mod patches. Resolve by hand, then push vbsm-sp-staging-v2026.003.000."
+          BASE=$(git show "HEAD:$MANIFEST" | jq -r .base)
+          FILES=$(git show "HEAD:$MANIFEST" | jq -r '.files[]')
+          echo "recorded base ${BASE:0:8} -> new upstream ${NEW:0:8}"
+
+          # refuse to clobber upstream work on the files the mod manages
+          drift=""
+          for f in $FILES; do
+            old=$(git rev-parse -q --verify "$BASE:$f" 2>/dev/null || echo absent)
+            new=$(git rev-parse -q --verify "$NEW:$f" 2>/dev/null || echo absent)
+            [ "$old" = "$new" ] || drift="$drift $f"
+          done
+          if [ -n "$drift" ]; then
+            echo "::error::sunnypilot changed mod-managed file(s) since the recorded base:$drift - merge by hand, update $MANIFEST, and push."
             exit 1
           fi
+
+          # upstream tree + our files, via plumbing only (no worktree, no blobs)
+          git read-tree "$NEW"
+          for f in $FILES; do
+            mode=$(git ls-tree "$OLD_HEAD" -- "$f" | awk '{print $1}')
+            blob=$(git rev-parse "$OLD_HEAD:$f")
+            git update-index --add --cacheinfo "$mode,$blob,$f"
+          done
+          git show "HEAD:$MANIFEST" | jq --arg b "$NEW" '.base = $b' > /tmp/manifest.json
+          mblob=$(git hash-object -w /tmp/manifest.json)
+          git update-index --add --cacheinfo "100644,$mblob,$MANIFEST"
+
+          TREE=$(git write-tree)
+          COMMIT=$(git commit-tree "$TREE" -p "$NEW" -p "$OLD_HEAD" \
+            -m "vision_bsm: port onto sunnypilot staging ${NEW:0:8}
+
+Upstream's tree with the mod overlaid, carried unchanged from ${OLD_HEAD:0:8}.
+A merge of both parents, so the branch history stays reachable whether
+upstream advanced or rewrote staging.")
+          git update-ref "refs/heads/$BRANCH" "$COMMIT"
+          echo "ported: $COMMIT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: verify the mod survived the rebase
-        if: steps.rebase.outputs.changed == 'true'
+      - name: verify before publishing
+        if: steps.port.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          # A clean rebase can still drop a change if upstream refactored around
-          # it, so check the markers rather than trusting the exit code.
+          C=$(git rev-parse "refs/heads/$BRANCH")
           fail=0
           check() {
-            if ! grep -q "$1" "$2"; then echo "::error::missing '$1' in $2"; fail=1; fi
+            git cat-file blob "$C:$2" | grep -q "$1" \
+              || { echo "::error::missing '$1' in $2"; fail=1; }
           }
-          check visionbsmd      openpilot/system/manager/process_config.py
-          check vision_bsm      openpilot/selfdrive/car/card.py
-          check VBSM            openpilot/selfdrive/selfdrived/selfdrived.py
+          check visionbsmd       openpilot/system/manager/process_config.py
+          check vision_bsm       openpilot/selfdrive/car/card.py
+          check VBSM             openpilot/selfdrive/selfdrived/selfdrived.py
           check BigConfigControl openpilot/selfdrive/ui/mici/layouts/settings/toggles.py
-          check BSM_STATE_PATH  openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
-          test -f openpilot/sunnypilot/vision_bsm.py || { echo "::error::daemon missing"; fail=1; }
-          # without this marker the device would try to compile on boot, which
-          # is exactly what it cannot do
-          test -f prebuilt || { echo "::error::prebuilt marker missing - device would try to build"; fail=1; }
-          python3 -m py_compile openpilot/sunnypilot/vision_bsm.py
+          check BSM_STATE_PATH   openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
+          # without this the device would try to compile, which it cannot do
+          git rev-parse -q --verify "$C:prebuilt" > /dev/null \
+            || { echo "::error::prebuilt marker missing"; fail=1; }
+          git cat-file blob "$C:openpilot/sunnypilot/vision_bsm.py" > /tmp/vb.py
+          python3 -m py_compile /tmp/vb.py || { echo "::error::daemon does not compile"; fail=1; }
           exit $fail
 
       - name: publish
-        if: steps.rebase.outputs.changed == 'true'
-        run: git push --force-with-lease origin vbsm-sp-staging-v2026.003.000
+        if: steps.port.outputs.changed == 'true'
+        run: git push --force-with-lease origin "$BRANCH"
