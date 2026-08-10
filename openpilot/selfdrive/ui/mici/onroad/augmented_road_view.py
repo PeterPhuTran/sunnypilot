@@ -15,6 +15,7 @@ from openpilot.system.ui.lib.application import FontWeight, gui_app, MousePos, M
 from openpilot.system.ui.widgets.label import UnifiedLabel
 from openpilot.system.ui.widgets import Widget
 from openpilot.common.filter_simple import BounceFilter
+from openpilot.common.swaglog import cloudlog
 import json
 import os
 import time
@@ -368,25 +369,50 @@ class AugmentedRoadView(CameraView):
 
     self._bookmark_icon.render(self.rect)
 
-  def _switch_stream_if_needed(self, sm):
-    if self._bsm_zone is not None and DRIVER_CAM in self.available_streams:
-      if self.stream_type != DRIVER_CAM:
-        self.switch_stream(DRIVER_CAM)
-      return
+  def _cancel_pending_switch(self):
+    """Abandon an in-flight stream switch.
 
-    if sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
+    The base class switch is asynchronous: it arms a target client and only
+    completes when that stream delivers its first frame. Its switch_stream()
+    also early-returns when asked for the stream already on screen, so a
+    switch armed AWAY from the current stream cannot be redirected back - it
+    has to be cancelled outright, or it completes after the reason for it has
+    passed. That is exactly how the driver view kept appearing after a brief
+    turn signal: the signal ended before the driver stream connected, nothing
+    could retarget, and the stale switch landed seconds later.
+    """
+    if self._switching:
+      cloudlog.info("vision_bsm ui: cancelled in-flight camera switch "
+                    f"to {self._target_stream_type} (no longer wanted)")
+      self._target_client = None
+      self._target_stream_type = None
+      self._switching = False
+
+  def _switch_stream_if_needed(self, sm):
+    # decide against what WILL be on screen once any in-flight switch lands,
+    # not what is on screen now
+    effective = self._target_stream_type if self._switching else self.stream_type
+
+    if self._bsm_zone is not None and DRIVER_CAM in self.available_streams:
+      target = DRIVER_CAM
+    elif sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
       v_ego = sm['carState'].vEgo
       if v_ego < WIDE_CAM_MAX_SPEED:
         target = WIDE_CAM
       elif v_ego > ROAD_CAM_MIN_SPEED:
         target = ROAD_CAM
       else:
-        # Hysteresis zone - keep current stream
-        target = self.stream_type
+        # Hysteresis zone - keep whatever we are showing or heading to
+        target = effective
     else:
       target = ROAD_CAM
 
-    if self.stream_type != target:
+    if effective == target:
+      return
+    if target == self.stream_type:
+      # already showing the right stream; kill the switch away from it
+      self._cancel_pending_switch()
+    else:
       self.switch_stream(target)
 
   def _update_calibration(self):
