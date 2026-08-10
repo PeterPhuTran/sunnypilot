@@ -109,7 +109,12 @@ MODEL_SCORE_DEFAULT = {"left": 0.08, "right": 0.03}
 # collect scores down to here so the daemon's own numbers can be swept against
 # labels; only the threshold decides whether a warning is raised
 MODEL_FLOOR = 0.02
-MODEL_HOLD = 2.5           # a confirmed vehicle stays raised this long
+# Shortened from 2.5 after labelling on-road firing: 7 of 24 sampled fired
+# tiles had no live detection at all - the hold outliving the car. Under
+# blind-spot semantics a car exits the danger zone faster than it exits the
+# window; while signalling the check cadence is 0.5s, so 1.2s still bridges
+# two missed checks.
+MODEL_HOLD = 1.2
 # A single crop at 0.30 padding found less than half the cars in the labelled
 # set, and a third of them scored exactly zero - invisible, not merely below
 # threshold - so no amount of threshold tuning could recover them. The wide crop
@@ -133,8 +138,8 @@ MAX_BOX_COVERAGE = 0.95
 # how long continued movement keeps a confirmed car up for, and the ceiling on
 # that. Without a ceiling the warning latches: motion is active on ~74% of left
 # frames, so scenery alone would keep re-extending a car that has long gone.
-MOTION_EXTEND = 1.2
-MAX_HOLD = 4.0
+MOTION_EXTEND = 0.8
+MAX_HOLD = 2.0
 FUSION_DEFAULT = "model"        # "model" | "either" | "motion"
 # how often a zone may be checked, by what the driver is doing
 MODEL_INTERVAL_SIGNALLING = 0.5
