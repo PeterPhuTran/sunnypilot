@@ -115,6 +115,12 @@ MODEL_FLOOR = 0.02
 # window; while signalling the check cadence is 0.5s, so 1.2s still bridges
 # two missed checks.
 MODEL_HOLD = 1.2
+# A warning needs two model hits, not one. Measured on labelled drive footage:
+# several false fires lived for exactly one check and vanished, and no single
+# spurious output should ever chime. The window tolerates one missed check at
+# the signalling cadence; at slower cadences it scales with the interval.
+CONFIRM_WINDOW_MIN = 1.6
+CONFIRM_WINDOW_FACTOR = 1.15
 # A single crop at 0.30 padding found less than half the cars in the labelled
 # set, and a third of them scored exactly zero - invisible, not merely below
 # threshold - so no amount of threshold tuning could recover them. The wide crop
@@ -196,6 +202,7 @@ class SideState:
     self.last_model_hit = -1e9
     self.last_model_result = -1e9
     self.occluded = False
+    self.pending_hit = -1e9
     self.hold_until = -1e9
     self.model_runs = 0
     self.model_hits = 0
@@ -536,8 +543,15 @@ class Detector:
       state.occluded = person
       state.model_runs += 1
       if vehicle:
-        state.last_model_hit = done_at
         state.model_hits += 1
+        # confirm-before-raise: the first hit arms, the second within the
+        # window raises. Cost is one check interval of latency (~0.5s while
+        # signalling); benefit is that one-off fires never reach the driver.
+        window = max(CONFIRM_WINDOW_MIN,
+                     CONFIRM_WINDOW_FACTOR * self._model_interval(side, blinkers))
+        if done_at - state.pending_hit <= window:
+          state.last_model_hit = done_at
+        state.pending_hit = done_at
 
     # An inference takes ~1s and this runs at 5Hz, so most calls find the
     # worker busy. Bail before building anything: the crops cost tens of
