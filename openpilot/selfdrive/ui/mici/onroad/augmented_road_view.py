@@ -402,8 +402,14 @@ class AugmentedRoadView(CameraView):
       elif v_ego > ROAD_CAM_MIN_SPEED:
         target = ROAD_CAM
       else:
-        # Hysteresis zone - keep whatever we are showing or heading to
-        target = effective
+        # Hysteresis zone - keep whatever we are showing or heading to, but
+        # only ever a road-facing stream. Holding "current" unconditionally
+        # latched the DRIVER view here: end a turn signal at 11-22 mph - the
+        # normal speed coming out of a street turn, with experimental mode on -
+        # and the blind spot preview stayed on screen until speed left the
+        # band. Measured on the 2026-08-10 drive: experimental active 100% of
+        # the time, so every turn ending in the band latched.
+        target = effective if effective in (WIDE_CAM, ROAD_CAM) else ROAD_CAM
     else:
       target = ROAD_CAM
 
