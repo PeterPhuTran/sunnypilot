@@ -1,5 +1,5 @@
 {
-  "base": "3cfb155351bce88c773d82033c110268525b1bec",
+  "base": "f43bfc67d27fce8c5974498abbf373eeeea2ff04",
   "files": [
     "openpilot/sunnypilot/vision_bsm.py",
     "openpilot/system/manager/process_config.py",
