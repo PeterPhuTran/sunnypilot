@@ -109,18 +109,23 @@ MODEL_SCORE_DEFAULT = {"left": 0.08, "right": 0.03}
 # collect scores down to here so the daemon's own numbers can be swept against
 # labels; only the threshold decides whether a warning is raised
 MODEL_FLOOR = 0.02
-# Shortened from 2.5 after labelling on-road firing: 7 of 24 sampled fired
-# tiles had no live detection at all - the hold outliving the car. Under
-# blind-spot semantics a car exits the danger zone faster than it exits the
-# window; while signalling the check cadence is 0.5s, so 1.2s still bridges
-# two missed checks.
-MODEL_HOLD = 1.2
-# A warning needs two model hits, not one. Measured on labelled drive footage:
-# several false fires lived for exactly one check and vanished, and no single
-# spurious output should ever chime. The window tolerates one missed check at
-# the signalling cadence; at slower cadences it scales with the interval.
-CONFIRM_WINDOW_MIN = 1.6
-CONFIRM_WINDOW_FACTOR = 1.15
+# Sized between two failure modes, both measured: 4s produced stale-hold
+# false tiles (7 of 24 sampled fired tiles had no live detection), and 1.2s
+# was shorter than the per-side check cadence, so even a steadily-confirmed
+# car flickered. Must outlive one per-side check gap (~2.2s idle cadence: ~1s inference plus
+# alternation) or a steadily-confirmed car flickers off between checks. Still
+# well under the original 4s that produced stale-hold false tiles.
+MODEL_HOLD = 2.4
+# A warning needs two model hits, not one - but confirmation counts RUNS, not
+# wall-clock. The first version used a time window sized to the check interval
+# and produced a 46-minute drive with zero warnings: consecutive completions
+# for one side are bounded by inference time plus side alternation (~1s
+# signalling, ~2.2s idle), so the window could never contain two of them while
+# idle. Confirm when this run and the previous run of the same side (allowing
+# one missed run) both saw the car; the wall-clock cap only guards against
+# confirming across genuinely stale gaps.
+CONFIRM_MISS_TOLERANCE = 1
+CONFIRM_MAX_GAP = 6.0
 # A single crop at 0.30 padding found less than half the cars in the labelled
 # set, and a third of them scored exactly zero - invisible, not merely below
 # threshold - so no amount of threshold tuning could recover them. The wide crop
@@ -203,6 +208,7 @@ class SideState:
     self.last_model_result = -1e9
     self.occluded = False
     self.pending_hit = -1e9
+    self.runs_since_hit = 999
     self.hold_until = -1e9
     self.model_runs = 0
     self.model_hits = 0
@@ -544,14 +550,15 @@ class Detector:
       state.model_runs += 1
       if vehicle:
         state.model_hits += 1
-        # confirm-before-raise: the first hit arms, the second within the
-        # window raises. Cost is one check interval of latency (~0.5s while
-        # signalling); benefit is that one-off fires never reach the driver.
-        window = max(CONFIRM_WINDOW_MIN,
-                     CONFIRM_WINDOW_FACTOR * self._model_interval(side, blinkers))
-        if done_at - state.pending_hit <= window:
+        # confirm-before-raise: this run plus the previous run of this side
+        # (one miss tolerated) - a single spurious output still cannot chime
+        if (state.runs_since_hit <= CONFIRM_MISS_TOLERANCE
+            and done_at - state.pending_hit <= CONFIRM_MAX_GAP):
           state.last_model_hit = done_at
+        state.runs_since_hit = 0
         state.pending_hit = done_at
+      else:
+        state.runs_since_hit += 1
 
     # An inference takes ~1s and this runs at 5Hz, so most calls find the
     # worker busy. Bail before building anything: the crops cost tens of
