@@ -125,7 +125,16 @@ MODEL_HOLD = 2.4
 # one missed run) both saw the car; the wall-clock cap only guards against
 # confirming across genuinely stale gaps.
 CONFIRM_MISS_TOLERANCE = 1
-CONFIRM_MAX_GAP = 6.0
+# Pathology guard only, NOT a cadence assumption. Measured under onroad-like
+# load, same-side completions arrive 5.6s apart (p90 8.1s) even for the
+# signalled side - a cap below that starves confirmation, which silenced two
+# whole drives. Runs-counting carries the real confirmation semantics.
+CONFIRM_MAX_GAP = 12.0
+# Hold scales with the observed per-side completion gap so a confirmed car
+# stays warned between checks at any cadence; clamped so a stale hold stays
+# bounded well under the 4s regime that produced false tiles.
+HOLD_GAP_FACTOR = 1.5
+HOLD_MAX = 6.0
 # A single crop at 0.30 padding found less than half the cars in the labelled
 # set, and a third of them scored exactly zero - invisible, not merely below
 # threshold - so no amount of threshold tuning could recover them. The wide crop
@@ -209,6 +218,8 @@ class SideState:
     self.occluded = False
     self.pending_hit = -1e9
     self.runs_since_hit = 999
+    self.run_gap = MODEL_HOLD           # observed same-side completion gap
+    self.hold_span = MODEL_HOLD
     self.hold_until = -1e9
     self.model_runs = 0
     self.model_hits = 0
@@ -334,7 +345,7 @@ class ModelDetector:
       return 0.0
     return float(mask[y0:y1, x0:x1].mean())
 
-  def prepare(self, buf, side, polygons):
+  def prepare(self, buf, side, polygons, pads=MODEL_PADS):
     """Cut the crops out of the shared camera buffer, on the sampling thread.
 
     This has to happen here rather than in the worker: the VisionIPC buffer is
@@ -345,7 +356,7 @@ class ModelDetector:
     than one.
     """
     jobs = []
-    for pad in MODEL_PADS:
+    for pad in pads:
       x0, y0, x1, y1 = polygon_bbox(polygons, pad)
       box = (int(x0 * buf.width), int(y0 * buf.height),
              int(x1 * buf.width), int(y1 * buf.height))
@@ -545,6 +556,8 @@ class Detector:
       state = self.states[side]
       if done_at <= state.last_model_result:
         continue                            # already folded this one in
+      if state.last_model_result > 0:
+        state.run_gap = min(10.0, done_at - state.last_model_result)
       state.last_model_result = done_at
       state.occluded = person
       state.model_runs += 1
@@ -555,6 +568,7 @@ class Detector:
         if (state.runs_since_hit <= CONFIRM_MISS_TOLERANCE
             and done_at - state.pending_hit <= CONFIRM_MAX_GAP):
           state.last_model_hit = done_at
+          state.hold_span = min(HOLD_MAX, max(MODEL_HOLD, HOLD_GAP_FACTOR * state.run_gap))
         state.runs_since_hit = 0
         state.pending_hit = done_at
       else:
@@ -575,7 +589,12 @@ class Detector:
       state = self.states[side]
       if now - state.last_model_run < self._model_interval(side, blinkers):
         continue
-      jobs = self.model.prepare(buf, side, self.polygons[side])
+      # One scale per run, alternating: a two-scale job measured ~5.6s under
+      # onroad-like load, and cadence is what confirmation and hold live on.
+      # Consecutive runs still cover both scales inside one confirmation pair.
+      state.pad_flip = getattr(state, "pad_flip", 0) ^ 1
+      pads = (MODEL_PADS[state.pad_flip % len(MODEL_PADS)],)
+      jobs = self.model.prepare(buf, side, self.polygons[side], pads)
       if not jobs:
         return
       if self.worker.submit(side, jobs):
@@ -614,9 +633,9 @@ class Detector:
     if self.fusion == "motion":
       return bool(motion and not state.occluded)
 
-    confirmed = now - state.last_model_hit < MODEL_HOLD
+    confirmed = now - state.last_model_hit < state.hold_span
     if confirmed:
-      state.hold_until = max(state.hold_until, state.last_model_hit + MODEL_HOLD)
+      state.hold_until = max(state.hold_until, state.last_model_hit + state.hold_span)
     if self.fusion == "either":
       return bool(confirmed or (motion and not state.occluded))
 
@@ -745,6 +764,7 @@ def vision_bsm_thread():
   left = right = False
 
   last_rss_check = 0.0
+  last_cadence_log = 0.0
   frame_errors = 0
 
   try:
@@ -758,6 +778,11 @@ def vision_bsm_thread():
           cloudlog.error(f"vision_bsm: RSS {rss:.0f} MB over the {RSS_LIMIT_MB} MB "
                          "limit - exiting so manager restarts us clean")
           sys.exit(1)
+        if detector is not None and now - last_cadence_log > 60.0:
+          last_cadence_log = now
+          gaps = {s2: round(detector.states[s2].run_gap, 1) for s2 in ("left", "right")}
+          runs = {s2: detector.states[s2].model_runs for s2 in ("left", "right")}
+          cloudlog.info(f"vision_bsm cadence: gaps={gaps} runs={runs}")
 
       if now - last_config_check > CONFIG_CHECK_TIME:
         new_config = read_config()
