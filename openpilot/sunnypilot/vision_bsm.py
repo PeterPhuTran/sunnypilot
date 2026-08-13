@@ -120,13 +120,13 @@ MODEL_SCORE_DEFAULT = {"left": 0.12, "right": 0.08}
 # collect scores down to here so the daemon's own numbers can be swept against
 # labels; only the threshold decides whether a warning is raised
 MODEL_FLOOR = 0.02
-# Sized between two failure modes, both measured: 4s produced stale-hold
-# false tiles (7 of 24 sampled fired tiles had no live detection), and 1.2s
-# was shorter than the per-side check cadence, so even a steadily-confirmed
-# car flickered. Must outlive one per-side check gap (~2.2s idle cadence: ~1s inference plus
-# alternation) or a steadily-confirmed car flickers off between checks. Still
-# well under the original 4s that produced stale-hold false tiles.
-MODEL_HOLD = 2.4
+# Floor of the adaptive hold. History: 4s produced stale-hold false tiles,
+# and 1.2s once flickered - but only because the old two-scale jobs ran ~5s.
+# With the 320 model a run is ~140ms and the intervals above pace the sides at
+# well under a second, so 1.2s comfortably covers the cadence again, and the
+# adaptive hold (HOLD_GAP_FACTOR x observed gap) still stretches it whenever
+# the device is slower than the bench.
+MODEL_HOLD = 1.2
 # A warning needs two model hits, not one - but confirmation counts RUNS, not
 # wall-clock. The first version used a time window sized to the check interval
 # and produced a 46-minute drive with zero warnings: consecutive completions
@@ -145,7 +145,7 @@ CONFIRM_MAX_GAP = 12.0
 # stays warned between checks at any cadence; clamped so a stale hold stays
 # bounded well under the 4s regime that produced false tiles.
 HOLD_GAP_FACTOR = 1.5
-HOLD_MAX = 6.0
+HOLD_MAX = 4.0
 # A single crop at 0.30 padding found less than half the cars in the labelled
 # set, and a third of them scored exactly zero - invisible, not merely below
 # threshold - so no amount of threshold tuning could recover them. The wide crop
@@ -173,9 +173,15 @@ MOTION_EXTEND = 0.8
 MAX_HOLD = 2.0
 FUSION_DEFAULT = "model"        # "model" | "either" | "motion"
 # how often a zone may be checked, by what the driver is doing
-MODEL_INTERVAL_SIGNALLING = 0.5
-MODEL_INTERVAL_ACTIVE = 1.5
-MODEL_INTERVAL_IDLE = 3.0
+# Retuned for the fine-tuned 320: a single run measures ~140ms parked, so the
+# old 0.5s floor - sized for 5s+ two-scale jobs - had become the bottleneck
+# itself. Batching both sides into one inference was measured and rejected:
+# batch-2 costs 2.03x batch-1 on this 2-thread CPU (no amortisation), and the
+# dynamic-batch export scrambles YOLOv10's end-to-end head outputs outright.
+# Sides keep alternating; these intervals just let them alternate faster.
+MODEL_INTERVAL_SIGNALLING = 0.25
+MODEL_INTERVAL_ACTIVE = 0.75
+MODEL_INTERVAL_IDLE = 1.5
 # COCO ids
 VEHICLE_CLASSES = {1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 PERSON_CLASS = 0
@@ -322,7 +328,10 @@ class ModelDetector:
       # Network size comes from the input shape; the class map comes from the
       # ultralytics names metadata when present (the fine-tuned model ships
       # 0=vehicle 1=person), falling back to the stock COCO ids.
-      self.net = int(self.session.get_inputs()[0].shape[2])
+      dim = self.session.get_inputs()[0].shape[2]
+      # dynamic exports carry symbolic dims ("height") - int() would throw and
+      # silently demote the daemon to motion-only via the except below
+      self.net = int(dim) if isinstance(dim, int) else MODEL_NET
       names = {}
       try:
         import ast
