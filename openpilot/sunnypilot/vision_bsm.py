@@ -68,7 +68,13 @@ STATE_PATH = "/dev/shm/vision_bsm_state"
 # onnxruntime lives under /data so an AGNOS update cannot remove it. Appended,
 # not inserted, so the system numpy stays ahead of the copy pip pulled in.
 SITE_PACKAGES = "/data/vbsm/site-packages"
-MODEL_PATH = "/data/vbsm_models/yolov10n.onnx"
+# First existing candidate wins: the fine-tuned 320 (4.0x faster on this CPU,
+# held-out accuracy parity with the 640, much wider score margins), falling
+# back to the stock 640 so a missing model file degrades instead of disabling.
+MODEL_PATH_CANDIDATES = ("/data/vbsm_models/vbsm320.onnx",
+                         "/data/vbsm_models/yolov10n.onnx")
+MODEL_PATH = next((p for p in MODEL_PATH_CANDIDATES if os.path.isfile(p)),
+                  MODEL_PATH_CANDIDATES[-1])
 
 BACKGROUND_ALPHA = 0.1
 BRIGHT_FRACTION_THRESHOLD = 0.10
@@ -105,7 +111,12 @@ MODEL_THREADS = 2
 # Both are low because the scores are small once the cabin is excluded; see
 # MAX_BOX_COVERAGE. Override with "model_score" in the config, either a single
 # number for both sides or {"left": x, "right": y}.
-MODEL_SCORE_DEFAULT = {"left": 0.08, "right": 0.03}
+# Calibrated for the fine-tuned 320 against the held-out labels: left empties
+# top out at 0.087 with vehicles up to 0.95; right empties are all exactly
+# 0.000 with vehicles from 0.20. Margins on both sides of each threshold.
+# (The old 640 model wanted {left 0.08, right 0.03}; if the daemon ever falls
+# back to it, set model_score in the config accordingly.)
+MODEL_SCORE_DEFAULT = {"left": 0.12, "right": 0.08}
 # collect scores down to here so the daemon's own numbers can be swept against
 # labels; only the threshold decides whether a warning is raised
 MODEL_FLOOR = 0.02
@@ -287,6 +298,9 @@ class ModelDetector:
     self.input_name = None
     self.masks = {}
     self.thresholds = dict(thresholds or MODEL_SCORE_DEFAULT)
+    self.net = MODEL_NET
+    self.vehicle_classes = set(VEHICLE_CLASSES)
+    self.person_classes = {PERSON_CLASS}
     if SITE_PACKAGES not in sys.path:
       sys.path.append(SITE_PACKAGES)
     try:
@@ -304,7 +318,26 @@ class ModelDetector:
       opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
       self.session = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
       self.input_name = self.session.get_inputs()[0].name
-      cloudlog.info(f"vision_bsm: model loaded from {model_path}")
+      # The model file is the authority on its own geometry and classes.
+      # Network size comes from the input shape; the class map comes from the
+      # ultralytics names metadata when present (the fine-tuned model ships
+      # 0=vehicle 1=person), falling back to the stock COCO ids.
+      self.net = int(self.session.get_inputs()[0].shape[2])
+      names = {}
+      try:
+        import ast
+        raw = self.session.get_modelmeta().custom_metadata_map.get("names", "")
+        names = ast.literal_eval(raw) if raw else {}
+      except (ValueError, SyntaxError):
+        names = {}
+      if names and "vehicle" in names.values():
+        self.vehicle_classes = {i for i, n in names.items() if n == "vehicle"}
+        self.person_classes = {i for i, n in names.items() if n == "person"}
+      else:
+        self.vehicle_classes = set(VEHICLE_CLASSES)
+        self.person_classes = {PERSON_CLASS}
+      cloudlog.info(f"vision_bsm: model loaded from {model_path} "
+                    f"net={self.net} vehicle_classes={sorted(self.vehicle_classes)}")
     except Exception:
       cloudlog.exception("vision_bsm: model unavailable, falling back to motion only")
       self.session = None
@@ -400,10 +433,11 @@ class ModelDetector:
   def _infer_one(self, crop, mask, side):
     """One crop through the model, filtered to detections on the glass."""
     img = Image.fromarray(crop)
-    scale = min(MODEL_NET / img.width, MODEL_NET / img.height)
+    net = self.net
+    scale = min(net / img.width, net / img.height)
     new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
-    offset = ((MODEL_NET - new_size[0]) // 2, (MODEL_NET - new_size[1]) // 2)
-    canvas = Image.new("RGB", (MODEL_NET, MODEL_NET), (MODEL_GREY,) * 3)
+    offset = ((net - new_size[0]) // 2, (net - new_size[1]) // 2)
+    canvas = Image.new("RGB", (net, net), (MODEL_GREY,) * 3)
     canvas.paste(img.resize(new_size, Image.BILINEAR), offset)
 
     # transpose only restrides the view; some fused kernels mishandle a
@@ -420,7 +454,7 @@ class ModelDetector:
       if score < MODEL_FLOOR:
         break                                  # sorted, so nothing below matters
       cls = int(det[5])
-      if cls not in VEHICLE_CLASSES and cls != PERSON_CLASS:
+      if cls not in self.vehicle_classes and cls not in self.person_classes:
         continue
       # letterboxed network pixels back to crop pixels
       det_box = ((det[0] - offset[0]) / scale, (det[1] - offset[1]) / scale,
@@ -430,7 +464,7 @@ class ModelDetector:
         continue                               # the car we are sitting in
       if self._inside_fraction(mask, det_box) < MODEL_INSIDE:
         continue                               # the driver, or our own bodywork
-      if cls == PERSON_CLASS:
+      if cls in self.person_classes:
         person = person or score >= self.thresholds[side]
       else:
         best = max(best, score)
