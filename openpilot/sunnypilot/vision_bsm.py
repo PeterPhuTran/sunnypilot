@@ -136,6 +136,8 @@ MODEL_HOLD = 1.2
 # one missed run) both saw the car; the wall-clock cap only guards against
 # confirming across genuinely stale gaps.
 CONFIRM_MISS_TOLERANCE = 1
+# Single-hit bypass for high-confidence detections; see the fold for why.
+CONFIRM_BYPASS_SCORE = 0.45
 # Pathology guard only, NOT a cadence assumption. Measured under onroad-like
 # load, same-side completions arrive 5.6s apart (p90 8.1s) even for the
 # signalled side - a cap below that starves confirmation, which silenced two
@@ -551,12 +553,12 @@ class ModelWorker:
 
       side, jobs = job
       try:
-        vehicle, person = self.model.infer(jobs, side)
+        score, person = self.model.score(jobs, side)
       except Exception:
         cloudlog.exception("vision_bsm: model inference failed")
-        vehicle = person = False
+        score, person = 0.0, False
       with self.lock:
-        self.results[side] = (vehicle, person, time.monotonic())
+        self.results[side] = (score, person, time.monotonic())
         self.busy = False
 
 
@@ -595,7 +597,8 @@ class Detector:
     if self.worker is None:
       return
 
-    for side, (vehicle, person, done_at) in self.worker.take().items():
+    for side, (score, person, done_at) in self.worker.take().items():
+      vehicle = score >= self.model.thresholds[side]
       state = self.states[side]
       if done_at <= state.last_model_result:
         continue                            # already folded this one in
@@ -607,9 +610,15 @@ class Detector:
       if vehicle:
         state.model_hits += 1
         # confirm-before-raise: this run plus the previous run of this side
-        # (one miss tolerated) - a single spurious output still cannot chime
-        if (state.runs_since_hit <= CONFIRM_MISS_TOLERANCE
-            and done_at - state.pending_hit <= CONFIRM_MAX_GAP):
+        # (one miss tolerated) - a single WEAK output still cannot chime. A
+        # strong one can: a fast overtaker on route 38 was scoreable for only
+        # 1.2s of a signal window at 0.65-0.74, and two-hit confirmation ate
+        # it. On this model empty windows measure <=0.087, so a single hit at
+        # CONFIRM_BYPASS_SCORE is not phantom territory; persistent false
+        # sources (parked rows) were going to confirm one run later anyway.
+        if (score >= CONFIRM_BYPASS_SCORE
+            or (state.runs_since_hit <= CONFIRM_MISS_TOLERANCE
+                and done_at - state.pending_hit <= CONFIRM_MAX_GAP)):
           state.last_model_hit = done_at
           state.hold_span = min(HOLD_MAX, max(MODEL_HOLD, HOLD_GAP_FACTOR * state.run_gap))
         state.runs_since_hit = 0
@@ -624,9 +633,14 @@ class Detector:
     if self.worker.busy:
       return
 
-    # the side being signalled always wins, otherwise alternate
-    order = [s for s in ("left", "right") if blinkers.get(s)]
-    order += [self.next_side, "left" if self.next_side == "right" else "right"]
+    # While signalling, the signalled side gets the worker EXCLUSIVELY - the
+    # other window was stealing a third of the cadence exactly when latency
+    # matters most. Idle, the sides alternate as before.
+    signalled = [s for s in ("left", "right") if blinkers.get(s)]
+    if signalled:
+      order = signalled
+    else:
+      order = [self.next_side, "left" if self.next_side == "right" else "right"]
 
     for side in order:
       state = self.states[side]
