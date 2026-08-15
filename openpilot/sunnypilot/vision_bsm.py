@@ -56,7 +56,8 @@ import time
 
 import numpy as np
 
-from msgq.visionipc import VisionIpcClient, VisionStreamType
+from msgq.visionipc import VisionIpcClient
+from openpilot.cereal.visionipc import VisionStreamType
 from PIL import Image, ImageDraw
 
 import openpilot.cereal.messaging as messaging
@@ -805,7 +806,7 @@ def vision_bsm_thread():
   except OSError:
     pass
 
-  client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_DRIVER, True)
+  client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_CABIN, True)
   sm = messaging.SubMaster(['carState'])
   # Loaded on first use, not here: the model and its runtime cost ~100 MB, and
   # building them up front meant switching the mod off in settings left every
@@ -885,7 +886,7 @@ def vision_bsm_thread():
       if buf is None:
         missed_frames += 1
         if missed_frames > RECONNECT_TIMEOUT:
-          client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_DRIVER, True)
+          client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_CABIN, True)
           connected = False
           missed_frames = 0
         continue
