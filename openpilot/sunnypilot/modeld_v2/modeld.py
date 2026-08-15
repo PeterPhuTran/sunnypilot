@@ -278,8 +278,15 @@ class ModelState(ModelStateBase):
                             lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
     if 'action' not in model_output:
       plan = model_output['plan'][0]
-      desired_accel, should_stop = get_accel_from_plan(plan[:, Plan.VELOCITY][:, 0], plan[:, Plan.ACCELERATION][:, 0], self.constants.T_IDXS,
-                                                       action_t=long_action_t)
+      # VBSM_COMPAT: staging 30a9cdc7 slimmed get_accel_from_plan to a single return
+      # value but left this non-action-model branch unpacking two, which crashes
+      # custom model bundles (e.g. WMI V12). Restore the exact pre-refresh pairing:
+      # should_stop(v_now, a_target) with v_now from the plan, thresholds 0.25/0.1.
+      plan_speeds = plan[:, Plan.VELOCITY][:, 0]
+      desired_accel = get_accel_from_plan(plan_speeds, plan[:, Plan.ACCELERATION][:, 0], self.constants.T_IDXS,
+                                          action_t=long_action_t)
+      plan_v_now = plan_speeds[0] if len(plan_speeds) == len(self.constants.T_IDXS) else 0.0
+      should_stop = bool(plan_v_now < 0.25 and desired_accel < 0.1)
 
       curvature_plan = (plan + (self.PLANPLUS_CONTROL - 1.0) * model_output['planplus'][0]
                         if 'planplus' in model_output and self.PLANPLUS_CONTROL != 1.0 else plan)
