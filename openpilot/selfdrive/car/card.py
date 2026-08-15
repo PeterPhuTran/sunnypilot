@@ -83,7 +83,7 @@ class Car:
     self._vision_bsm_counter = 0
     self._vision_bsm_left = False
     self._vision_bsm_right = False
-    self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'liveTracks'] + ['carParamsSP', 'carStateSP'])
+    self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
 
@@ -276,10 +276,10 @@ class Car:
     self.pm.send('carState', cs_send)
 
     if RD is not None:
-      tracks_msg = messaging.new_message('liveTracks')
+      tracks_msg = messaging.new_message('radarTracks')
       tracks_msg.valid = not any(RD.errors.to_dict().values())
-      tracks_msg.liveTracks = RD
-      self.pm.send('liveTracks', tracks_msg)
+      tracks_msg.radarTracks = RD
+      self.pm.send('radarTracks', tracks_msg)
 
     # carParamsSP - logged every 50 seconds (> 1 per segment)
     if self.sm.frame % int(50. / DT_CTRL) == 0:
