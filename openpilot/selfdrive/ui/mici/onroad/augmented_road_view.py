@@ -409,7 +409,7 @@ class AugmentedRoadView(CameraView):
         # and the blind spot preview stayed on screen until speed left the
         # band. Measured on the 2026-08-10 drive: experimental active 100% of
         # the time, so every turn ending in the band latched.
-        target = effective if effective in (WIDE_CAM, ROAD_CAM) else ROAD_CAM
+        target = effective if effective in (WIDE_CAM, NARROW_ROAD_CAM) else NARROW_ROAD_CAM
     else:
       target = NARROW_ROAD_CAM
 
