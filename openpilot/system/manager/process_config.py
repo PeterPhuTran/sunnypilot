@@ -190,6 +190,7 @@ procs += [
 
   # Camera blind spot monitor
   PythonProcess("visionbsmd", "openpilot.sunnypilot.vision_bsm", vision_bsm, enabled=MICI),
+  PythonProcess("uiwatchdog", "openpilot.sunnypilot.ui_watchdog", always_run, enabled=MICI),
 
   # mapd
   NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),
