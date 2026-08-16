@@ -122,6 +122,29 @@ jobs:
             || { echo "::error::prebuilt marker missing"; fail=1; }
           git cat-file blob "$C:openpilot/sunnypilot/vision_bsm.py" > /tmp/vb.py
           python3 -m py_compile /tmp/vb.py || { echo "::error::daemon does not compile"; fail=1; }
+          # regression guards from the route-46 post-mortem:
+          # (a) undefined-name sweep catches missed upstream renames that
+          #     import tests cannot see (NameError inside function bodies)
+          pip install --quiet pyflakes
+          NEWBASE=$(git cat-file blob "$C:$MANIFEST" | jq -r .base)
+          FILES=$(git cat-file blob "$C:$MANIFEST" | jq -r ".files[]")
+          for f in $FILES; do
+            case "$f" in
+              *.py)
+                git cat-file blob "$C:$f" > /tmp/pf.py
+                PF=$(python3 -m pyflakes /tmp/pf.py | grep "undefined name" || true)
+                [ -z "$PF" ] || { echo "::error::pyflakes $f: $PF"; fail=1; }
+                ;;
+            esac
+          done
+          # (b) file-mode parity with upstream — API-authored commits can
+          #     silently flatten 100755 to 100644, which kills exec-ed
+          #     entrypoints (modeld exited 126 for a whole drive)
+          for f in $FILES; do
+            UP=$(git ls-tree "$NEWBASE" -- "$f" | awk "{print $1}")
+            OURS=$(git ls-tree "$C" -- "$f" | awk "{print $1}")
+            [ -z "$UP" ] || [ "$UP" = "$OURS" ] || { echo "::error::mode mismatch $f: ours $OURS vs upstream $UP"; fail=1; }
+          done
           exit $fail
 
       - name: publish
