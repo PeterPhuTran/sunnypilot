@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""VBSM_WATCHDOG: recover a UI that is alive but never paints.
+"""VBSM_WATCHDOG: keep the mici UI alive — respawn on death, recover stalls.
 
-Failure class seen on-road: the UI process starts, initializes raylib, then
-deadlocks before presenting its first frame (suspected EGL setup contending
-with the driving model's first-boot kernel compilation). The process is alive,
-so the ordinary process watchdog sees nothing, and the boot splash stays on
-screen for the whole drive.
+Route-46 post-mortem facts this design rests on:
+- This tree's manager NEVER respawns a process that dies mid-session
+  (ManagerProcess.start() no-ops while self.proc is set), so a UI crash
+  leaves the boot splash up for the rest of the drive.
+- The observed failures were (a) a crash (NameError) with no respawn and
+  (b) an offroad boot where the UI completed construction then never
+  presented its first frame (upstream issue class: commaai/openpilot#37845).
 
-Detection: while onroad (camerad present), a healthy UI renders continuously
-and burns CPU; a deadlocked one accrues essentially none. If the UI process
-gains less than ~1s of CPU time over a 30s window after the system has been
-onroad for 90s, it is stalled: capture /proc evidence for the post-mortem,
-kill it, and let the manager respawn it. By then the boot storm has usually
-passed and the respawn paints. At most 3 kills per boot, so a genuinely
-broken UI ends up parked rather than thrashing.
+So this watchdog owns recovery itself:
+- DEAD:  if no UI process exists (onroad or offroad), spawn a replacement
+  directly with the same interpreter and environment.
+- STALL: while onroad, a healthy UI renders continuously and burns CPU; if
+  the UI process gains < ~1s CPU over a 30s window after 90s onroad, dump
+  /proc evidence (wchan + kernel stacks name the blocked syscall — also the
+  evidence comma asks for on #37845), kill it, and respawn.
+
+Rate limits: max 6 respawns per boot, min 20s apart — a deterministically
+crashing UI ends up parked with its crash files rather than thrashing.
+NOTE: crash files under /data/community/crashes carry a stale Jul-28 date
+when the boot predates NTP sync; search by mtime, not name.
 """
 import os
 import signal
+import subprocess
+import sys
 import time
 
 from openpilot.common.swaglog import cloudlog
@@ -26,7 +35,9 @@ CHECK_INTERVAL = 5.0
 WINDOW = 30.0
 MIN_ONROAD_S = 90.0
 MIN_ACTIVE_TICKS = 100   # < ~1s CPU over the window while onroad = stalled
-MAX_KILLS_PER_BOOT = 3
+MAX_RESPAWNS_PER_BOOT = 6
+MIN_RESPAWN_GAP_S = 20.0
+STARTUP_GRACE_S = 30.0   # leave a freshly spawned UI alone this long
 
 
 def scan_procs():
@@ -82,22 +93,54 @@ def dump_evidence(pid):
     return None
 
 
+def spawn_ui():
+  # Same interpreter and environment as this managed process; own session so
+  # a watchdog restart never takes the UI down with it.
+  return subprocess.Popen(
+    [sys.executable, "-c", "from openpilot.selfdrive.ui.ui import main; main()"],
+    cwd="/data/openpilot", env=os.environ.copy(),
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    start_new_session=True,
+  )
+
+
 def main():
   onroad_since = None
   prev = None  # (pid, ticks, monotonic)
-  kills = 0
+  respawns = 0
+  last_respawn = 0.0
+  boot_mono = time.monotonic()
   while True:
     time.sleep(CHECK_INTERVAL)
     now = time.monotonic()
     ui, camerad = scan_procs()
+
     if not camerad:
       onroad_since = None
-      prev = None
-      continue
-    if onroad_since is None:
+    elif onroad_since is None:
       onroad_since = now
+
+    def may_respawn():
+      return (respawns < MAX_RESPAWNS_PER_BOOT
+              and now - last_respawn >= MIN_RESPAWN_GAP_S
+              and now - boot_mono >= STARTUP_GRACE_S)
+
+    # DEAD: manager will not bring it back; we do.
     if ui is None:
-      prev = None  # manager owns respawn
+      prev = None
+      if may_respawn():
+        respawns += 1
+        last_respawn = now
+        cloudlog.error(f"ui_watchdog: ui dead, respawning ({respawns}/{MAX_RESPAWNS_PER_BOOT})")
+        try:
+          spawn_ui()
+        except OSError as e:
+          cloudlog.error(f"ui_watchdog: respawn failed: {e}")
+      continue
+
+    # STALL (onroad only — an idle offroad UI legitimately burns ~no CPU)
+    if onroad_since is None:
+      prev = None
       continue
     ticks = cpu_ticks(ui)
     if ticks is None:
@@ -109,15 +152,20 @@ def main():
     if now - prev[2] < WINDOW:
       continue
     delta = ticks - prev[1]
-    if now - onroad_since >= MIN_ONROAD_S and delta < MIN_ACTIVE_TICKS and kills < MAX_KILLS_PER_BOOT:
+    if now - onroad_since >= MIN_ONROAD_S and delta < MIN_ACTIVE_TICKS and may_respawn():
       evidence = dump_evidence(ui)
-      kills += 1
+      respawns += 1
+      last_respawn = now
       cloudlog.error(f"ui_watchdog: ui pid {ui} stalled ({delta} ticks/{WINDOW:.0f}s onroad), "
-                     f"kill {kills}/{MAX_KILLS_PER_BOOT}, evidence={evidence}")
+                     f"kill+respawn {respawns}/{MAX_RESPAWNS_PER_BOOT}, evidence={evidence}")
       try:
         os.kill(ui, signal.SIGKILL)
       except OSError:
         pass
+      try:
+        spawn_ui()
+      except OSError as e:
+        cloudlog.error(f"ui_watchdog: respawn failed: {e}")
       prev = None
     else:
       prev = (ui, ticks, now)
