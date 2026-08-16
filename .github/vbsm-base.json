@@ -1,6 +1,7 @@
 {
   "base": "30a9cdc7d028470c0188444218ae2ae86e28e840",
   "files": [
+    "VBSM.md",
     "openpilot/sunnypilot/vision_bsm.py",
     "openpilot/system/manager/process_config.py",
     "openpilot/selfdrive/car/card.py",
