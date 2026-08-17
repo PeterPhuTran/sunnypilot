@@ -1,73 +1,73 @@
 #!/usr/bin/env python3
-"""VBSM_WATCHDOG: keep the mici UI alive — respawn on death, recover stalls.
+"""VBSM_WATCHDOG: recover a mici UI that is alive but has stopped drawing.
 
-Route-46 post-mortem facts this design rests on:
-- This tree's manager NEVER respawns a process that dies mid-session
-  (ManagerProcess.start() no-ops while self.proc is set), so a UI crash
-  leaves the boot splash up for the rest of the drive.
-- The observed failures were (a) a crash (NameError) with no respawn and
-  (b) an offroad boot where the UI completed construction then never
-  presented its first frame (upstream issue class: commaai/openpilot#37845).
+Division of labour with the manager: VBSM_RESTART in system/manager/process.py
+reaps a dead child so start() can rebuild it, which is what restores the
+process AND clears the processNotRunning soft-disable. A *frozen* process is
+still alive, so no restart policy can see it — that is this watchdog's only
+job. It proves the UI has stopped presenting frames, kills it, and lets the
+manager bring it back properly.
 
-So this watchdog owns recovery itself:
-- DEAD:  if no UI process exists (onroad or offroad), spawn a replacement
-  directly with the same interpreter and environment.
-- STALL: while onroad, a healthy UI renders continuously and burns CPU; if
-  the UI process gains < ~1s CPU over a 30s window after 90s onroad, dump
-  /proc evidence (wchan + kernel stacks name the blocked syscall — also the
-  evidence comma asks for on #37845), kill it, and respawn.
+It deliberately spawns nothing. The v2 watchdog spawned replacements itself,
+which was wrong twice over: the replacement was not manager-tracked (so
+managerState still reported ui down and openpilot stayed soft-disabled), and a
+spawn racing a live UI produced a second 'uiDebug' publisher, whose
+MultiplePublishersError took down the real UI mid-drive.
 
-Rate limits: max 6 respawns per boot, min 20s apart — a deterministically
-crashing UI ends up parked with its crash files rather than thrashing.
-NOTE: crash files under /data/community/crashes carry a stale Jul-28 date
-when the boot predates NTP sync; search by mtime, not name.
+Liveness is the 'uiDebug' message that ui.py publishes once per rendered
+frame. gui_app.render() skips the loop body — and so the publish — whenever
+the screen is off, but onroad the screen is always awake (ui_state:
+awake = ignition or not interaction_timeout), so onroad "no uiDebug" means
+"not drawing frames". That is a direct signal. It replaces a CPU-tick
+heuristic that could not tell a busy UI from an idle sibling: that heuristic
+matched the substring "selfdrive.ui", which also matches
+'openpilot.selfdrive.ui.soundd', and killed soundd for idling as designed.
+Process identity is therefore matched on the exact proctitle, never a prefix.
+
+NOTE: crash files under /data/community/crashes carry a stale Jul-28 date when
+the boot predates NTP sync; search by mtime, not by name.
 """
 import os
 import signal
-import subprocess
-import sys
 import time
 
+from openpilot.cereal import messaging
 from openpilot.common.swaglog import cloudlog
 
+UI_PROCTITLE = "openpilot.selfdrive.ui.ui"
 EVIDENCE_DIR = "/data/vbsm_eval"
-CHECK_INTERVAL = 5.0
-WINDOW = 30.0
-MIN_ONROAD_S = 90.0
-MIN_ACTIVE_TICKS = 100   # < ~1s CPU over the window while onroad = stalled
-MAX_RESPAWNS_PER_BOOT = 6
-MIN_RESPAWN_GAP_S = 20.0
-STARTUP_GRACE_S = 30.0   # leave a freshly spawned UI alone this long
+
+CHECK_INTERVAL = 2.0
+STALL_TIMEOUT = 30.0     # onroad seconds with no rendered frame = frozen
+MIN_ONROAD_S = 90.0      # let the camera stack and first model runs settle
+MAX_KILLS_PER_BOOT = 3
+MIN_KILL_GAP_S = 60.0    # manager restart + UI startup needs room to finish
 
 
-def scan_procs():
-  """One /proc pass: (ui_pid, camerad_running)."""
-  ui, camerad = None, False
-  for p in os.listdir("/proc"):
-    if not p.isdigit():
+def find_ui():
+  """PID of the UI, matched on its exact proctitle.
+
+  Exact, not substring: 'openpilot.selfdrive.ui.soundd' shares the prefix.
+  """
+  for entry in os.listdir("/proc"):
+    if not entry.isdigit():
       continue
     try:
-      with open(f"/proc/{p}/cmdline", "rb") as f:
-        cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+      with open(f"/proc/{entry}/cmdline", "rb") as f:
+        cmd = f.read().rstrip(b"\0").replace(b"\0", b" ").decode(errors="replace")
     except OSError:
       continue
-    if "camerad" in cmd and "watchdog" not in cmd:
-      camerad = True
-    if "selfdrive.ui" in cmd and "watchdog" not in cmd:
-      ui = int(p)
-  return ui, camerad
-
-
-def cpu_ticks(pid):
-  try:
-    with open(f"/proc/{pid}/stat") as f:
-      parts = f.read().rsplit(")", 1)[1].split()
-    return int(parts[11]) + int(parts[12])  # utime + stime
-  except (OSError, IndexError, ValueError):
-    return None
+    if cmd == UI_PROCTITLE:
+      return int(entry)
+  return None
 
 
 def dump_evidence(pid):
+  """wchan + per-thread kernel stacks name the blocked syscall.
+
+  This is also the evidence comma asks for on the splash-hang issue class
+  (commaai/openpilot#37845), so keep it even when recovery works.
+  """
   try:
     os.makedirs(EVIDENCE_DIR, exist_ok=True)
     path = os.path.join(EVIDENCE_DIR, f"ui_stall_{int(time.time())}.log")
@@ -93,82 +93,63 @@ def dump_evidence(pid):
     return None
 
 
-def spawn_ui():
-  # Same interpreter and environment as this managed process; own session so
-  # a watchdog restart never takes the UI down with it.
-  return subprocess.Popen(
-    [sys.executable, "-c", "from openpilot.selfdrive.ui.ui import main; main()"],
-    cwd="/data/openpilot", env=os.environ.copy(),
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    start_new_session=True,
-  )
-
-
 def main():
+  sm = messaging.SubMaster(['uiDebug', 'deviceState'])
+  now = time.monotonic()
+  last_frame = now
   onroad_since = None
-  prev = None  # (pid, ticks, monotonic)
-  respawns = 0
-  last_respawn = 0.0
-  boot_mono = time.monotonic()
+  kills = 0
+  last_kill = 0.0
+
   while True:
     time.sleep(CHECK_INTERVAL)
     now = time.monotonic()
-    ui, camerad = scan_procs()
+    sm.update(0)
 
-    if not camerad:
+    if sm.updated['uiDebug']:
+      last_frame = now
+
+    started = bool(sm['deviceState'].started) if sm.seen['deviceState'] else False
+    if not started:
+      # offroad the screen is allowed to sleep, which legitimately stops
+      # rendering: there is no liveness signal to judge here.
       onroad_since = None
-    elif onroad_since is None:
-      onroad_since = now
-
-    def may_respawn():
-      return (respawns < MAX_RESPAWNS_PER_BOOT
-              and now - last_respawn >= MIN_RESPAWN_GAP_S
-              and now - boot_mono >= STARTUP_GRACE_S)
-
-    # DEAD: manager will not bring it back; we do.
-    if ui is None:
-      prev = None
-      if may_respawn():
-        respawns += 1
-        last_respawn = now
-        cloudlog.error(f"ui_watchdog: ui dead, respawning ({respawns}/{MAX_RESPAWNS_PER_BOOT})")
-        try:
-          spawn_ui()
-        except OSError as e:
-          cloudlog.error(f"ui_watchdog: respawn failed: {e}")
+      last_frame = now
       continue
 
-    # STALL (onroad only — an idle offroad UI legitimately burns ~no CPU)
     if onroad_since is None:
-      prev = None
+      onroad_since = now
+      last_frame = now
       continue
-    ticks = cpu_ticks(ui)
-    if ticks is None:
-      prev = None
+
+    if now - onroad_since < MIN_ONROAD_S or now - last_frame < STALL_TIMEOUT:
       continue
-    if prev is None or prev[0] != ui:
-      prev = (ui, ticks, now)
+    if kills >= MAX_KILLS_PER_BOOT or now - last_kill < MIN_KILL_GAP_S:
       continue
-    if now - prev[2] < WINDOW:
+
+    if not sm.seen['uiDebug']:
+      # never received a single frame message, so silence proves nothing about
+      # the UI — it could equally be this subscription that is broken, and
+      # killing on that would be the same class of false positive as v2.
+      # A UI that never starts is a death, which the manager already owns.
       continue
-    delta = ticks - prev[1]
-    if now - onroad_since >= MIN_ONROAD_S and delta < MIN_ACTIVE_TICKS and may_respawn():
-      evidence = dump_evidence(ui)
-      respawns += 1
-      last_respawn = now
-      cloudlog.error(f"ui_watchdog: ui pid {ui} stalled ({delta} ticks/{WINDOW:.0f}s onroad), "
-                     f"kill+respawn {respawns}/{MAX_RESPAWNS_PER_BOOT}, evidence={evidence}")
-      try:
-        os.kill(ui, signal.SIGKILL)
-      except OSError:
-        pass
-      try:
-        spawn_ui()
-      except OSError as e:
-        cloudlog.error(f"ui_watchdog: respawn failed: {e}")
-      prev = None
-    else:
-      prev = (ui, ticks, now)
+
+    pid = find_ui()
+    if pid is None:
+      # already gone; the manager's restart policy owns this case
+      last_frame = now
+      continue
+
+    evidence = dump_evidence(pid)
+    kills += 1
+    last_kill = now
+    last_frame = now
+    cloudlog.error(f"ui_watchdog: ui pid {pid} drew no frame for {STALL_TIMEOUT:.0f}s onroad, "
+                   f"killing for manager restart ({kills}/{MAX_KILLS_PER_BOOT}), evidence={evidence}")
+    try:
+      os.kill(pid, signal.SIGKILL)
+    except OSError as e:
+      cloudlog.error(f"ui_watchdog: kill failed: {e}")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
     "VBSM.md",
     "openpilot/sunnypilot/vision_bsm.py",
     "openpilot/sunnypilot/ui_watchdog.py",
+    "openpilot/system/manager/process.py",
     "openpilot/system/manager/process_config.py",
     "openpilot/selfdrive/car/card.py",
     "openpilot/selfdrive/selfdrived/selfdrived.py",
