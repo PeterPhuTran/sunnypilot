@@ -117,6 +117,12 @@ jobs:
           check VBSM_COMPAT      openpilot/sunnypilot/modeld_v2/modeld.py
           check VBSM_WATCHDOG    openpilot/sunnypilot/ui_watchdog.py
           check uiwatchdog       openpilot/system/manager/process_config.py
+          check VBSM_RESTART     openpilot/system/manager/process.py
+          # a lost restart policy is silent until something dies mid-drive, so
+          # assert the call sites too, not just the marker comment
+          test "$(git cat-file blob "$C:openpilot/system/manager/process.py" \
+                  | grep -c 'if self.hold_dead_proc():')" = 2 \
+            || { echo "::error::hold_dead_proc not wired into both start() methods"; fail=1; }
           # without this the device would try to compile, which it cannot do
           git rev-parse -q --verify "$C:prebuilt" > /dev/null \
             || { echo "::error::prebuilt marker missing"; fail=1; }
