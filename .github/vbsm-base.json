@@ -1,5 +1,5 @@
 {
-  "base": "5b4820d8fb6fe9ce3ddb86bcdd3b8daf0f9e3b50",
+  "base": "23c42a37cb45df05573737da49417ec5b8ea3b5a",
   "files": [
     "VBSM.md",
     "openpilot/sunnypilot/vision_bsm.py",
@@ -10,7 +10,6 @@
     "openpilot/selfdrive/selfdrived/selfdrived.py",
     "openpilot/selfdrive/ui/mici/layouts/settings/toggles.py",
     "openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py",
-    "openpilot/system/athena/athenad.py",
-    "openpilot/sunnypilot/modeld_v2/modeld.py"
+    "openpilot/system/athena/athenad.py"
   ]
 }
