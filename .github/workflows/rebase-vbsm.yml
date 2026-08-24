@@ -142,12 +142,12 @@ jobs:
                 ;;
             esac
           done
-          # (b) file-mode parity with upstream — API-authored commits can
+          # (b) file-mode parity with upstream - API-authored commits can
           #     silently flatten 100755 to 100644, which kills exec-ed
           #     entrypoints (modeld exited 126 for a whole drive)
           for f in $FILES; do
-            UP=$(git ls-tree "$NEWBASE" -- "$f" | awk "{print $1}")
-            OURS=$(git ls-tree "$C" -- "$f" | awk "{print $1}")
+            UP=$(git ls-tree "$NEWBASE" -- "$f" | awk '{print $1}')
+            OURS=$(git ls-tree "$C" -- "$f" | awk '{print $1}')
             [ -z "$UP" ] || [ "$UP" = "$OURS" ] || { echo "::error::mode mismatch $f: ours $OURS vs upstream $UP"; fail=1; }
           done
           exit $fail
