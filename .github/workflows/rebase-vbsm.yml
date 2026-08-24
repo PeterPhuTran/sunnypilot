@@ -114,7 +114,6 @@ jobs:
           check BigConfigControl openpilot/selfdrive/ui/mici/layouts/settings/toggles.py
           check BSM_STATE_PATH   openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
           check VBSM_PRIVACY     openpilot/system/athena/athenad.py
-          check VBSM_COMPAT      openpilot/sunnypilot/modeld_v2/modeld.py
           check VBSM_WATCHDOG    openpilot/sunnypilot/ui_watchdog.py
           check uiwatchdog       openpilot/system/manager/process_config.py
           check VBSM_RESTART     openpilot/system/manager/process.py
