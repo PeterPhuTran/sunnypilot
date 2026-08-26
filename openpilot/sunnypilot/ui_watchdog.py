@@ -216,9 +216,14 @@ class GpuKick:
       return
 
     # the running modeld must itself say it booted without the GPU; a missing
-    # param proves nothing and must never trigger a kill
+    # param proves nothing and must never trigger a kill. Loading alone is NOT
+    # that signal -- it goes False on SUCCESS too, and gating on it alone made
+    # the kick SIGKILL two perfectly healthy GPU sessions one second after
+    # their 39s BMV2 loads finished. UsbGpuActive is the actual verdict.
     loading = self.params.get("UsbGpuLoading")
     if loading is None or self.params.get_bool("UsbGpuLoading"):
+      return
+    if self.params.get_bool("UsbGpuActive"):
       return
 
     # the manager must have finished moving selection to the AMD catalog,
