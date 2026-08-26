@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""VBSM_WATCHDOG: recover a mici UI that is alive but has stopped drawing.
+"""VBSM_WATCHDOG: recover a mici UI that is alive but has stopped drawing,
+and (VBSM_GPU_KICK) cycle modeld onto the chestnut GPU when it boots late.
 
 Division of labour with the manager: VBSM_RESTART in system/manager/process.py
 reaps a dead child so start() can rebuild it, which is what restores the
 process AND clears the processNotRunning soft-disable. A *frozen* process is
-still alive, so no restart policy can see it — that is this watchdog's only
-job. It proves the UI has stopped presenting frames, kills it, and lets the
+still alive, so no restart policy can see it — that is this watchdog's UI job.
+It proves the UI has stopped presenting frames, kills it, and lets the
 manager bring it back properly.
 
 It deliberately spawns nothing. The v2 watchdog spawned replacements itself,
@@ -24,6 +25,19 @@ matched the substring "selfdrive.ui", which also matches
 'openpilot.selfdrive.ui.soundd', and killed soundd for idling as designed.
 Process identity is therefore matched on the exact proctitle, never a prefix.
 
+VBSM_GPU_KICK: the chestnut enclosure is powered from the car's SWITCHED 12V
+outlet, so it boots at the same moment openpilot does and loses the race —
+modeld evaluates usbgpu_present() exactly once at startup, so a drive that
+starts before the enclosure enumerates runs the whole way on the SoC with the
+GPU idle. When the GPU is provably usable (same usbgpu_present() check modeld
+itself runs), the models manager has finished switching the active bundle to
+the AMD catalog, and the running modeld reports it booted without the GPU
+(UsbGpuLoading False), this watchdog kills modeld ONCE at a safe moment —
+standing still, openpilot not engaged — and the manager's restart policy
+brings it back; the fresh modeld re-runs its GPU check and loads the AMD
+bundle from the pre-cached chunks. Bundle ping-pong across power cycles is
+the manager's own per-catalog stash/restore and needs no help from here.
+
 NOTE: crash files under /data/community/crashes carry a stale Jul-28 date when
 the boot predates NTP sync; search by mtime, not by name.
 """
@@ -32,7 +46,9 @@ import signal
 import time
 
 from openpilot.cereal import messaging
+from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.modeld.helpers import usbgpu_present
 
 UI_PROCTITLE = "openpilot.selfdrive.ui.ui"
 EVIDENCE_DIR = "/data/vbsm_eval"
@@ -42,6 +58,28 @@ STALL_TIMEOUT = 30.0     # onroad seconds with no rendered frame = frozen
 MIN_ONROAD_S = 90.0      # let the camera stack and first model runs settle
 MAX_KILLS_PER_BOOT = 3
 MIN_KILL_GAP_S = 60.0    # manager restart + UI startup needs room to finish
+
+GPU_STABLE_S = 10.0      # enclosure must stay enumerated this long
+MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write UsbGpuLoading
+GPU_KICK_COOLDOWN_S = 120.0
+MAX_GPU_KICKS = 2        # per boot; a modeld that then dies on AMD is the
+                         # manager restart policy's problem, not a kick loop
+GPU_VEGO_MAX = 0.5       # m/s — only ever kick at a standstill
+
+
+def find_proc(match, exclude=()):
+  """PID whose proctitle contains match and none of exclude."""
+  for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+      continue
+    try:
+      with open(f"/proc/{entry}/cmdline", "rb") as f:
+        cmd = f.read().rstrip(b"\0").replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+      continue
+    if match in cmd and not any(x in cmd for x in exclude):
+      return int(entry)
+  return None
 
 
 def find_ui():
@@ -93,8 +131,74 @@ def dump_evidence(pid):
     return None
 
 
+class GpuKick:
+  """VBSM_GPU_KICK state; one tick per watchdog loop pass."""
+
+  def __init__(self, params):
+    self.params = params
+    self.gpu_since = None
+    self.modeld_seen = None  # (pid, monotonic first seen)
+    self.kicks = 0
+    self.last_kick = 0.0
+
+  def tick(self, sm, started, now):
+    if not started:
+      self.gpu_since = None
+      self.modeld_seen = None
+      return
+
+    if not usbgpu_present():
+      self.gpu_since = None
+      return
+    if self.gpu_since is None:
+      self.gpu_since = now
+
+    pid = find_proc(".modeld", exclude=("dmonitoring", "watchdog"))
+    if pid is None:
+      self.modeld_seen = None
+      return
+    if self.modeld_seen is None or self.modeld_seen[0] != pid:
+      self.modeld_seen = (pid, now)
+
+    if now - self.gpu_since < GPU_STABLE_S or now - self.modeld_seen[1] < MODELD_SETTLE_S:
+      return
+    if self.kicks >= MAX_GPU_KICKS or now - self.last_kick < GPU_KICK_COOLDOWN_S:
+      return
+
+    # the running modeld must itself say it booted without the GPU; a missing
+    # param proves nothing and must never trigger a kill
+    loading = self.params.get("UsbGpuLoading")
+    if loading is None or self.params.get_bool("UsbGpuLoading"):
+      return
+
+    # the manager must have finished moving selection to the AMD catalog,
+    # otherwise a restarted modeld would marry the GPU to a Qualcomm bundle
+    active_json = self.params.get("ModelManager_ActiveJson") or ""
+    if "usbgpu" not in str(active_json) or self.params.get("ModelManager_ActiveBundle") is None:
+      return
+
+    # only at a standstill with openpilot disengaged — never take the model
+    # away from a moving car
+    if not (sm.seen['carState'] and sm.seen['selfdriveState']):
+      return
+    if sm['carState'].vEgo > GPU_VEGO_MAX or sm['selfdriveState'].enabled:
+      return
+
+    self.kicks += 1
+    self.last_kick = now
+    cloudlog.error(f"ui_watchdog: gpu present but modeld pid {pid} booted without it; "
+                   f"kicking for AMD reload ({self.kicks}/{MAX_GPU_KICKS})")
+    try:
+      os.kill(pid, signal.SIGKILL)
+    except OSError as e:
+      cloudlog.error(f"ui_watchdog: gpu kick failed: {e}")
+    self.modeld_seen = None
+
+
 def main():
-  sm = messaging.SubMaster(['uiDebug', 'deviceState'])
+  params = Params()
+  sm = messaging.SubMaster(['uiDebug', 'deviceState', 'carState', 'selfdriveState'])
+  gpu = GpuKick(params)
   now = time.monotonic()
   last_frame = now
   onroad_since = None
@@ -110,6 +214,9 @@ def main():
       last_frame = now
 
     started = bool(sm['deviceState'].started) if sm.seen['deviceState'] else False
+
+    gpu.tick(sm, started, now)
+
     if not started:
       # offroad the screen is allowed to sleep, which legitimately stops
       # rendering: there is no liveness signal to judge here.
