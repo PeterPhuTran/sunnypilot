@@ -333,6 +333,14 @@ def main(demo=False):
   config_realtime_process(7, 54)
 
   USBGPU = usbgpu_present()
+  # VBSM_GPU_FALLBACK: the watchdog touches this tmpfs marker when a modeld
+  # with an ACTIVE eGPU dies (tinygrad "Device hang detected" -- sustained
+  # inference browns out the accessory-outlet enclosure). Without it, every
+  # restart after a hang burned another 60s no-model window re-attempting the
+  # GPU mid-drive. tmpfs clears on reboot, so each boot gets a fresh chance.
+  if USBGPU and os.path.exists('/dev/shm/vbsm_usbgpu_veto'):
+    cloudlog.event("eGPU vetoed after earlier device hang; running SoC fallback", error=True)
+    USBGPU = False
   if USBGPU:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
@@ -398,7 +406,15 @@ def main(demo=False):
       else:
         raise RuntimeError("eGPU model load failed or timed out (60s); no SoC fallback bundle stashed")
   else:
-    model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=False)
+    override = None
+    if usbgpu_present():
+      # vetoed chestnut still attached: the active bundle is the AMD one and
+      # its pkl cannot run on the SoC, so load the stashed Qualcomm bundle
+      override = get_active_bundle(params, raw_bundle_dict=params.get("ModelManager_PrevBundle"))
+      if override is None or _find_driving_pkl(override) is None:
+        override = None
+    model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=False,
+                       bundle_override=override)
   gpu_active = USBGPU and model is not None and model.usbgpu
 
   params.put_bool("UsbGpuLoading", False)

@@ -52,6 +52,7 @@ from openpilot.selfdrive.modeld.helpers import usbgpu_present
 
 UI_PROCTITLE = "openpilot.selfdrive.ui.ui"
 EVIDENCE_DIR = "/data/vbsm_eval"
+EVIDENCE_CRASH_DIR = "/data/community/crashes"
 
 CHECK_INTERVAL = 2.0
 STALL_TIMEOUT = 30.0     # onroad seconds with no rendered frame = frozen
@@ -59,6 +60,7 @@ MIN_ONROAD_S = 90.0      # let the camera stack and first model runs settle
 MAX_KILLS_PER_BOOT = 3
 MIN_KILL_GAP_S = 60.0    # manager restart + UI startup needs room to finish
 
+GPU_VETO_FILE = "/dev/shm/vbsm_usbgpu_veto"  # tmpfs: a reboot grants a fresh chance
 GPU_STABLE_S = 10.0      # enclosure must stay enumerated this long
 MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write UsbGpuLoading
 GPU_KICK_COOLDOWN_S = 120.0
@@ -138,13 +140,27 @@ class GpuKick:
     self.params = params
     self.gpu_since = None
     self.modeld_seen = None  # (pid, monotonic first seen)
+    self.gpu_was_active = False
     self.kicks = 0
     self.last_kick = 0.0
+
+  def _veto(self):
+    """Sustained inference hangs the accessory-outlet enclosure (tinygrad
+    "Device hang detected"); without a veto every restart after a hang burned
+    another 60s no-model window re-attempting the GPU mid-drive. One inference
+    death = SoC for the rest of this boot; modeld checks the marker at start."""
+    try:
+      with open(GPU_VETO_FILE, "w") as f:
+        f.write(str(int(time.time())))
+      cloudlog.error("ui_watchdog: eGPU-active modeld died; vetoing the GPU until reboot")
+    except OSError as e:
+      cloudlog.error(f"ui_watchdog: veto write failed: {e}")
 
   def tick(self, sm, started, now):
     if not started:
       self.gpu_since = None
       self.modeld_seen = None
+      self.gpu_was_active = False
       return
 
     if not usbgpu_present():
@@ -155,14 +171,29 @@ class GpuKick:
 
     pid = find_proc(".modeld", exclude=("dmonitoring", "watchdog"))
     if pid is None:
+      # a GPU-active modeld that vanishes while still onroad, with a crash
+      # file seconds old, died of the device hang -- a clean offroad stop
+      # leaves no fresh crash file and never trips this
+      if self.modeld_seen is not None and self.gpu_was_active and not os.path.exists(GPU_VETO_FILE):
+        try:
+          newest = max((os.path.getmtime(os.path.join(EVIDENCE_CRASH_DIR, f))
+                        for f in os.listdir(EVIDENCE_CRASH_DIR)), default=0)
+        except OSError:
+          newest = 0
+        if time.time() - newest < 90:
+          self._veto()
       self.modeld_seen = None
+      self.gpu_was_active = False
       return
+    self.gpu_was_active = self.params.get_bool("UsbGpuActive")
     if self.modeld_seen is None or self.modeld_seen[0] != pid:
       self.modeld_seen = (pid, now)
 
     if now - self.gpu_since < GPU_STABLE_S or now - self.modeld_seen[1] < MODELD_SETTLE_S:
       return
     if self.kicks >= MAX_GPU_KICKS or now - self.last_kick < GPU_KICK_COOLDOWN_S:
+      return
+    if os.path.exists(GPU_VETO_FILE):
       return
 
     # the running modeld must itself say it booted without the GPU; a missing
