@@ -397,14 +397,24 @@ def main(demo=False):
     model = big_model
     params.put_bool("UsbGpuActive", model is not None)
     if model is None:
-      fallback = get_active_bundle(params, raw_bundle_dict=params.get("ModelManager_PrevBundle"))
-      if fallback is not None and _find_driving_pkl(fallback) is not None:
-        cloudlog.event("eGPU load failed; falling back to SoC bundle",
-                       fallback=str(fallback.internalName), error=True)
-        model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height,
-                           usbgpu=False, bundle_override=fallback)
-      else:
-        raise RuntimeError("eGPU model load failed or timed out (60s); no SoC fallback bundle stashed")
+      # An in-process SoC fallback looked right but hung in the field: the
+      # loader thread does not FAIL on this power setup, it WEDGES mid-USB
+      # transfer, and a stuck thread inside tinygrad poisons the process --
+      # observed as 135s onroad with zero modelV2 while the fallback load sat
+      # behind it. Fall back by process replacement instead: set the per-boot
+      # veto, then die hard. os._exit skips atexit and thread joins that would
+      # block on the wedged thread; the manager restart policy respawns us,
+      # and the respawn sees the veto and loads the stashed Qualcomm bundle
+      # clean in seconds.
+      try:
+        with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
+          f.write("load")
+      except OSError:
+        pass
+      cloudlog.event("eGPU load failed or wedged; exiting for vetoed respawn",
+                     error=True, loader_stuck=bool(t.is_alive()))
+      time.sleep(0.2)  # give the log a moment to flush
+      os._exit(1)
   else:
     override = None
     if usbgpu_present():
