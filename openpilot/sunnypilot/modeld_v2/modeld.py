@@ -84,11 +84,16 @@ class ModelState(ModelStateBase):
   inputs: dict[str, np.ndarray]
   prev_desire: np.ndarray
 
-  def __init__(self, cam_w: int, cam_h: int, usbgpu: bool = False):
+  def __init__(self, cam_w: int, cam_h: int, usbgpu: bool = False, bundle_override=None):
     ModelStateBase.__init__(self)
 
     env_pkl = os.environ.get('COMBINED_MODEL_PKL')
-    if env_pkl and os.path.exists(env_pkl):
+    if bundle_override is not None:
+      # VBSM_GPU_FALLBACK: load a caller-chosen bundle instead of the active
+      # one -- used to fall back to the stashed Qualcomm bundle when the eGPU
+      # bundle cannot be loaded
+      model_bundle = bundle_override
+    elif env_pkl and os.path.exists(env_pkl):
       model_bundle = None
     else:
       model_bundle = get_active_bundle()
@@ -364,29 +369,48 @@ def main(demo=False):
   model = None
   if USBGPU:
     import threading
+    # VBSM_GPU_FALLBACK, master-parity (commaai/openpilot modeld.py): a failed
+    # or timed-out eGPU load must NOT kill modeld -- on the accessory-outlet
+    # install the enclosure browns out under load and the USB link resets, and
+    # the raise here turned every such brownout into a drive with no model at
+    # all. Load into a separate name so the still-running loader thread can
+    # never clobber the fallback after the timeout fires, then fall back to
+    # the Qualcomm bundle the models manager stashed when the catalog flipped.
+    big_model = None
     def load():
-      nonlocal model
-      model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=True)
+      nonlocal big_model
+      try:
+        big_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=True)
+      except Exception:
+        cloudlog.exception("eGPU model load failed")
     t = threading.Thread(target=load, daemon=True)
     t.start()
     t.join(60)
+    model = big_model
+    params.put_bool("UsbGpuActive", model is not None)
     if model is None:
-      params.put_bool("UsbGpuActive", False)
-      raise RuntimeError("eGPU model load failed or timed out (60s)")
-    params.put_bool("UsbGpuActive", True)
+      fallback = get_active_bundle(params, raw_bundle_dict=params.get("ModelManager_PrevBundle"))
+      if fallback is not None and _find_driving_pkl(fallback) is not None:
+        cloudlog.event("eGPU load failed; falling back to SoC bundle",
+                       fallback=str(fallback.internalName), error=True)
+        model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height,
+                           usbgpu=False, bundle_override=fallback)
+      else:
+        raise RuntimeError("eGPU model load failed or timed out (60s); no SoC fallback bundle stashed")
   else:
     model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=False)
+  gpu_active = USBGPU and model is not None and model.usbgpu
 
   params.put_bool("UsbGpuLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
-  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutState"] if USBGPU else [])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutState"] if gpu_active else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
-  chestnut_state = ChestnutState(pm, USBGPU) if USBGPU else None
+  chestnut_state = ChestnutState(pm, gpu_active) if gpu_active else None
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / model.constants.MODEL_FREQ)
