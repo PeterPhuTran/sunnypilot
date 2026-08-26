@@ -396,6 +396,31 @@ def main(demo=False):
     t.join(60)
     model = big_model
     params.put_bool("UsbGpuActive", model is not None)
+    if model is not None:
+      # VBSM_GPU_PPT: bound the GPU package power so sustained inference stays
+      # inside what the 12V feed can actually deliver. The accessory-outlet
+      # path measures ~0.33 ohm, so stock ~150W (11A+) sags the input volts
+      # into brownout and tinygrad raises "Device hang detected" ~46s into
+      # engaged driving. 80W (~6A) fits the measured path. Doubles as the
+      # discriminating experiment: a capped GPU still hanging clears the
+      # supply and indicts the enclosure. Tune via /data/vbsm_gpu_ppt_w
+      # (watts; 0 disables); read back and log what the SMU actually applied.
+      try:
+        limit_w = 80
+        try:
+          with open("/data/vbsm_gpu_ppt_w") as f:
+            limit_w = int(f.read().strip())
+        except (OSError, ValueError):
+          pass
+        if limit_w > 0:
+          limit_w = max(40, min(220, limit_w))
+          from tinygrad.device import Device
+          smu = Device["AMD"].iface.dev_impl.smu
+          smu._send_msg(smu.smu_mod.PPSMC_MSG_SetPptLimit, limit_w, timeout=100)
+          applied = smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
+          cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), error=False)
+      except Exception:
+        cloudlog.exception("chestnut ppt limit failed")
     if model is None:
       # An in-process SoC fallback looked right but hung in the field: the
       # loader thread does not FAIL on this power setup, it WEDGES mid-USB
