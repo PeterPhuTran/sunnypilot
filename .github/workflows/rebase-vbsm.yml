@@ -115,6 +115,7 @@ jobs:
           check BSM_STATE_PATH   openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
           check VBSM_PRIVACY     openpilot/system/athena/athenad.py
           check VBSM_WATCHDOG    openpilot/sunnypilot/ui_watchdog.py
+          check VBSM_GPU_KICK    openpilot/sunnypilot/ui_watchdog.py
           check uiwatchdog       openpilot/system/manager/process_config.py
           check VBSM_RESTART     openpilot/system/manager/process.py
           # a lost restart policy is silent until something dies mid-drive, so
