@@ -61,6 +61,7 @@ MAX_KILLS_PER_BOOT = 3
 MIN_KILL_GAP_S = 60.0    # manager restart + UI startup needs room to finish
 
 GPU_VETO_FILE = "/dev/shm/vbsm_usbgpu_veto"  # tmpfs: a reboot grants a fresh chance
+GPU_LOAD_DEADLINE_S = 90.0  # every legitimate load path resolves by 60s
 GPU_STABLE_S = 10.0      # enclosure must stay enumerated this long
 MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write UsbGpuLoading
 GPU_KICK_COOLDOWN_S = 120.0
@@ -188,6 +189,24 @@ class GpuKick:
     self.gpu_was_active = self.params.get_bool("UsbGpuActive")
     if self.modeld_seen is None or self.modeld_seen[0] != pid:
       self.modeld_seen = (pid, now)
+
+    # A wedged eGPU load blocks inside a C call HOLDING THE GIL, which freezes
+    # every thread in modeld INCLUDING its own 60s timeout (field-verified:
+    # modeld ignored SIGINT and needed the manager escalation SIGKILL at
+    # car-off, with the timeout never having fired). Only an external kill
+    # works. UsbGpuLoading past the deadline is definitive: every legitimate
+    # path -- success or the in-process exit -- resolves by 60s.
+    if (self.params.get_bool("UsbGpuLoading") and now - self.modeld_seen[1] > GPU_LOAD_DEADLINE_S
+        and not os.path.exists(GPU_VETO_FILE)):
+      self._veto()
+      cloudlog.error(f"ui_watchdog: modeld pid {pid} wedged in eGPU load "
+                     f"({now - self.modeld_seen[1]:.0f}s), killing for vetoed respawn")
+      try:
+        os.kill(pid, signal.SIGKILL)
+      except OSError as e:
+        cloudlog.error(f"ui_watchdog: wedge kill failed: {e}")
+      self.modeld_seen = None
+      return
 
     if now - self.gpu_since < GPU_STABLE_S or now - self.modeld_seen[1] < MODELD_SETTLE_S:
       return
