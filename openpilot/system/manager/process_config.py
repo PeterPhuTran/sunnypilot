@@ -5,7 +5,7 @@ import platform
 from opendbc.car.structs import car
 from openpilot.cereal import custom
 from openpilot.common.params import Params
-from openpilot.common.hardware import PC, COMMA_HARDWARE
+from openpilot.common.hardware import HARDWARE, PC, COMMA_HARDWARE
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 from openpilot.common.hardware.hw import Paths
 
@@ -18,6 +18,13 @@ WEBCAM = os.getenv("USE_WEBCAM") is not None
 
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
+
+# camera blind spot monitor, comma four only: the zones are calibrated against
+# that driver camera and the full screen view lives in the mici UI
+MICI = HARDWARE.get_device_type() == "mici"
+
+def vision_bsm(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and os.path.isfile("/data/vision_bsm.json")
 
 def notcar(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and CP.notCar
@@ -173,6 +180,10 @@ procs += [
 
   # Backup
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
+
+  # Camera blind spot monitor
+  PythonProcess("visionbsmd", "openpilot.sunnypilot.vision_bsm", vision_bsm, enabled=MICI),
+  PythonProcess("uiwatchdog", "openpilot.sunnypilot.ui_watchdog", always_run, enabled=MICI),
 
   # mapd
   NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),

@@ -14,6 +14,17 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.hardware import HARDWARE, PC
 from openpilot.selfdrive.modeld.helpers import usbgpu_compiled
 
+
+def _bundle_pkl_cached() -> bool:
+  """VBSM_GPU_HUD: any chunked bundle pkl in the model cache. Latched by the
+  caller, so this scan runs only until it first returns True."""
+  try:
+    import os
+    from openpilot.common.hardware.hw import Paths
+    return any(f.endswith(".pkl.chunkmanifest") for f in os.listdir(Paths.model_root()))
+  except OSError:
+    return False
+
 from openpilot.selfdrive.ui.sunnypilot.ui_state import UIStateSP, DeviceSP
 
 BACKLIGHT_OFFROAD = 65 if HARDWARE.get_device_type() == "mici" else 50
@@ -227,8 +238,13 @@ class UIState(UIStateSP):
     self.experimental_mode_confirmed = self.params.get_bool("ExperimentalModeConfirmed")
     # keep usbgpu UI active until offroad transition when gpu disappears
     self.usbgpu = self.sm["deviceState"].chestnutPresent or (self.usbgpu and self.started)
+
     if not self.usbgpu_compiled:
-      self.usbgpu_compiled = usbgpu_compiled()
+      # VBSM_GPU_HUD: usbgpu_compiled() only knows the STOCK big model file,
+      # so on a bundle-based install the mici eGPU status icon (pulsing =
+      # loading, green = GPU model live, orange = fell back to the SoC) never
+      # rendered at all. A cached bundle pkl is the bundle-world equivalent.
+      self.usbgpu_compiled = usbgpu_compiled() or _bundle_pkl_cached()
     self.usbgpu_active = self.params.get("UsbGpuActive")
     self.usbgpu_loading = self.params.get_bool("UsbGpuLoading")
 

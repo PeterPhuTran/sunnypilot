@@ -52,6 +52,12 @@ def nativelauncher(pargs: list[str], cwd: str, name: str) -> None:
   os.execvp(pargs[0], pargs)
 
 
+# VBSM_RESTART: a crash-looping process must end up parked with its crash
+# files, not restarting forever
+MAX_RESTARTS_PER_SESSION = 3
+MIN_RESTART_GAP_S = 10.0
+
+
 def join_process(process: Process, timeout: float) -> None:
   # Process().join(timeout) will hang due to a python 3 bug: https://bugs.python.org/issue28382
   # We have to poll the exitcode instead
@@ -68,6 +74,40 @@ class ManagerProcess(ABC):
   enabled = True
   name = ""
   shutting_down = False
+  # VBSM_RESTART: bounded mid-session restarts, see hold_dead_proc()
+  restarts = 0
+  last_restart = 0.0
+
+  def hold_dead_proc(self) -> bool:
+    """VBSM_RESTART: True if self.proc is set and start() must leave it alone.
+
+    Upstream never restarts a process that dies mid-session — start() returns
+    early while self.proc is set — so a process that crashes stays down until
+    the next reboot. That is a hard failure rather than a cosmetic one:
+    processNotRunning is SOFT_DISABLE plus NO_ENTRY, so a single crash
+    disengages openpilot and blocks re-engagement for the rest of the drive.
+    Observed on this device with ui, micd and soundd, none of which came back.
+
+    So reap a dead child and let start() build a fresh one, but bound it: a
+    process that keeps dying is a real fault, and past the cap it must surface
+    as the alert instead of restarting forever.
+    """
+    if self.proc is None:
+      return False
+    if self.proc.is_alive():
+      return True
+
+    now = time.monotonic()
+    if self.restarts >= MAX_RESTARTS_PER_SESSION or now - self.last_restart < MIN_RESTART_GAP_S:
+      return True
+
+    self.restarts += 1
+    self.last_restart = now
+    cloudlog.error(f"{self.name} died with exitcode {self.proc.exitcode}, "
+                   f"restarting ({self.restarts}/{MAX_RESTARTS_PER_SESSION})")
+    join_process(self.proc, 1)
+    self.proc = None
+    return False
 
   @abstractmethod
   def start(self) -> None:
@@ -146,7 +186,7 @@ class NativeProcess(ManagerProcess):
     if self.shutting_down:
       self.stop()
 
-    if self.proc is not None:
+    if self.hold_dead_proc():
       return
 
     cwd = os.path.join(BASEDIR, self.cwd)
@@ -170,7 +210,7 @@ class PythonProcess(ManagerProcess):
     if self.shutting_down:
       self.stop()
 
-    if self.proc is not None:
+    if self.hold_dead_proc():
       return
 
     cloudlog.info(f"starting python {self.module}")
