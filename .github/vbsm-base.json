@@ -1,5 +1,5 @@
 {
-  "base": "1d1bab016d8888fd30318562706a785177bb7953",
+  "base": "d807079d31679bc7bb737bb489df4f57b5183460",
   "files": [
     "VBSM.md",
     "openpilot/sunnypilot/vision_bsm.py",

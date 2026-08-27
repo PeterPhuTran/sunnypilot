@@ -84,19 +84,14 @@ class ModelState(ModelStateBase):
   inputs: dict[str, np.ndarray]
   prev_desire: np.ndarray
 
-  def __init__(self, cam_w: int, cam_h: int, usbgpu: bool = False, bundle_override=None):
+  def __init__(self, cam_w: int, cam_h: int, usbgpu: bool = False):
     ModelStateBase.__init__(self)
 
     env_pkl = os.environ.get('COMBINED_MODEL_PKL')
-    if bundle_override is not None:
-      # VBSM_GPU_FALLBACK: load a caller-chosen bundle instead of the active
-      # one -- used to fall back to the stashed Qualcomm bundle when the eGPU
-      # bundle cannot be loaded
-      model_bundle = bundle_override
-    elif env_pkl and os.path.exists(env_pkl):
+    if env_pkl and os.path.exists(env_pkl):
       model_bundle = None
     else:
-      model_bundle = get_active_bundle()
+      model_bundle = get_active_bundle(usbgpu=usbgpu)
     self.generation = model_bundle.generation if model_bundle is not None else None
     overrides = {override.key: override.value for override in model_bundle.overrides} if model_bundle else {}
 
@@ -333,11 +328,10 @@ def main(demo=False):
   config_realtime_process(7, 54)
 
   USBGPU = usbgpu_present()
-  # VBSM_GPU_FALLBACK: the watchdog touches this tmpfs marker when a modeld
-  # with an ACTIVE eGPU dies (tinygrad "Device hang detected" -- sustained
-  # inference browns out the accessory-outlet enclosure). Without it, every
-  # restart after a hang burned another 60s no-model window re-attempting the
-  # GPU mid-drive. tmpfs clears on reboot, so each boot gets a fresh chance.
+  # VBSM_GPU_FALLBACK: set when an eGPU load fails twice or an eGPU-active
+  # modeld dies (accessory-outlet power limits); tmpfs clears it each boot.
+  # With the veto the SoC path runs, and upstream's per-hardware bundle slots
+  # make ModelState(usbgpu=False) select the Qualcomm slot on its own.
   if USBGPU and os.path.exists('/dev/shm/vbsm_usbgpu_veto'):
     cloudlog.event("eGPU vetoed earlier this boot; running SoC fallback", error=True)
     USBGPU = False
@@ -377,19 +371,12 @@ def main(demo=False):
   model = None
   if USBGPU:
     import threading
-    # VBSM_GPU_FALLBACK, master-parity (commaai/openpilot modeld.py): a failed
-    # or timed-out eGPU load must NOT kill modeld -- on the accessory-outlet
-    # install the enclosure browns out under load and the USB link resets, and
-    # the raise here turned every such brownout into a drive with no model at
-    # all. Load into a separate name so the still-running loader thread can
-    # never clobber the fallback after the timeout fires, then fall back to
-    # the Qualcomm bundle the models manager stashed when the catalog flipped.
+
     def apply_ppt_cap():
-      # VBSM_GPU_PPT: must run BEFORE the 1.7GB model transfer, not after it.
-      # The cap was originally applied post-load, which left the load phase
-      # running uncapped boost transients -- fine on a warm evening rail,
-      # brownout on a cold morning start (clean enumeration, zero USB resets,
-      # load still died). Open the device, cap it, then transfer.
+      # VBSM_GPU_PPT: cap package power BEFORE the 1.7GB transfer -- the
+      # accessory-outlet 12V path (~0.45 ohm measured) browns out at stock
+      # boost transients, during load as well as inference. 80W ~ 6A fits.
+      # Tune via /data/vbsm_gpu_ppt_w (watts; 0 disables), clamp 40..220.
       limit_w = 80
       try:
         with open("/data/vbsm_gpu_ppt_w") as f:
@@ -405,6 +392,8 @@ def main(demo=False):
       applied = smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
       cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), error=False)
 
+    # VBSM_GPU_FALLBACK: load into a separate name so a late-completing or
+    # wedged loader thread can never clobber state after the timeout fires
     big_model = None
     def load():
       nonlocal big_model
@@ -412,11 +401,8 @@ def main(demo=False):
         apply_ppt_cap()
         big_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=True)
       except Exception as e:
-        # a "Failed to acquire lock file am_usb:*" in this chain means some
-        # OTHER process held the tinygrad USB-GPU device lock -- seen once in
-        # the field (33ms fail, GPU healthy, holder never identified because
-        # nothing captured it at the moment). Capture the holder while it
-        # still exists.
+        # a lock-flavored failure means another process held the tinygrad
+        # USB-GPU device lock; capture the holder while it still exists
         if "acquire lock" in str(e) or "am_usb" in str(e):
           try:
             import glob as _glob, subprocess as _sp
@@ -432,18 +418,12 @@ def main(demo=False):
     model = big_model
     params.put_bool("UsbGpuActive", model is not None)
     if model is None:
-      # An in-process SoC fallback looked right but hung in the field: the
-      # loader thread does not FAIL on this power setup, it WEDGES mid-USB
-      # transfer, and a stuck thread inside tinygrad poisons the process --
-      # observed as 135s onroad with zero modelV2 while the fallback load sat
-      # behind it. Fall back by process replacement instead: set the per-boot
-      # veto, then die hard. os._exit skips atexit and thread joins that would
-      # block on the wedged thread; the manager restart policy respawns us,
-      # and the respawn sees the veto and loads the stashed Qualcomm bundle
-      # clean in seconds.
-      # one free retry: a cold-start rail transient should not cost the whole
-      # boot the GPU -- the respawn retries ~a minute later on a settled rail;
-      # a second failure vetoes as before
+      # fall back by PROCESS REPLACEMENT: a wedged loader blocks inside a C
+      # call holding the GIL, so in-process fallbacks hang behind it. First
+      # failure exits WITHOUT the veto (cold-start transients get one retry
+      # on a settled rail); the second failure vetoes the boot. The manager
+      # restart policy owns the respawn; the respawn sees the veto and loads
+      # the Qualcomm slot in seconds.
       fails = 1
       try:
         with open('/dev/shm/vbsm_gpu_load_fails') as f:
@@ -464,18 +444,10 @@ def main(demo=False):
       cloudlog.event("eGPU load failed or wedged; exiting for respawn",
                      error=True, loader_stuck=bool(t.is_alive()), attempt=fails,
                      vetoed=bool(fails >= 2))
-      time.sleep(0.2)  # give the log a moment to flush
+      time.sleep(0.2)
       os._exit(1)
   else:
-    override = None
-    if usbgpu_present():
-      # vetoed chestnut still attached: the active bundle is the AMD one and
-      # its pkl cannot run on the SoC, so load the stashed Qualcomm bundle
-      override = get_active_bundle(params, raw_bundle_dict=params.get("ModelManager_PrevBundle"))
-      if override is None or _find_driving_pkl(override) is None:
-        override = None
-    model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=False,
-                       bundle_override=override)
+    model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=False)
   gpu_active = USBGPU and model is not None and model.usbgpu
 
   params.put_bool("UsbGpuLoading", False)

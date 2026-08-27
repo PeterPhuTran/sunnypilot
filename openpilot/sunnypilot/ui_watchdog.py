@@ -226,10 +226,9 @@ class GpuKick:
     if self.params.get_bool("UsbGpuActive"):
       return
 
-    # the manager must have finished moving selection to the AMD catalog,
-    # otherwise a restarted modeld would marry the GPU to a Qualcomm bundle
-    active_json = self.params.get("ModelManager_ActiveJson") or ""
-    if "usbgpu" not in str(active_json) or self.params.get("ModelManager_ActiveBundle") is None:
+    # upstream moved to per-hardware bundle SLOTS: only kick when the USBGPU
+    # slot actually holds a bundle for the restarted modeld to load
+    if self.params.get("ModelManager_ActiveBundleUSBGPU") is None:
       return
 
     # only at a standstill with openpilot disengaged — never take the model
