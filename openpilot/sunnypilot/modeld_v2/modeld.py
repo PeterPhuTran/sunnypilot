@@ -384,10 +384,32 @@ def main(demo=False):
     # all. Load into a separate name so the still-running loader thread can
     # never clobber the fallback after the timeout fires, then fall back to
     # the Qualcomm bundle the models manager stashed when the catalog flipped.
+    def apply_ppt_cap():
+      # VBSM_GPU_PPT: must run BEFORE the 1.7GB model transfer, not after it.
+      # The cap was originally applied post-load, which left the load phase
+      # running uncapped boost transients -- fine on a warm evening rail,
+      # brownout on a cold morning start (clean enumeration, zero USB resets,
+      # load still died). Open the device, cap it, then transfer.
+      limit_w = 80
+      try:
+        with open("/data/vbsm_gpu_ppt_w") as f:
+          limit_w = int(f.read().strip())
+      except (OSError, ValueError):
+        pass
+      if limit_w <= 0:
+        return
+      limit_w = max(40, min(220, limit_w))
+      from tinygrad.device import Device
+      smu = Device["AMD"].iface.dev_impl.smu
+      smu._send_msg(smu.smu_mod.PPSMC_MSG_SetPptLimit, limit_w, timeout=100)
+      applied = smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
+      cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), error=False)
+
     big_model = None
     def load():
       nonlocal big_model
       try:
+        apply_ppt_cap()
         big_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=True)
       except Exception:
         cloudlog.exception("eGPU model load failed")
@@ -396,31 +418,6 @@ def main(demo=False):
     t.join(60)
     model = big_model
     params.put_bool("UsbGpuActive", model is not None)
-    if model is not None:
-      # VBSM_GPU_PPT: bound the GPU package power so sustained inference stays
-      # inside what the 12V feed can actually deliver. The accessory-outlet
-      # path measures ~0.33 ohm, so stock ~150W (11A+) sags the input volts
-      # into brownout and tinygrad raises "Device hang detected" ~46s into
-      # engaged driving. 80W (~6A) fits the measured path. Doubles as the
-      # discriminating experiment: a capped GPU still hanging clears the
-      # supply and indicts the enclosure. Tune via /data/vbsm_gpu_ppt_w
-      # (watts; 0 disables); read back and log what the SMU actually applied.
-      try:
-        limit_w = 80
-        try:
-          with open("/data/vbsm_gpu_ppt_w") as f:
-            limit_w = int(f.read().strip())
-        except (OSError, ValueError):
-          pass
-        if limit_w > 0:
-          limit_w = max(40, min(220, limit_w))
-          from tinygrad.device import Device
-          smu = Device["AMD"].iface.dev_impl.smu
-          smu._send_msg(smu.smu_mod.PPSMC_MSG_SetPptLimit, limit_w, timeout=100)
-          applied = smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
-          cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), error=False)
-      except Exception:
-        cloudlog.exception("chestnut ppt limit failed")
     if model is None:
       # An in-process SoC fallback looked right but hung in the field: the
       # loader thread does not FAIL on this power setup, it WEDGES mid-USB
@@ -431,13 +428,29 @@ def main(demo=False):
       # block on the wedged thread; the manager restart policy respawns us,
       # and the respawn sees the veto and loads the stashed Qualcomm bundle
       # clean in seconds.
+      # one free retry: a cold-start rail transient should not cost the whole
+      # boot the GPU -- the respawn retries ~a minute later on a settled rail;
+      # a second failure vetoes as before
+      fails = 1
       try:
-        with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
-          f.write("load")
+        with open('/dev/shm/vbsm_gpu_load_fails') as f:
+          fails = int(f.read().strip()) + 1
+      except (OSError, ValueError):
+        pass
+      try:
+        with open('/dev/shm/vbsm_gpu_load_fails', 'w') as f:
+          f.write(str(fails))
       except OSError:
         pass
-      cloudlog.event("eGPU load failed or wedged; exiting for vetoed respawn",
-                     error=True, loader_stuck=bool(t.is_alive()))
+      if fails >= 2:
+        try:
+          with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
+            f.write("load")
+        except OSError:
+          pass
+      cloudlog.event("eGPU load failed or wedged; exiting for respawn",
+                     error=True, loader_stuck=bool(t.is_alive()), attempt=fails,
+                     vetoed=bool(fails >= 2))
       time.sleep(0.2)  # give the log a moment to flush
       os._exit(1)
   else:
