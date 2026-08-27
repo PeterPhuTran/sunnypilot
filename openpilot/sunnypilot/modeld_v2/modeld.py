@@ -339,7 +339,7 @@ def main(demo=False):
   # restart after a hang burned another 60s no-model window re-attempting the
   # GPU mid-drive. tmpfs clears on reboot, so each boot gets a fresh chance.
   if USBGPU and os.path.exists('/dev/shm/vbsm_usbgpu_veto'):
-    cloudlog.event("eGPU vetoed after earlier device hang; running SoC fallback", error=True)
+    cloudlog.event("eGPU vetoed earlier this boot; running SoC fallback", error=True)
     USBGPU = False
   if USBGPU:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
@@ -411,7 +411,20 @@ def main(demo=False):
       try:
         apply_ppt_cap()
         big_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=True)
-      except Exception:
+      except Exception as e:
+        # a "Failed to acquire lock file am_usb:*" in this chain means some
+        # OTHER process held the tinygrad USB-GPU device lock -- seen once in
+        # the field (33ms fail, GPU healthy, holder never identified because
+        # nothing captured it at the moment). Capture the holder while it
+        # still exists.
+        if "acquire lock" in str(e) or "am_usb" in str(e):
+          try:
+            import glob as _glob, subprocess as _sp
+            for lk in _glob.glob("/tmp/am_usb:*.lock"):
+              r = _sp.run(["fuser", "-v", lk], capture_output=True, text=True, timeout=5)
+              cloudlog.event("eGPU lock holder", lock=lk, fuser=(r.stdout + r.stderr)[:500], error=True)
+          except Exception:
+            pass
         cloudlog.exception("eGPU model load failed")
     t = threading.Thread(target=load, daemon=True)
     t.start()
