@@ -122,6 +122,14 @@ class BookmarkIcon(Widget):
         self._interacting = True
 
     elif mouse_event.left_released:
+      # VBSM_HUD: a tap (no meaningful swipe) on the profile chip cycles the
+      # driving personality; same decrement direction as the wheel button.
+      # selfdrived re-reads the param on its periodic config check.
+      if self._is_swiping and abs(self._swipe_start_x - self._swipe_current_x) < 20:
+        chip = self._hud_renderer.profile_chip_rect
+        if chip.width > 0 and rl.check_collision_point_rec(mouse_event.pos, chip):
+          cur = int(ui_state.sm['selfdriveState'].personality.raw)
+          ui_state.params.put("LongitudinalPersonality", (cur - 1) % 3)
       if self._is_swiping:
         swipe_distance = self._swipe_start_x - self._swipe_current_x
 

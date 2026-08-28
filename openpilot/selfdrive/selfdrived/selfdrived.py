@@ -363,6 +363,16 @@ class SelfdriveD(CruiseHelper):
     # steering above the lane change speed, so this covers the rest of the time.
     self._vbsm_counter += 1
     if self._vbsm_counter % VBSM_CONFIG_INTERVAL == 0:
+      # VBSM_HUD: adopt external personality changes (the HUD profile chip and
+      # the settings page write the param, but upstream only reads it at boot
+      # and from the wheel button). Self-written values are a no-op here.
+      try:
+        p = int(self.params.get("LongitudinalPersonality") or 0)
+        if 0 <= p <= 2 and p != self.personality:
+          self.personality = p
+          self.events.add(EventName.personalityChanged)
+      except (ValueError, TypeError):
+        pass
       try:
         with open(VBSM_CONFIG) as f:
           config = json.load(f)

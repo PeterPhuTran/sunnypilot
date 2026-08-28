@@ -104,6 +104,13 @@ class HudRenderer(Widget):
     self.is_cruise_available: bool = True
     self.set_speed: float = SET_SPEED_NA
     self._set_speed_changed_time: float = 0
+    # VBSM_HUD: always-visible driving profile chip (tap target owned by the
+    # parent view); personality comes LIVE from selfdriveState, not a param
+    # poll, so wheel-button cycling and settings changes reflect instantly
+    self.profile_chip_rect = rl.Rectangle(0, 0, 0, 0)
+    self._profile_names = {v: k[:3].upper() for k, v in log.LongitudinalPersonality.schema.enumerants.items()}
+    self._personality: int = -1
+    self._profile_flash = FirstOrderFilter(0.0, 0.3, 1 / gui_app.target_fps)
     self.speed: float = 0.0
     self.v_ego_cluster_seen: bool = False
     self._engaged: bool = False
@@ -173,6 +180,11 @@ class HudRenderer(Widget):
     if (set_speed != self.set_speed and engaged) or (engaged and not self._engaged):
       self._set_speed_changed_time = rl.get_time()
     self._engaged = engaged
+    pers = int(sm['selfdriveState'].personality.raw)
+    if pers != self._personality:
+      if self._personality >= 0:
+        self._profile_flash.x = 1.0
+      self._personality = pers
     self.set_speed = set_speed
     self.is_cruise_set = 0 < self.set_speed < SET_SPEED_NA
     self.is_cruise_available = self.set_speed != -1
@@ -190,6 +202,8 @@ class HudRenderer(Widget):
 
     if self.is_cruise_set:
       self._draw_set_speed(rect)
+
+    self._draw_profile_chip(rect)
 
     if ui_state.usbgpu and ui_state.usbgpu_compiled:
       self._draw_model_source(rect)
@@ -275,10 +289,33 @@ class HudRenderer(Widget):
       exclamation_pos_y = pos_y - self._txt_exclamation_point.height / 2
       rl.draw_texture_ex(self._txt_exclamation_point, rl.Vector2(exclamation_pos_x, exclamation_pos_y), 0.0, 1.0, rl.WHITE)
 
+  def _draw_profile_chip(self, rect: rl.Rectangle) -> None:
+    # VBSM_HUD: bottom-left, clear of the wheel and eGPU icons (bottom-right)
+    # and the set-speed circle (top-left)
+    if self._personality < 0:
+      return
+    label = self._profile_names.get(self._personality, "?")
+    w, h = 96, 46
+    x = rect.x + 10
+    y = rect.y + rect.height - 14 - h
+    self.profile_chip_rect = rl.Rectangle(x, y, w, h)
+    flash = self._profile_flash.update(0.0)
+    bg = rl.Color(255, 255, 255, int(255 * (0.18 + 0.5 * flash)))
+    rl.draw_rectangle_rounded(self.profile_chip_rect, 0.5, 8, bg)
+    fg = rl.Color(255, 255, 255, 235)
+    font = gui_app.font(FontWeight.SEMI_BOLD)
+    tw = rl.measure_text_ex(font, label, 30, 0).x
+    rl.draw_text_ex(font, label, rl.Vector2(x + (w - tw) / 2, y + 8), 30, 0, fg)
+
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""
-    alpha = self._set_speed_alpha_filter.update(0 < rl.get_time() - self._set_speed_changed_time < SET_SPEED_PERSISTENCE and
-                                                self._can_draw_top_icons and self._engaged)
+    # VBSM_HUD: the set speed used to fade 2.5s after a change, leaving the
+    # driver blind to it for most of the drive; keep it up whenever engaged.
+    # Known trade-off: the dmoji yields to top icons, so it hides while
+    # engaged now. Disengaged keeps the old change-triggered fade.
+    alpha = self._set_speed_alpha_filter.update(self._can_draw_top_icons and
+                                                (self._engaged or
+                                                 0 < rl.get_time() - self._set_speed_changed_time < SET_SPEED_PERSISTENCE))
     if alpha < 1e-2:
       return
 

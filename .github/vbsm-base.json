@@ -13,6 +13,7 @@
     "openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py",
     "openpilot/system/athena/athenad.py",
     "openpilot/sunnypilot/modeld_v2/modeld.py",
-    "openpilot/selfdrive/ui/ui_state.py"
+    "openpilot/selfdrive/ui/ui_state.py",
+    "openpilot/selfdrive/ui/mici/onroad/hud_renderer.py"
   ]
 }
