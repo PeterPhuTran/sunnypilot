@@ -3,6 +3,7 @@
   "files": [
     "VBSM.md",
     "CHESTNUT.md",
+    "MODS.md",
     "openpilot/sunnypilot/vision_bsm.py",
     "openpilot/sunnypilot/ui_watchdog.py",
     "openpilot/system/manager/process.py",
