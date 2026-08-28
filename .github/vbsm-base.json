@@ -14,6 +14,8 @@
     "openpilot/system/athena/athenad.py",
     "openpilot/sunnypilot/modeld_v2/modeld.py",
     "openpilot/selfdrive/ui/ui_state.py",
-    "openpilot/selfdrive/ui/mici/onroad/hud_renderer.py"
+    "openpilot/selfdrive/ui/mici/onroad/hud_renderer.py",
+    "openpilot/system/hardware/hardwared.py",
+    "openpilot/sunnypilot/chestnut_power.py"
   ]
 }
