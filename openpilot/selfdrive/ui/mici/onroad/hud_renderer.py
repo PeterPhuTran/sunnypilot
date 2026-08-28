@@ -292,7 +292,9 @@ class HudRenderer(Widget):
   def _draw_profile_chip(self, rect: rl.Rectangle) -> None:
     # VBSM_HUD: bottom-left, clear of the wheel and eGPU icons (bottom-right)
     # and the set-speed circle (top-left)
-    if self._personality < 0:
+    # alerts own the screen: the same yield the set-speed circle uses
+    # (augmented_road_view clears can_draw_top_icons while an alert renders)
+    if self._personality < 0 or not self._can_draw_top_icons:
       return
     # gap-distance bars, factory-cruise idiom: 1 blue bar = aggressive (tight),
     # 2 = standard, 3 = relaxed (long). Enum is aggressive=0/standard=1/relaxed=2,
