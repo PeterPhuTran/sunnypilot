@@ -110,6 +110,7 @@ jobs:
           }
           check visionbsmd       openpilot/system/manager/process_config.py
           check "Field Debugging Log" CHESTNUT.md
+          check "Complete Index" MODS.md
           check vision_bsm       openpilot/selfdrive/car/card.py
           check VBSM             openpilot/selfdrive/selfdrived/selfdrived.py
           check BigConfigControl openpilot/selfdrive/ui/mici/layouts/settings/toggles.py
