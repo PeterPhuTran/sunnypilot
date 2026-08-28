@@ -2,6 +2,7 @@
   "base": "d807079d31679bc7bb737bb489df4f57b5183460",
   "files": [
     "VBSM.md",
+    "CHESTNUT.md",
     "openpilot/sunnypilot/vision_bsm.py",
     "openpilot/sunnypilot/ui_watchdog.py",
     "openpilot/system/manager/process.py",
