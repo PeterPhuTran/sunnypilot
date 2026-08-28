@@ -298,14 +298,16 @@ class HudRenderer(Widget):
     # 2 = standard, 3 = relaxed (long). Enum is aggressive=0/standard=1/relaxed=2,
     # so filled = personality + 1. Unfilled slots stay faint so the scale reads.
     filled = self._personality + 1
-    w, h = 96, 46
-    x = rect.x + 10
-    y = rect.y + rect.height - 14 - h
+    # top-right corner, slimmed per user preference; the set-speed circle owns
+    # top-left, turn arrows draw center, wheel/eGPU icons own bottom-right
+    w, h = 78, 40
+    x = rect.x + rect.width - 10 - w
+    y = rect.y + 14
     self.profile_chip_rect = rl.Rectangle(x, y, w, h)
     flash = self._profile_flash.update(0.0)
     bg = rl.Color(255, 255, 255, int(255 * (0.14 + 0.45 * flash)))
     rl.draw_rectangle_rounded(self.profile_chip_rect, 0.5, 8, bg)
-    bar_w, bar_h, gap = 18, 28, 9
+    bar_w, bar_h, gap = 14, 24, 7
     bx = x + (w - 3 * bar_w - 2 * gap) / 2
     by = y + (h - bar_h) / 2
     for i in range(3):
