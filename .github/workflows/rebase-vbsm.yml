@@ -109,6 +109,7 @@ jobs:
               || { echo "::error::missing '$1' in $2"; fail=1; }
           }
           check visionbsmd       openpilot/system/manager/process_config.py
+          check "Field Debugging Log" CHESTNUT.md
           check vision_bsm       openpilot/selfdrive/car/card.py
           check VBSM             openpilot/selfdrive/selfdrived/selfdrived.py
           check BigConfigControl openpilot/selfdrive/ui/mici/layouts/settings/toggles.py
