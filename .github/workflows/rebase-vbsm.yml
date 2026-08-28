@@ -121,6 +121,7 @@ jobs:
           check VBSM_GPU_PPT     openpilot/sunnypilot/modeld_v2/modeld.py
           check VBSM_GPU_HUD     openpilot/selfdrive/ui/ui_state.py
           check VBSM_HUD         openpilot/selfdrive/ui/mici/onroad/hud_renderer.py
+          check VBSM_GPU_IDLE    openpilot/system/hardware/hardwared.py
           check uiwatchdog       openpilot/system/manager/process_config.py
           check VBSM_RESTART     openpilot/system/manager/process.py
           # a lost restart policy is silent until something dies mid-drive, so
