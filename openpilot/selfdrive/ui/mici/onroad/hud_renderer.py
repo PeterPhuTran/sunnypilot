@@ -338,31 +338,23 @@ class HudRenderer(Widget):
                             rl.Color(0, 0, 0, int(255 / 2 * alpha)), rl.BLANK)
 
     set_speed_color = rl.Color(255, 255, 255, int(255 * 0.9 * alpha))
-    max_color = rl.Color(255, 255, 255, int(255 * 0.9 * alpha))
 
     set_speed = self.set_speed
     if self.is_cruise_set and not ui_state.is_metric:
       set_speed *= KM_TO_MILE
 
+    # VBSM_HUD: MAX label dropped, number at 3/5 size with a black outline for
+    # legibility over bright road scenes; measured-centered in the circle now
+    # that the label no longer shares the space
     set_speed_text = CRUISE_DISABLED_CHAR if not self.is_cruise_set else str(round(set_speed))
-    rl.draw_text_ex(
-      self._font_display,
-      set_speed_text,
-      rl.Vector2(x + 13 + 4, y + 3 - 8 - 3 + 4),
-      FONT_SIZES.set_speed,
-      0,
-      set_speed_color,
-    )
-
-    max_text = tr("MAX")
-    rl.draw_text_ex(
-      self._font_semi_bold,
-      max_text,
-      rl.Vector2(x + 25, y + FONT_SIZES.set_speed - 7 + 4),
-      FONT_SIZES.max_speed,
-      0,
-      max_color,
-    )
+    size = FONT_SIZES.set_speed * 3 / 5
+    tw = rl.measure_text_ex(self._font_display, set_speed_text, size, 0)
+    tx = x + circle_radius - tw.x / 2
+    ty = y + circle_radius - tw.y / 2
+    outline = rl.Color(0, 0, 0, int(255 * 0.9 * alpha))
+    for ox, oy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-2, -2), (2, -2), (-2, 2), (2, 2)):
+      rl.draw_text_ex(self._font_display, set_speed_text, rl.Vector2(tx + ox, ty + oy), size, 0, outline)
+    rl.draw_text_ex(self._font_display, set_speed_text, rl.Vector2(tx, ty), size, 0, set_speed_color)
 
   def _draw_current_speed(self, rect: rl.Rectangle) -> None:
     """Draw the current vehicle speed and unit."""
