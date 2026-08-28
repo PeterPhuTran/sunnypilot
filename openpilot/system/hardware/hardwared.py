@@ -78,7 +78,9 @@ class Chestnut:
 
   def _power(self, enable: bool) -> None:
     cmd = "on" if enable else "off"
-    ret = subprocess.run(["sudo", sys.executable, os.path.join(BASEDIR, "openpilot/sunnypilot/chestnut_power.py"), cmd],
+    # -B: a root python writing __pycache__ into the tree breaks the updater's
+    # git clean as user comma, silently blocking ALL updates (bit us once)
+    ret = subprocess.run(["sudo", sys.executable, "-B", os.path.join(BASEDIR, "openpilot/sunnypilot/chestnut_power.py"), cmd],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=30)
     ok = ret.returncode == 0
     cloudlog.event("chestnut gpu rails", cmd=cmd, success=ok, output=ret.stdout[-200:], error=not ok)
