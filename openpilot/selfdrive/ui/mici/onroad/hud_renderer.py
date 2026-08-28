@@ -294,18 +294,26 @@ class HudRenderer(Widget):
     # and the set-speed circle (top-left)
     if self._personality < 0:
       return
-    label = self._profile_names.get(self._personality, "?")
+    # gap-distance bars, factory-cruise idiom: 1 blue bar = aggressive (tight),
+    # 2 = standard, 3 = relaxed (long). Enum is aggressive=0/standard=1/relaxed=2,
+    # so filled = personality + 1. Unfilled slots stay faint so the scale reads.
+    filled = self._personality + 1
     w, h = 96, 46
     x = rect.x + 10
     y = rect.y + rect.height - 14 - h
     self.profile_chip_rect = rl.Rectangle(x, y, w, h)
     flash = self._profile_flash.update(0.0)
-    bg = rl.Color(255, 255, 255, int(255 * (0.18 + 0.5 * flash)))
+    bg = rl.Color(255, 255, 255, int(255 * (0.14 + 0.45 * flash)))
     rl.draw_rectangle_rounded(self.profile_chip_rect, 0.5, 8, bg)
-    fg = rl.Color(255, 255, 255, 235)
-    font = gui_app.font(FontWeight.SEMI_BOLD)
-    tw = rl.measure_text_ex(font, label, 30, 0).x
-    rl.draw_text_ex(font, label, rl.Vector2(x + (w - tw) / 2, y + 8), 30, 0, fg)
+    bar_w, bar_h, gap = 18, 28, 9
+    bx = x + (w - 3 * bar_w - 2 * gap) / 2
+    by = y + (h - bar_h) / 2
+    for i in range(3):
+      r = rl.Rectangle(bx + i * (bar_w + gap), by, bar_w, bar_h)
+      if i < filled:
+        rl.draw_rectangle_rounded(r, 0.35, 6, rl.Color(0, 145, 255, 235))
+      else:
+        rl.draw_rectangle_rounded(r, 0.35, 6, rl.Color(255, 255, 255, 55))
 
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""
