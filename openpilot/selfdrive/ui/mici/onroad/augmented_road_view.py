@@ -125,8 +125,13 @@ class BookmarkIcon(Widget):
       # VBSM_HUD: a tap (no meaningful swipe) on the profile chip cycles the
       # driving personality; same decrement direction as the wheel button.
       # selfdrived re-reads the param on its periodic config check.
-      if self._is_swiping and abs(self._swipe_start_x - self._swipe_current_x) < 20:
-        chip = self._hud_renderer.profile_chip_rect
+      # (this handler is BookmarkIcon's -- it receives all road-view touches;
+      # the parent view injects hud_renderer after construction. A bare
+      # self._hud_renderer here crashed the whole UI on any tap: BookmarkIcon
+      # never had that attribute.)
+      hud = getattr(self, "hud_renderer", None)
+      if hud is not None and self._is_swiping and abs(self._swipe_start_x - self._swipe_current_x) < 20:
+        chip = hud.profile_chip_rect
         if chip.width > 0 and rl.check_collision_point_rec(mouse_event.pos, chip):
           cur = int(ui_state.sm['selfdriveState'].personality.raw)
           ui_state.params.put("LongitudinalPersonality", (cur - 1) % 3)
@@ -174,6 +179,9 @@ class AugmentedRoadView(CameraView):
 
     self._model_renderer = ModelRenderer()
     self._hud_renderer = HudRenderer()
+    # VBSM_HUD: the profile-chip tap target lives in BookmarkIcon's touch
+    # handler (the only receiver of road-view touches); give it the renderer
+    self._bookmark_icon.hud_renderer = self._hud_renderer
     self._alert_renderer = AlertRenderer()
     self._driver_state_renderer = DriverStateRenderer()
     self._confidence_ball = ConfidenceBall()
