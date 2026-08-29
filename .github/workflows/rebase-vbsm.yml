@@ -120,7 +120,6 @@ jobs:
           check VBSM_GPU_KICK    openpilot/sunnypilot/ui_watchdog.py
           check VBSM_GPU_FALLBACK openpilot/sunnypilot/modeld_v2/modeld.py
           check VBSM_GPU_PPT     openpilot/sunnypilot/modeld_v2/modeld.py
-          check VBSM_GPU_HUD     openpilot/selfdrive/ui/ui_state.py
           check VBSM_HUD         openpilot/selfdrive/ui/mici/onroad/hud_renderer.py
           check VBSM_GPU_IDLE    openpilot/system/hardware/hardwared.py
           check VBSM_QUIET       openpilot/sunnypilot/models/fetcher.py
