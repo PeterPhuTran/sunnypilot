@@ -328,6 +328,13 @@ def main(demo=False):
   config_realtime_process(7, 54)
 
   CHESTNUT = chestnut_present()
+  # VBSM_GPU_FALLBACK: set when an eGPU load fails twice or an eGPU-active
+  # modeld dies (accessory-outlet power limits); tmpfs clears it each boot.
+  # With the veto the SoC path runs, and the per-hardware bundle slots make
+  # ModelState(chestnut=False) select the Qualcomm slot on its own.
+  if CHESTNUT and os.path.exists('/dev/shm/vbsm_usbgpu_veto'):
+    cloudlog.event("eGPU vetoed earlier this boot; running SoC fallback", error=True)
+    CHESTNUT = False
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
@@ -364,29 +371,95 @@ def main(demo=False):
   model = None
   if CHESTNUT:
     import threading
+
+    def apply_ppt_cap():
+      # VBSM_GPU_PPT: cap package power BEFORE the 1.7GB transfer -- the
+      # accessory-outlet 12V path (~0.45 ohm measured) browns out at stock
+      # boost transients, during load as well as inference. 80W ~ 6A fits.
+      # Tune via /data/vbsm_gpu_ppt_w (watts; 0 disables), clamp 40..220.
+      limit_w = 80
+      try:
+        with open("/data/vbsm_gpu_ppt_w") as f:
+          limit_w = int(f.read().strip())
+      except (OSError, ValueError):
+        pass
+      if limit_w <= 0:
+        return
+      limit_w = max(40, min(220, limit_w))
+      from tinygrad.device import Device
+      smu = Device["AMD"].iface.dev_impl.smu
+      smu._send_msg(smu.smu_mod.PPSMC_MSG_SetPptLimit, limit_w, timeout=100)
+      applied = smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
+      cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), error=False)
+
+    # VBSM_GPU_FALLBACK: load into a separate name so a late-completing or
+    # wedged loader thread can never clobber state after the timeout fires
+    big_model = None
     def load():
-      nonlocal model
-      model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
+      nonlocal big_model
+      try:
+        apply_ppt_cap()
+        big_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
+      except Exception as e:
+        # a lock-flavored failure means another process held the tinygrad
+        # USB-GPU device lock; capture the holder while it still exists
+        if "acquire lock" in str(e) or "am_usb" in str(e):
+          try:
+            import glob as _glob, subprocess as _sp
+            for lk in _glob.glob("/tmp/am_usb:*.lock"):
+              r = _sp.run(["fuser", "-v", lk], capture_output=True, text=True, timeout=5)
+              cloudlog.event("eGPU lock holder", lock=lk, fuser=(r.stdout + r.stderr)[:500], error=True)
+          except Exception:
+            pass
+        cloudlog.exception("eGPU model load failed")
     t = threading.Thread(target=load, daemon=True)
     t.start()
     t.join(60)
+    model = big_model
+    params.put_bool("ChestnutActive", model is not None)
     if model is None:
-      params.put_bool("ChestnutActive", False)
-      raise RuntimeError("chestnut model load failed or timed out (60s)")
-    params.put_bool("ChestnutActive", True)
+      # fall back by PROCESS REPLACEMENT: a wedged loader blocks inside a C
+      # call holding the GIL, so in-process fallbacks hang behind it. First
+      # failure exits WITHOUT the veto (cold-start transients get one retry
+      # on a settled rail); the second failure vetoes the boot. The manager
+      # restart policy owns the respawn; the respawn sees the veto and loads
+      # the Qualcomm slot in seconds.
+      fails = 1
+      try:
+        with open('/dev/shm/vbsm_gpu_load_fails') as f:
+          fails = int(f.read().strip()) + 1
+      except (OSError, ValueError):
+        pass
+      try:
+        with open('/dev/shm/vbsm_gpu_load_fails', 'w') as f:
+          f.write(str(fails))
+      except OSError:
+        pass
+      if fails >= 2:
+        try:
+          with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
+            f.write("load")
+        except OSError:
+          pass
+      cloudlog.event("eGPU load failed or wedged; exiting for respawn",
+                     error=True, loader_stuck=bool(t.is_alive()), attempt=fails,
+                     vetoed=bool(fails >= 2))
+      time.sleep(0.2)
+      os._exit(1)
   else:
     model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False)
+  gpu_active = CHESTNUT and model is not None and model.chestnut
 
   params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
-  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutState"] if CHESTNUT else [])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutState"] if gpu_active else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
-  chestnut_state = ChestnutState(pm, CHESTNUT) if CHESTNUT else None
+  chestnut_state = ChestnutState(pm, gpu_active) if gpu_active else None
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / model.constants.MODEL_FREQ)

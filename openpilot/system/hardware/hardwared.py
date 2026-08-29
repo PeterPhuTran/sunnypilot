@@ -49,6 +49,11 @@ class Chestnut:
     self.attempts = 0
     self.last_attempt = 0.
     self.flashed = False
+    self.rails_state: str | None = None
+    self.offroad_since: float | None = None
+    self.power_thread: threading.Thread | None = None
+    self.power_attempts = 0
+    self.last_power = 0.
 
   def flash(self) -> None:
     ret = subprocess.run(["sudo", sys.executable, os.path.join(BASEDIR, "openpilot/system/hardware/chestnut/flash.py"), CHESTNUT_FW_VERSION],
@@ -56,7 +61,68 @@ class Chestnut:
     cloudlog.event("chestnut flash done", returncode=ret.returncode, output=ret.stdout[-1000:], error=ret.returncode != 0)
     self.flashed = ret.returncode == 0
 
+  # VBSM_GPU_IDLE: cut the GPU rails while parked. The enclosure holds 12V on
+  # some car-off transitions and idles at ~25-40W straight off the small hybrid
+  # 12V battery (measured; resting voltage sagged to 11.7V with five
+  # low-voltage shutdowns during one bench week). The F3 rail switch is
+  # hardware-validated in both directions on fw ed4e39b7: off collapses draw
+  # 2A -> 1mA, on restores with the PCIe link retraining to L0 first try.
+  # OFF only after sustained offroad (manager has long stopped modeld, nothing
+  # holds the device); ON strictly on the offroad->onroad edge so a hardwared
+  # restart mid-drive never touches the bus while modeld owns the GPU. Both
+  # commands are idempotent; modeld's own retry+veto ladder is the backstop if
+  # the ON edge ever loses a race. Opt out: touch /data/vbsm_no_gpu_idle_off.
+  IDLE_CUT_S = 120.
+  POWER_RETRY_S = 15.
+  MAX_POWER_ATTEMPTS = 4
+
+  def _power(self, enable: bool) -> None:
+    cmd = "on" if enable else "off"
+    # -B: a root python writing __pycache__ into the tree breaks the updater's
+    # git clean as user comma, silently blocking ALL updates (bit us once)
+    ret = subprocess.run(["sudo", sys.executable, "-B", os.path.join(BASEDIR, "openpilot/sunnypilot/chestnut_power.py"), cmd],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=30)
+    ok = ret.returncode == 0
+    cloudlog.event("chestnut gpu rails", cmd=cmd, success=ok, output=ret.stdout[-200:], error=not ok)
+    if ok:
+      self.rails_state = cmd
+
+  def _update_rails(self, offroad: bool, present: bool) -> None:
+    now = time.monotonic()
+    if not present or os.path.exists("/data/vbsm_no_gpu_idle_off"):
+      self.rails_state = None
+      self.offroad_since = None
+      return
+    if self.power_thread is not None and self.power_thread.is_alive():
+      return
+
+    if offroad:
+      if self.offroad_since is None:
+        self.offroad_since = now
+        self.power_attempts = 0
+      want = "off"
+      ready = now - self.offroad_since >= self.IDLE_CUT_S
+    else:
+      if self.offroad_since is not None:
+        self.power_attempts = 0
+      self.offroad_since = None
+      want = "on"
+      # edge-only: rails_state None at startup mid-drive means "leave it alone"
+      ready = self.rails_state == "off"
+
+    if not ready or self.rails_state == want:
+      return
+    if self.power_attempts >= self.MAX_POWER_ATTEMPTS or now - self.last_power < self.POWER_RETRY_S:
+      return
+    self.power_attempts += 1
+    self.last_power = now
+    self.power_thread = threading.Thread(target=self._power, args=(want == "on",), daemon=True)
+    self.power_thread.start()
+
   def update(self, offroad: bool, usb_state: list[dict]) -> None:
+    present = any((d["vendorId"], d["productId"]) in CHESTNUT_USB_IDS for d in usb_state)
+    self._update_rails(offroad, present)
+
     mismatch = any((d["vendorId"], d["productId"]) in CHESTNUT_USB_IDS + CHESTNUT_ROM_USB_IDS and
                    d["product"] != f"custom {CHESTNUT_FW_VERSION}-CLEAN" for d in usb_state)
     if not mismatch:
@@ -224,6 +290,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   should_start_prev = False
   in_car = False
   engaged_prev = False
+  shutdown_ticks = 0
   pwrsave = False
   offroad_cycle_count = 0
 
@@ -443,9 +510,17 @@ def hardware_thread(end_event, hw_queue) -> None:
     msg.deviceState.somPowerDrawW = som_power_draw
 
     # Check if we need to shut down
+    # VBSM_GPU_IDLE-adjacent: require the decision to hold for 2 consecutive
+    # iterations. Observed once: the shutdown latched in the same sampling
+    # window as an ignition rise, turning a normal departure into a
+    # stale-clock cold boot ("logo, reboot, then clean start").
     if power_monitor.should_shutdown(onroad_conditions["ignition"], in_car, off_ts, started_seen):
-      cloudlog.warning(f"shutting device down, offroad since {off_ts}")
-      params.put_bool("DoShutdown", True, block=True)
+      shutdown_ticks += 1
+      if shutdown_ticks >= 2:
+        cloudlog.warning(f"shutting device down, offroad since {off_ts}")
+        params.put_bool("DoShutdown", True, block=True)
+    else:
+      shutdown_ticks = 0
 
     msg.deviceState.started = started_ts is not None and not offroad_mode
     msg.deviceState.startedMonoTime = int(1e9*(started_ts or 0))

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import time
 import threading
@@ -35,6 +36,11 @@ from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import Butto
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
 REPLAY = "REPLAY" in os.environ
+
+# camera blind spot monitor drop-in
+VBSM_CONFIG = "/data/vision_bsm.json"
+VBSM_CONFIG_INTERVAL = 100  # cycles between config reads at 100Hz
+VBSM_CHIME_HOLD = 150  # ~1.5s of alert per blind spot entry
 SIMULATION = "SIMULATION" in os.environ
 TESTING_CLOSET = "TESTING_CLOSET" in os.environ
 
@@ -58,6 +64,11 @@ IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 class SelfdriveD(CruiseHelper):
   def __init__(self, CP=None, CP_SP=None):
     self.params = Params()
+
+    self._vbsm_counter = 0
+    self._vbsm_chime_always = False
+    self._vbsm_detected_prev = False
+    self._vbsm_hold = 0
 
     # Ensure the current branch is cached, otherwise the first cycle lags
     build_metadata = get_build_metadata()
@@ -347,6 +358,42 @@ class SelfdriveD(CruiseHelper):
       self.events.add(EventName.excessiveActuation)
     # ******************************************************************************************
 
+    # Camera blind spot monitor chime, reusing the stock "Car Detected in
+    # Blindspot" event. The lane change alert below only fires while openpilot is
+    # steering above the lane change speed, so this covers the rest of the time.
+    self._vbsm_counter += 1
+    if self._vbsm_counter % VBSM_CONFIG_INTERVAL == 0:
+      # VBSM_HUD: adopt external personality changes (the HUD profile chip and
+      # the settings page write the param, but upstream only reads it at boot
+      # and from the wheel button). Self-written values are a no-op here.
+      try:
+        p = int(self.params.get("LongitudinalPersonality") or 0)
+        if 0 <= p <= 2 and p != self.personality:
+          self.personality = p
+          self.events.add(EventName.personalityChanged)
+      except (ValueError, TypeError):
+        pass
+      try:
+        with open(VBSM_CONFIG) as f:
+          config = json.load(f)
+        self._vbsm_chime_always = bool(config.get("enabled")) and bool(config.get("chime_always"))
+      except (OSError, ValueError):
+        self._vbsm_chime_always = False
+
+    detected = CS.leftBlindspot or CS.rightBlindspot
+    signalled = (CS.leftBlinker and CS.leftBlindspot) or (CS.rightBlinker and CS.rightBlindspot)
+
+    # hold briefly on the leading edge rather than nagging the whole time a car
+    # sits alongside in traffic
+    if self._vbsm_chime_always and detected and not self._vbsm_detected_prev:
+      self._vbsm_hold = VBSM_CHIME_HOLD
+    self._vbsm_detected_prev = detected
+    self._vbsm_hold = max(0, self._vbsm_hold - 1)
+
+    if signalled or self._vbsm_hold > 0:
+      if self.sm['modelV2'].meta.laneChangeState != LaneChangeState.preLaneChange:
+        self.events.add(EventName.laneChangeBlocked)
+
     # Handle lane change
     if self.sm['modelV2'].meta.laneChangeState == LaneChangeState.preLaneChange:
       direction = self.sm['modelV2'].meta.laneChangeDirection
@@ -521,6 +568,14 @@ class SelfdriveD(CruiseHelper):
           self.params.put('LongitudinalPersonality', self.personality)
           self.events.add(EventName.personalityChanged)
         self.experimental_mode_switched = False
+
+      # VBSM_EXP_TOGGLE: the LKAS wheel button toggles experimental vs stock
+      # (chill) mode; its stock MADS lateral-pause duty is disabled in mads.py
+      # under the same marker. The TSS2 carstate emits a single pressed edge
+      # per physical press, so this flips exactly once per press.
+      if any(be.pressed and be.type == ButtonType.lkas for be in CS.buttonEvents):
+        self.params.put_bool("ExperimentalMode", not self.params.get_bool("ExperimentalMode"))
+        self.events_sp.add(custom.OnroadEventSP.EventName.experimentalModeSwitched)
 
     self.icbm.run(CS, self.sm['carControl'], self.sm['longitudinalPlanSP'], self.is_metric)
 

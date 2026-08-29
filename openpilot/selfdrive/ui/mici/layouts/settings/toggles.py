@@ -1,3 +1,5 @@
+import json
+import os
 from collections.abc import Callable
 
 from openpilot.cereal import log
@@ -10,6 +12,51 @@ from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callba
 from openpilot.selfdrive.ui.ui_state import ui_state
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
+
+VBSM_CONFIG = "/data/vision_bsm.json"
+
+
+class BigConfigControl(BigToggle):
+  """A toggle backed by a JSON config file rather than a param.
+
+  The camera blind spot monitor ships as a drop-in with no compiled param of its
+  own, but it still belongs in the same settings list as everything else.
+  """
+
+  def __init__(self, text: str, key: str, path: str = VBSM_CONFIG, toggle_callback=None):
+    super().__init__(text, "", toggle_callback=toggle_callback)
+    self.key = key
+    self.path = path
+    self.set_checked(self._read())
+
+  def _read(self) -> bool:
+    try:
+      with open(self.path) as f:
+        return bool(json.load(f).get(self.key))
+    except (OSError, ValueError):
+      return False
+
+  def _write(self, value: bool) -> None:
+    try:
+      with open(self.path) as f:
+        config = json.load(f)
+    except (OSError, ValueError):
+      config = {}
+    config[self.key] = value
+    tmp = self.path + ".tmp"
+    try:
+      with open(tmp, "w") as f:
+        json.dump(config, f)
+      os.replace(tmp, self.path)
+    except OSError:
+      pass
+
+  def _handle_mouse_release(self, mouse_pos):
+    super()._handle_mouse_release(mouse_pos)
+    self._write(self._checked)
+
+  def refresh(self) -> None:
+    self.set_checked(self._read())
 
 
 class ExperimentalModeConfirmPage(NavScroller):
@@ -50,6 +97,8 @@ class TogglesLayoutMici(NavScroller):
     record_front = BigParamControl("record & upload cabin camera", "RecordFront", toggle_callback=restart_needed_callback)
     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
     enable_openpilot = BigParamControl("enable sunnypilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
+    self._vision_bsm = BigConfigControl("camera blind spot monitor", "enabled")
+    self._vision_bsm_chime = BigConfigControl("chime on every blind spot car", "chime_always")
 
     self._scroller.add_widgets([
       self._personality_toggle,
@@ -57,6 +106,8 @@ class TogglesLayoutMici(NavScroller):
       is_metric_toggle,
       ldw_toggle,
       always_on_dm_toggle,
+      self._vision_bsm,
+      self._vision_bsm_chime,
       record_front,
       record_mic,
       enable_openpilot,
@@ -114,6 +165,10 @@ class TogglesLayoutMici(NavScroller):
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:
       item.set_checked(ui_state.params.get_bool(key))
+
+    # config backed, so not in the params list above
+    self._vision_bsm.refresh()
+    self._vision_bsm_chime.refresh()
 
   def _on_experimental_mode(self, state: bool):
     if state and not ui_state.params.get_bool("ExperimentalModeConfirmed"):
