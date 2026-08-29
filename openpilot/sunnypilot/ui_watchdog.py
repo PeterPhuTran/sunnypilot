@@ -27,12 +27,12 @@ Process identity is therefore matched on the exact proctitle, never a prefix.
 
 VBSM_GPU_KICK: the chestnut enclosure is powered from the car's SWITCHED 12V
 outlet, so it boots at the same moment openpilot does and loses the race —
-modeld evaluates usbgpu_present() exactly once at startup, so a drive that
+modeld evaluates chestnut_present() exactly once at startup, so a drive that
 starts before the enclosure enumerates runs the whole way on the SoC with the
-GPU idle. When the GPU is provably usable (same usbgpu_present() check modeld
+GPU idle. When the GPU is provably usable (same chestnut_present() check modeld
 itself runs), the models manager has finished switching the active bundle to
 the AMD catalog, and the running modeld reports it booted without the GPU
-(UsbGpuLoading False), this watchdog kills modeld ONCE at a safe moment —
+(ChestnutLoading False), this watchdog kills modeld ONCE at a safe moment —
 standing still, openpilot not engaged — and the manager's restart policy
 brings it back; the fresh modeld re-runs its GPU check and loads the AMD
 bundle from the pre-cached chunks. Bundle ping-pong across power cycles is
@@ -48,7 +48,7 @@ import time
 from openpilot.cereal import messaging
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.modeld.helpers import usbgpu_present
+from openpilot.selfdrive.modeld.helpers import chestnut_present
 
 UI_PROCTITLE = "openpilot.selfdrive.ui.ui"
 EVIDENCE_DIR = "/data/vbsm_eval"
@@ -63,7 +63,7 @@ MIN_KILL_GAP_S = 60.0    # manager restart + UI startup needs room to finish
 GPU_VETO_FILE = "/dev/shm/vbsm_usbgpu_veto"  # tmpfs: a reboot grants a fresh chance
 GPU_LOAD_DEADLINE_S = 90.0  # every legitimate load path resolves by 60s
 GPU_STABLE_S = 10.0      # enclosure must stay enumerated this long
-MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write UsbGpuLoading
+MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write ChestnutLoading
 GPU_KICK_COOLDOWN_S = 120.0
 MAX_GPU_KICKS = 2        # per boot; a modeld that then dies on AMD is the
                          # manager restart policy's problem, not a kick loop
@@ -164,7 +164,7 @@ class GpuKick:
       self.gpu_was_active = False
       return
 
-    if not usbgpu_present():
+    if not chestnut_present():
       self.gpu_since = None
       return
     if self.gpu_since is None:
@@ -186,7 +186,7 @@ class GpuKick:
       self.modeld_seen = None
       self.gpu_was_active = False
       return
-    self.gpu_was_active = self.params.get_bool("UsbGpuActive")
+    self.gpu_was_active = self.params.get_bool("ChestnutActive")
     if self.modeld_seen is None or self.modeld_seen[0] != pid:
       self.modeld_seen = (pid, now)
 
@@ -194,9 +194,9 @@ class GpuKick:
     # every thread in modeld INCLUDING its own 60s timeout (field-verified:
     # modeld ignored SIGINT and needed the manager escalation SIGKILL at
     # car-off, with the timeout never having fired). Only an external kill
-    # works. UsbGpuLoading past the deadline is definitive: every legitimate
+    # works. ChestnutLoading past the deadline is definitive: every legitimate
     # path -- success or the in-process exit -- resolves by 60s.
-    if (self.params.get_bool("UsbGpuLoading") and now - self.modeld_seen[1] > GPU_LOAD_DEADLINE_S
+    if (self.params.get_bool("ChestnutLoading") and now - self.modeld_seen[1] > GPU_LOAD_DEADLINE_S
         and not os.path.exists(GPU_VETO_FILE)):
       self._veto()
       cloudlog.error(f"ui_watchdog: modeld pid {pid} wedged in eGPU load "
@@ -219,11 +219,11 @@ class GpuKick:
     # param proves nothing and must never trigger a kill. Loading alone is NOT
     # that signal -- it goes False on SUCCESS too, and gating on it alone made
     # the kick SIGKILL two perfectly healthy GPU sessions one second after
-    # their 39s BMV2 loads finished. UsbGpuActive is the actual verdict.
-    loading = self.params.get("UsbGpuLoading")
-    if loading is None or self.params.get_bool("UsbGpuLoading"):
+    # their 39s BMV2 loads finished. ChestnutActive is the actual verdict.
+    loading = self.params.get("ChestnutLoading")
+    if loading is None or self.params.get_bool("ChestnutLoading"):
       return
-    if self.params.get_bool("UsbGpuActive"):
+    if self.params.get_bool("ChestnutActive"):
       return
 
     # upstream moved to per-hardware bundle SLOTS: only kick when the USBGPU

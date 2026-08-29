@@ -3,7 +3,7 @@ import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
 from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar
-from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
+from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus, ChestnutState
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -19,9 +19,9 @@ KM_TO_MILE = 0.621371
 CRUISE_DISABLED_CHAR = '–'
 
 SET_SPEED_PERSISTENCE = 2.5  # seconds
-# VBSM_HUD: how long the eGPU status icon lingers after a state change before
-# yielding the bottom-right slot to the driver-monitoring face
-EGPU_PERSISTENCE = 6.0  # seconds
+# VBSM_HUD: how long the chestnut status icon lingers after a state change
+# before yielding the bottom-right slot to the driver-monitoring face
+CHESTNUT_PERSISTENCE = 6.0  # seconds
 
 
 @dataclass(frozen=True)
@@ -117,8 +117,7 @@ class HudRenderer(Widget):
     self.speed: float = 0.0
     self.v_ego_cluster_seen: bool = False
     self._engaged: bool = False
-    self._small_model_engaged: bool = False
-    self._egpu_fade_time: float = 0
+    self._chestnut_fade_time: float = 0
 
     self._can_draw_top_icons = True
     self._show_wheel_critical = False
@@ -134,20 +133,18 @@ class HudRenderer(Widget):
     self._txt_wheel: rl.Texture = gui_app.texture('icons_mici/wheel.png', 50, 50)
     self._txt_wheel_critical: rl.Texture = gui_app.texture('icons_mici/wheel_critical.png', 50, 50)
     self._txt_exclamation_point: rl.Texture = gui_app.texture('icons_mici/exclamation_point.png', 9, 44)
-    self._txt_egpu: rl.Texture = gui_app.texture('icons_mici/egpu.png', 60, 44)
-    self._txt_egpu_green: rl.Texture = gui_app.texture('icons_mici/egpu_green.png', 60, 44)
-    self._txt_egpu_orange: rl.Texture = gui_app.texture('icons_mici/egpu_orange.png', 60, 44)
-    self._txt_egpu_crossed: rl.Texture = gui_app.texture('icons_mici/egpu_crossed.png', 60, 52)
-    self._egpu_icon: rl.Texture | None = None
+    self._txt_chestnut: rl.Texture = gui_app.texture('icons_mici/chestnut.png', 60, 44)
+    self._txt_chestnut_green: rl.Texture = gui_app.texture('icons_mici/chestnut_green.png', 60, 44)
+    self._txt_chestnut_orange: rl.Texture = gui_app.texture('icons_mici/chestnut_orange.png', 75, 44)
+    self._chestnut_icon: rl.Texture | None = None
     # VBSM_HUD: engaged bottom-left badge -- experimental flask vs stock couch
     self._txt_mode_exp: rl.Texture = gui_app.texture('icons_mici/experimental_mode.png', 50, 50)
     self._txt_mode_stock: rl.Texture = gui_app.texture('icons/couch.png', 50, 50)
-
     self._wheel_alpha_filter = FirstOrderFilter(0, 0.05, 1 / gui_app.target_fps)
     self._wheel_y_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
 
     self._set_speed_alpha_filter = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
-    self._egpu_alpha_filter = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
+    self._chestnut_alpha_filter = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
 
   def set_wheel_critical_icon(self, critical: bool):
     """Set the wheel icon to critical or normal state."""
@@ -161,10 +158,10 @@ class HudRenderer(Widget):
     # whether we're drawing any top icons currently
     return bool(self._set_speed_alpha_filter.x > 1e-2)
 
-  def egpu_icon_visible(self) -> bool:
+  def chestnut_icon_visible(self) -> bool:
     # VBSM_HUD: the dmoji shares the bottom-right slot and waits for the
-    # eGPU status icon to fade out
-    return bool(self._egpu_alpha_filter.x > 1e-2)
+    # chestnut status icon to fade out
+    return bool(self._chestnut_alpha_filter.x > 1e-2)
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
@@ -183,14 +180,12 @@ class HudRenderer(Widget):
       controls_state.deprecated.vCruise if v_cruise_cluster == 0.0 else v_cruise_cluster
     )
     engaged = sm['selfdriveState'].enabled
-    if (engaged and not self._engaged and not ui_state.usbgpu_loading and ui_state.usbgpu_active is not True and
-        ui_state.sm.recv_frame['modelV2'] > ui_state.started_frame):
-      self._small_model_engaged = True
-    if engaged != self._engaged:
-      self._egpu_fade_time = rl.get_time() if engaged else 0
     if (set_speed != self.set_speed and engaged) or (engaged and not self._engaged):
       self._set_speed_changed_time = rl.get_time()
+    if engaged != self._engaged:
+      self._chestnut_fade_time = rl.get_time() if engaged else 0
     self._engaged = engaged
+    # VBSM_HUD: live personality for the profile chip
     pers = int(sm['selfdriveState'].personality.raw)
     if pers != self._personality:
       if self._personality >= 0:
@@ -216,8 +211,7 @@ class HudRenderer(Widget):
 
     self._draw_profile_chip(rect)
 
-    if ui_state.usbgpu and ui_state.usbgpu_compiled:
-      self._draw_model_source(rect)
+    self._draw_model_source(rect)
 
     self._draw_steering_wheel(rect)
 
@@ -225,31 +219,25 @@ class HudRenderer(Widget):
     if ui_state.sm.recv_frame['selfdriveState'] < ui_state.started_frame:
       return
 
-    big_failed = (ui_state.usbgpu_active is False or not ui_state.sm['deviceState'].chestnutPresent or
-                  (ui_state.usbgpu_active is True and ui_state.sm.recv_frame['modelV2'] > ui_state.started_frame and
-                   not ui_state.sm.alive['modelV2']) or
-                  (ui_state.usbgpu_active is None and ui_state.sm.recv_frame['modelV2'] > ui_state.started_frame))
-    self._small_model_engaged &= big_failed
-    loading = ui_state.usbgpu_loading or (ui_state.usbgpu_active is None and not big_failed)
+    loading = ui_state.chestnut_state == ChestnutState.LOADING
     if loading:
-      pulse = 0.5 - 0.5 * math.cos(rl.get_time() * 6.0)
-      icon = self._txt_egpu
-      opacity = 0.35 + 0.65 * pulse
-    elif self._small_model_engaged:
-      icon = self._txt_egpu_crossed
-      opacity = 0.65
-    elif big_failed:
-      icon = self._txt_egpu_orange
+      icon = self._txt_chestnut
+      opacity = 0.35 + 0.65 * (0.5 - 0.5 * math.cos(rl.get_time() * 6.0))
+    elif ui_state.chestnut_state in (ChestnutState.UNCOMPILED, ChestnutState.FAILED):
+      icon = self._txt_chestnut_orange
+      opacity = 1.0
+    elif ui_state.chestnut_state == ChestnutState.ACTIVE:
+      icon = self._txt_chestnut_green
       opacity = 1.0
     else:
-      icon = self._txt_egpu_green
-      opacity = 1.0
+      return
 
-    if icon is not self._egpu_icon:
-      self._egpu_fade_time = rl.get_time()
-      self._egpu_icon = icon
+    if icon is not self._chestnut_icon:
+      self._chestnut_fade_time = rl.get_time()
+      self._chestnut_icon = icon
     # VBSM_HUD: linger longer than the set-speed fade so the state is readable
-    alpha = self._egpu_alpha_filter.update(loading or 0 < rl.get_time() - self._egpu_fade_time < EGPU_PERSISTENCE)
+    visible = loading or rl.get_time() - self._chestnut_fade_time < CHESTNUT_PERSISTENCE
+    alpha = self._chestnut_alpha_filter.update(visible)
     if alpha < 1e-2:
       return
 
@@ -309,36 +297,6 @@ class HudRenderer(Widget):
       exclamation_pos_y = pos_y - self._txt_exclamation_point.height / 2
       rl.draw_texture_ex(self._txt_exclamation_point, rl.Vector2(exclamation_pos_x, exclamation_pos_y), 0.0, 1.0, rl.WHITE)
 
-  def _draw_profile_chip(self, rect: rl.Rectangle) -> None:
-    # VBSM_HUD: bottom-left, clear of the wheel and eGPU icons (bottom-right)
-    # and the set-speed circle (top-left)
-    # alerts own the screen: the same yield the set-speed circle uses
-    # (augmented_road_view clears can_draw_top_icons while an alert renders)
-    if self._personality < 0 or not self._can_draw_top_icons:
-      return
-    # gap-distance bars, factory-cruise idiom: 1 blue bar = aggressive (tight),
-    # 2 = standard, 3 = relaxed (long). Enum is aggressive=0/standard=1/relaxed=2,
-    # so filled = personality + 1. Unfilled slots stay faint so the scale reads.
-    filled = self._personality + 1
-    # top-right corner, slimmed per user preference; the set-speed circle owns
-    # top-left, turn arrows draw center, wheel/eGPU icons own bottom-right
-    w, h = 78, 40
-    x = rect.x + rect.width - 10 - w
-    y = rect.y + 14
-    self.profile_chip_rect = rl.Rectangle(x, y, w, h)
-    flash = self._profile_flash.update(0.0)
-    bg = rl.Color(255, 255, 255, int(255 * (0.14 + 0.45 * flash)))
-    rl.draw_rectangle_rounded(self.profile_chip_rect, 0.5, 8, bg)
-    bar_w, bar_h, gap = 14, 24, 7
-    bx = x + (w - 3 * bar_w - 2 * gap) / 2
-    by = y + (h - bar_h) / 2
-    for i in range(3):
-      r = rl.Rectangle(bx + i * (bar_w + gap), by, bar_w, bar_h)
-      if i < filled:
-        rl.draw_rectangle_rounded(r, 0.35, 6, rl.Color(0, 145, 255, 235))
-      else:
-        rl.draw_rectangle_rounded(r, 0.35, 6, rl.Color(255, 255, 255, 55))
-
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""
     # VBSM_HUD: the set speed used to fade 2.5s after a change, leaving the
@@ -371,6 +329,37 @@ class HudRenderer(Widget):
     for ox, oy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-2, -2), (2, -2), (-2, 2), (2, 2)):
       rl.draw_text_ex(self._font_display, set_speed_text, rl.Vector2(tx + ox, ty + oy), size, 0, outline)
     rl.draw_text_ex(self._font_display, set_speed_text, rl.Vector2(tx, ty), size, 0, set_speed_color)
+
+  def _draw_profile_chip(self, rect: rl.Rectangle) -> None:
+    # VBSM_HUD: bottom-left, clear of the wheel and eGPU icons (bottom-right)
+    # and the set-speed circle (top-left)
+    # alerts own the screen: the same yield the set-speed circle uses
+    # (augmented_road_view clears can_draw_top_icons while an alert renders)
+    if self._personality < 0 or not self._can_draw_top_icons:
+      return
+    # gap-distance bars, factory-cruise idiom: 1 blue bar = aggressive (tight),
+    # 2 = standard, 3 = relaxed (long). Enum is aggressive=0/standard=1/relaxed=2,
+    # so filled = personality + 1. Unfilled slots stay faint so the scale reads.
+    filled = self._personality + 1
+    # top-right corner, slimmed per user preference; the set-speed circle owns
+    # top-left, turn arrows draw center, wheel/eGPU icons own bottom-right
+    w, h = 78, 40
+    x = rect.x + rect.width - 10 - w
+    y = rect.y + 14
+    self.profile_chip_rect = rl.Rectangle(x, y, w, h)
+    flash = self._profile_flash.update(0.0)
+    bg = rl.Color(255, 255, 255, int(255 * (0.14 + 0.45 * flash)))
+    rl.draw_rectangle_rounded(self.profile_chip_rect, 0.5, 8, bg)
+    bar_w, bar_h, gap = 14, 24, 7
+    bx = x + (w - 3 * bar_w - 2 * gap) / 2
+    by = y + (h - bar_h) / 2
+    for i in range(3):
+      r = rl.Rectangle(bx + i * (bar_w + gap), by, bar_w, bar_h)
+      if i < filled:
+        rl.draw_rectangle_rounded(r, 0.35, 6, rl.Color(0, 145, 255, 235))
+      else:
+        rl.draw_rectangle_rounded(r, 0.35, 6, rl.Color(255, 255, 255, 55))
+
 
   def _draw_current_speed(self, rect: rl.Rectangle) -> None:
     """Draw the current vehicle speed and unit."""

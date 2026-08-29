@@ -48,9 +48,9 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
   `UsbGpuActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything
   else); vetoes the boot when a GPU-active modeld dies.
-- **HUD status** (`VBSM_GPU_HUD`, `ui_state.py`): upstream's eGPU icon (pulsing = loading, green =
-  big model live, orange = SoC fallback) never rendered on bundle installs; a cached bundle pkl now
-  satisfies its gate.
+- **HUD status**: upstream's chestnut icon (pulsing = loading, green = big model live, orange =
+  fallback) is now driven by a proper state machine whose compiled-gate checks the bundle chunk
+  manifest — our `VBSM_GPU_HUD` gate patch became obsolete and was retired (see Retired below).
 - **Parked power-off** (`VBSM_GPU_IDLE`, `hardwared.py` + `chestnut_power.py`): the enclosure holds
   12 V after some parks and idles at 25–40 W straight off the car battery. After 120 s of offroad the
   GPU rails are cut via the firmware's F3 switch (hardware-validated both directions: 2 A → 1 mA,
@@ -89,7 +89,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   iterations before `DoShutdown` fires — kills the race where a shutdown latched in the same
   sampling window as an ignition rise and turned a departure into a double boot.
 
-## Managed files (19) and markers
+## Managed files (18) and markers
 
 | File | Mods | Markers |
 |---|---|---|
@@ -106,13 +106,14 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1 settings | `BigConfigControl` |
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap | `BSM_STATE_PATH`, `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD` |
-| `openpilot/selfdrive/ui/ui_state.py` | §4 HUD gate | `VBSM_GPU_HUD` |
 | `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
 | `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap + fallback | `VBSM_GPU_FALLBACK`, `VBSM_GPU_PPT` |
 | `openpilot/system/hardware/hardwared.py` | §4 idle power, §6 shutdown debounce | `VBSM_GPU_IDLE` |
 
 Retired: `VBSM_COMPAT` (a modeld_v2 unpacking shim, superseded when upstream fixed the API
-properly).
+properly); `VBSM_GPU_HUD` (a ui_state compiled-gate patch for bundle installs, superseded by
+upstream's chestnut state machine whose gate checks the bundle chunk manifest — `ui_state.py`
+left the managed set with it).
 
 ## Tunables and switches
 

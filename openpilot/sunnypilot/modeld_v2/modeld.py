@@ -9,7 +9,7 @@ See the LICENSE.md file in the root directory for more details.
 import os
 os.environ['GMMU'] = '0'
 from openpilot.common.hardware import COMMA_HARDWARE
-from openpilot.selfdrive.modeld.helpers import usbgpu_present, load_oob
+from openpilot.selfdrive.modeld.helpers import chestnut_present, load_oob
 import time
 import numpy as np
 import openpilot.cereal.messaging as messaging
@@ -84,14 +84,14 @@ class ModelState(ModelStateBase):
   inputs: dict[str, np.ndarray]
   prev_desire: np.ndarray
 
-  def __init__(self, cam_w: int, cam_h: int, usbgpu: bool = False):
+  def __init__(self, cam_w: int, cam_h: int, chestnut: bool = False):
     ModelStateBase.__init__(self)
 
     env_pkl = os.environ.get('COMBINED_MODEL_PKL')
     if env_pkl and os.path.exists(env_pkl):
       model_bundle = None
     else:
-      model_bundle = get_active_bundle(usbgpu=usbgpu)
+      model_bundle = get_active_bundle(chestnut=chestnut)
     self.generation = model_bundle.generation if model_bundle is not None else None
     overrides = {override.key: override.value for override in model_bundle.overrides} if model_bundle else {}
 
@@ -99,7 +99,7 @@ class ModelState(ModelStateBase):
     self.LONG_SMOOTH_SECONDS = float(overrides.get('long', ".0"))
     self.MIN_LAT_CONTROL_SPEED = 0.3
     self.PLANPLUS_CONTROL: float = 1.0
-    self.usbgpu = usbgpu
+    self.chestnut = chestnut
 
     pkl_path = _find_driving_pkl(model_bundle)
     assert pkl_path is not None, "No driving pkl found — all models must be compiled with compile_modeld.py"
@@ -110,7 +110,7 @@ class ModelState(ModelStateBase):
     jits = load_oob(open_file_chunked(pkl_path))
 
     self.WARP_DEV = 'QCOM' if COMMA_HARDWARE else 'CPU'
-    self.DEV = 'AMD' if self.usbgpu else self.WARP_DEV
+    self.DEV = 'AMD' if self.chestnut else self.WARP_DEV
     self.QUEUE_DEV = self.DEV
     metadata = jits['metadata']
 
@@ -185,7 +185,7 @@ class ModelState(ModelStateBase):
     else:
       self.warp(**{k: self.input_queues[k] for k in WARP_INPUTS}, frame=frame_tensor, big_frame=big_frame_tensor)
 
-    if self.usbgpu:
+    if self.chestnut:
       self.warmup()
 
   def warmup(self) -> None:
@@ -287,7 +287,7 @@ class ModelState(ModelStateBase):
       buf[0, :-1] = buf[0, 1:]
       buf[0, -1, :] = outputs['desired_curvature'][0, :] if not self.mlsim else 0
 
-    if self.usbgpu and not np.all(np.isfinite(outputs.get('plan', np.array([0.])))):
+    if self.chestnut and not np.all(np.isfinite(outputs.get('plan', np.array([0.])))):
       cloudlog.error("model output not finite, dropping frame")
       return None
 
@@ -327,20 +327,20 @@ def main(demo=False):
   setproctitle(PROCESS_NAME)
   config_realtime_process(7, 54)
 
-  USBGPU = usbgpu_present()
+  CHESTNUT = chestnut_present()
   # VBSM_GPU_FALLBACK: set when an eGPU load fails twice or an eGPU-active
   # modeld dies (accessory-outlet power limits); tmpfs clears it each boot.
-  # With the veto the SoC path runs, and upstream's per-hardware bundle slots
-  # make ModelState(usbgpu=False) select the Qualcomm slot on its own.
-  if USBGPU and os.path.exists('/dev/shm/vbsm_usbgpu_veto'):
+  # With the veto the SoC path runs, and the per-hardware bundle slots make
+  # ModelState(chestnut=False) select the Qualcomm slot on its own.
+  if CHESTNUT and os.path.exists('/dev/shm/vbsm_usbgpu_veto'):
     cloudlog.event("eGPU vetoed earlier this boot; running SoC fallback", error=True)
-    USBGPU = False
-  if USBGPU:
+    CHESTNUT = False
+  if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
   params = Params()
-  params.put_bool("UsbGpuLoading", USBGPU)
-  params.remove("UsbGpuActive")
+  params.put_bool("ChestnutLoading", CHESTNUT)
+  params.remove("ChestnutActive")
 
   # visionipc clients
   while True:
@@ -369,7 +369,7 @@ def main(demo=False):
   st = time.monotonic()
 
   model = None
-  if USBGPU:
+  if CHESTNUT:
     import threading
 
     def apply_ppt_cap():
@@ -399,7 +399,7 @@ def main(demo=False):
       nonlocal big_model
       try:
         apply_ppt_cap()
-        big_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=True)
+        big_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
       except Exception as e:
         # a lock-flavored failure means another process held the tinygrad
         # USB-GPU device lock; capture the holder while it still exists
@@ -416,7 +416,7 @@ def main(demo=False):
     t.start()
     t.join(60)
     model = big_model
-    params.put_bool("UsbGpuActive", model is not None)
+    params.put_bool("ChestnutActive", model is not None)
     if model is None:
       # fall back by PROCESS REPLACEMENT: a wedged loader blocks inside a C
       # call holding the GIL, so in-process fallbacks hang behind it. First
@@ -447,10 +447,10 @@ def main(demo=False):
       time.sleep(0.2)
       os._exit(1)
   else:
-    model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, usbgpu=False)
-  gpu_active = USBGPU and model is not None and model.usbgpu
+    model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False)
+  gpu_active = CHESTNUT and model is not None and model.chestnut
 
-  params.put_bool("UsbGpuLoading", False)
+  params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
@@ -597,7 +597,7 @@ def main(demo=False):
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
-      modelv2_send.modelV2.big = model.usbgpu
+      modelv2_send.modelV2.big = model.chestnut
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]

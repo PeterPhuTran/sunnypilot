@@ -361,10 +361,10 @@ class AugmentedRoadView(CameraView):
     alert_to_render, not_animating_out = self._alert_renderer.will_render()
 
     # VBSM_HUD: the dmoji lives in the bottom-right eGPU slot now -- it shows
-    # once the eGPU status icon has faded (the persistent set-speed owns its
+    # once the chestnut status icon has faded (the persistent set-speed owns its
     # old top-left slot, which kept it hidden whenever engaged). Hidden when
     # disengaged unless AlwaysOnDM is enabled, as before.
-    should_draw_dmoji = (not self._hud_renderer.egpu_icon_visible() and
+    should_draw_dmoji = (not self._hud_renderer.chestnut_icon_visible() and
                          (ui_state.status != UIStatus.DISENGAGED or ui_state.always_on_dm))
     self._driver_state_renderer.set_should_draw(should_draw_dmoji)
     dm_size = self._driver_state_renderer.BASE_SIZE
