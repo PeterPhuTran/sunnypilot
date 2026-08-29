@@ -290,6 +290,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   should_start_prev = False
   in_car = False
   engaged_prev = False
+  shutdown_ticks = 0
   pwrsave = False
   offroad_cycle_count = 0
 
@@ -509,9 +510,17 @@ def hardware_thread(end_event, hw_queue) -> None:
     msg.deviceState.somPowerDrawW = som_power_draw
 
     # Check if we need to shut down
+    # VBSM_GPU_IDLE-adjacent: require the decision to hold for 2 consecutive
+    # iterations. Observed once: the shutdown latched in the same sampling
+    # window as an ignition rise, turning a normal departure into a
+    # stale-clock cold boot ("logo, reboot, then clean start").
     if power_monitor.should_shutdown(onroad_conditions["ignition"], in_car, off_ts, started_seen):
-      cloudlog.warning(f"shutting device down, offroad since {off_ts}")
-      params.put_bool("DoShutdown", True, block=True)
+      shutdown_ticks += 1
+      if shutdown_ticks >= 2:
+        cloudlog.warning(f"shutting device down, offroad since {off_ts}")
+        params.put_bool("DoShutdown", True, block=True)
+    else:
+      shutdown_ticks = 0
 
     msg.deviceState.started = started_ts is not None and not offroad_mode
     msg.deviceState.startedMonoTime = int(1e9*(started_ts or 0))
