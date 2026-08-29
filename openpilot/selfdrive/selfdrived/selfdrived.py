@@ -569,6 +569,14 @@ class SelfdriveD(CruiseHelper):
           self.events.add(EventName.personalityChanged)
         self.experimental_mode_switched = False
 
+      # VBSM_EXP_TOGGLE: the LKAS wheel button toggles experimental vs stock
+      # (chill) mode; its stock MADS lateral-pause duty is disabled in mads.py
+      # under the same marker. The TSS2 carstate emits a single pressed edge
+      # per physical press, so this flips exactly once per press.
+      if any(be.pressed and be.type == ButtonType.lkas for be in CS.buttonEvents):
+        self.params.put_bool("ExperimentalMode", not self.params.get_bool("ExperimentalMode"))
+        self.events_sp.add(custom.OnroadEventSP.EventName.experimentalModeSwitched)
+
     self.icbm.run(CS, self.sm['carControl'], self.sm['longitudinalPlanSP'], self.is_metric)
 
   def data_sample(self):

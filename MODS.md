@@ -58,17 +58,38 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   `/data/vbsm_no_gpu_idle_off`. The privileged CLI runs under `python -B` — a root interpreter
   writing bytecode into the tree silently breaks the updater's git clean.
 
-### 5. Driver HUD — `VBSM_HUD`
+### 5. Driver HUD — `VBSM_HUD`, `VBSM_EXP_TOGGLE`
 - **Persistent set speed** (`hud_renderer.py`): the cruise set-speed no longer fades 2.5 s after a
-  change; it stays up whenever engaged. (Trade-off: the driver-monitoring emoji shares that slot and
-  hides while engaged.)
+  change; it stays up whenever engaged.
 - **Gap-profile chip** (`hud_renderer.py` + `augmented_road_view.py` + `selfdrived.py`): top-right
   blue-bar indicator — one bar = aggressive, two = standard, three = relaxed — reading the
   personality live from selfdrived's own state. Tap to cycle; selfdrived adopts external personality
   changes on its periodic check (upstream reads the param only at boot and from the wheel button)
   and fires the stock personality-changed alert as feedback.
+- **Driving-mode badge** (`hud_renderer.py`): while engaged, the bottom-left wheel icon becomes a
+  mode badge — flask = experimental, couch = stock. The steer-required critical wheel and its
+  exclamation mark are untouched, as are the disengage fade and turn-intent arrows.
+- **LKAS button = experimental toggle** (`VBSM_EXP_TOGGLE`, `selfdrived.py` + `mads.py`): one press
+  of the wheel's LKAS/LDA button flips `ExperimentalMode` (live within ~100 ms via the stack's
+  param threads) and fires the stock "Experimental Mode Switched" alert. MADS's stock use of the
+  same button (lateral pause) is disabled via `VBSM_LKAS_REPURPOSED` in `mads.py` — set it False
+  to restore. TSS2-only signal; the upstream distance-button 0.5 s hold toggle still works too.
+  Note the button also still flips the car's own stock LDA setting in the cluster.
+- **Driver-monitoring face relocated** (`augmented_road_view.py` + `hud_renderer.py`): the dmoji
+  moved from top-left (where the persistent set-speed kept it hidden whenever engaged) to the
+  bottom-right eGPU slot; it appears once the eGPU status icon fades. The eGPU icon also lingers
+  6 s after a state change (was 2.5 s) so its color is actually readable.
 
-## Managed files (16) and markers
+### 6. Boot & log hygiene — `VBSM_QUIET`
+- **Chunk-manifest storm fix** (`models/fetcher.py`): two catalog entries share a fileName with
+  different chunk counts, flipping the same manifest twice per second forever (93 % of log volume,
+  ~2 h retention). Manifests are now written only when the chunks exist locally. Reported upstream
+  (sunnypilot/sunnypilot#1975).
+- **Shutdown debounce** (`hardwared.py`): the offroad shutdown decision must hold for 2 consecutive
+  iterations before `DoShutdown` fires — kills the race where a shutdown latched in the same
+  sampling window as an ignition rise and turned a departure into a double boot.
+
+## Managed files (19) and markers
 
 | File | Mods | Markers |
 |---|---|---|
@@ -79,14 +100,16 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/system/manager/process.py` | §3 | `VBSM_RESTART` |
 | `openpilot/system/manager/process_config.py` | §1, §3 process entries | — |
 | `openpilot/selfdrive/car/card.py` | §1 | — |
-| `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §5 personality re-read | `VBSM`, `VBSM_HUD` |
+| `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §5 personality re-read + LKAS toggle | `VBSM`, `VBSM_HUD`, `VBSM_EXP_TOGGLE` |
+| `openpilot/sunnypilot/mads/mads.py` | §5 LKAS button freed for the toggle | `VBSM_EXP_TOGGLE` |
+| `openpilot/sunnypilot/models/fetcher.py` | §6 manifest storm fix | `VBSM_QUIET` |
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1 settings | `BigConfigControl` |
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap | `BSM_STATE_PATH`, `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD` |
 | `openpilot/selfdrive/ui/ui_state.py` | §4 HUD gate | `VBSM_GPU_HUD` |
 | `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
 | `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap + fallback | `VBSM_GPU_FALLBACK`, `VBSM_GPU_PPT` |
-| `openpilot/system/hardware/hardwared.py` | §4 idle power | `VBSM_GPU_IDLE` |
+| `openpilot/system/hardware/hardwared.py` | §4 idle power, §6 shutdown debounce | `VBSM_GPU_IDLE` |
 
 Retired: `VBSM_COMPAT` (a modeld_v2 unpacking shim, superseded when upstream fixed the API
 properly).

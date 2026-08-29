@@ -360,11 +360,17 @@ class AugmentedRoadView(CameraView):
 
     alert_to_render, not_animating_out = self._alert_renderer.will_render()
 
-    # Hide DMoji when disengaged unless AlwaysOnDM is enabled
-    should_draw_dmoji = (not self._hud_renderer.drawing_top_icons() and
+    # VBSM_HUD: the dmoji lives in the bottom-right eGPU slot now -- it shows
+    # once the eGPU status icon has faded (the persistent set-speed owns its
+    # old top-left slot, which kept it hidden whenever engaged). Hidden when
+    # disengaged unless AlwaysOnDM is enabled, as before.
+    should_draw_dmoji = (not self._hud_renderer.egpu_icon_visible() and
                          (ui_state.status != UIStatus.DISENGAGED or ui_state.always_on_dm))
     self._driver_state_renderer.set_should_draw(should_draw_dmoji)
-    self._driver_state_renderer.set_position(self._rect.x + 16, self._rect.y + 10)
+    dm_size = self._driver_state_renderer.BASE_SIZE
+    self._driver_state_renderer.set_position(
+      self._content_rect.x + self._content_rect.width - 10 - dm_size,
+      self._content_rect.y + self._content_rect.height - 14 - (50 + dm_size) / 2)  # 50 = wheel row height, same math as the eGPU icon
     self._driver_state_renderer.render()
 
     self._hud_renderer.set_can_draw_top_icons(alert_to_render is None)

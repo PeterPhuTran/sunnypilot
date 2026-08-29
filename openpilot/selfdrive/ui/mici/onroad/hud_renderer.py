@@ -19,6 +19,9 @@ KM_TO_MILE = 0.621371
 CRUISE_DISABLED_CHAR = '–'
 
 SET_SPEED_PERSISTENCE = 2.5  # seconds
+# VBSM_HUD: how long the eGPU status icon lingers after a state change before
+# yielding the bottom-right slot to the driver-monitoring face
+EGPU_PERSISTENCE = 6.0  # seconds
 
 
 @dataclass(frozen=True)
@@ -136,6 +139,9 @@ class HudRenderer(Widget):
     self._txt_egpu_orange: rl.Texture = gui_app.texture('icons_mici/egpu_orange.png', 60, 44)
     self._txt_egpu_crossed: rl.Texture = gui_app.texture('icons_mici/egpu_crossed.png', 60, 52)
     self._egpu_icon: rl.Texture | None = None
+    # VBSM_HUD: engaged bottom-left badge -- experimental flask vs stock couch
+    self._txt_mode_exp: rl.Texture = gui_app.texture('icons_mici/experimental_mode.png', 50, 50)
+    self._txt_mode_stock: rl.Texture = gui_app.texture('icons/couch.png', 50, 50)
 
     self._wheel_alpha_filter = FirstOrderFilter(0, 0.05, 1 / gui_app.target_fps)
     self._wheel_y_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
@@ -154,6 +160,11 @@ class HudRenderer(Widget):
   def drawing_top_icons(self) -> bool:
     # whether we're drawing any top icons currently
     return bool(self._set_speed_alpha_filter.x > 1e-2)
+
+  def egpu_icon_visible(self) -> bool:
+    # VBSM_HUD: the dmoji shares the bottom-right slot and waits for the
+    # eGPU status icon to fade out
+    return bool(self._egpu_alpha_filter.x > 1e-2)
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
@@ -237,7 +248,8 @@ class HudRenderer(Widget):
     if icon is not self._egpu_icon:
       self._egpu_fade_time = rl.get_time()
       self._egpu_icon = icon
-    alpha = self._egpu_alpha_filter.update(loading or 0 < rl.get_time() - self._egpu_fade_time < SET_SPEED_PERSISTENCE)
+    # VBSM_HUD: linger longer than the set-speed fade so the state is readable
+    alpha = self._egpu_alpha_filter.update(loading or 0 < rl.get_time() - self._egpu_fade_time < EGPU_PERSISTENCE)
     if alpha < 1e-2:
       return
 
@@ -265,6 +277,14 @@ class HudRenderer(Widget):
     pos_x = int(rect.x + 21 + wheel_txt.width / 2)
     pos_y = int(rect.y + rect.height - 14 - wheel_txt.height / 2 + self._wheel_y_filter.x)
     rotation = -ui_state.sm['carState'].steeringAngleDeg
+
+    # VBSM_HUD: while engaged (and not steer-critical) the bottom-left slot
+    # shows the driving mode instead of the wheel: flask = experimental,
+    # couch = stock. Same 50x50 box, so the turn-intent ring and the
+    # disengage/blind-spot fade behave unchanged.
+    if self._engaged and not self._show_wheel_critical:
+      wheel_txt = self._txt_mode_exp if ui_state.sm['selfdriveState'].experimentalMode else self._txt_mode_stock
+      rotation = 0.0
 
     turn_intent_margin = 25
     self._turn_intent.render(rl.Rectangle(

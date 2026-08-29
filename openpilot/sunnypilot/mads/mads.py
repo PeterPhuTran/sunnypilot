@@ -20,6 +20,11 @@ EventNameSP = custom.OnroadEventSP.EventName
 GearShifter = structs.CarState.GearShifter
 SafetyModel = structs.CarParams.SafetyModel
 
+# VBSM_EXP_TOGGLE: the LKAS button is repurposed to toggle experimental mode
+# (selfdrived.py, same marker); MADS must not also toggle lateral on the same
+# press. Set to False to restore the stock MADS button behavior.
+VBSM_LKAS_REPURPOSED = True
+
 SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 
@@ -171,7 +176,7 @@ class ModularAssistiveDrivingSystem:
       if be.type == ButtonType.cancel:
         if not self.selfdrive.enabled and self.selfdrive.enabled_prev:
           self.events_sp.add(EventNameSP.manualLongitudinalRequired)
-      if be.type == ButtonType.lkas and be.pressed and (CS.cruiseState.available or self.allow_always):
+      if be.type == ButtonType.lkas and be.pressed and (CS.cruiseState.available or self.allow_always) and not VBSM_LKAS_REPURPOSED:
         if self.enabled:
           if self.selfdrive.enabled:
             self.events_sp.add(EventNameSP.manualSteeringRequired)
