@@ -334,25 +334,19 @@ class HudRenderer(Widget):
     x = rect.x
     y = rect.y
 
-    # draw drop shadow
-    circle_radius = 162 // 2
-    rl.draw_circle_gradient(rl.Vector2(x + circle_radius, y + circle_radius), circle_radius,
-                            rl.Color(0, 0, 0, int(255 / 2 * alpha)), rl.BLANK)
-
     set_speed_color = rl.Color(255, 255, 255, int(255 * 0.9 * alpha))
 
     set_speed = self.set_speed
     if self.is_cruise_set and not ui_state.is_metric:
       set_speed *= KM_TO_MILE
 
-    # VBSM_HUD: MAX label dropped, number at 3/5 size with a black outline for
-    # legibility over bright road scenes; measured-centered in the circle now
-    # that the label no longer shares the space
+    # VBSM_HUD: bare number, no MAX label, no shadow circle -- tucked into the
+    # top-left corner at half size; the black outline carries legibility on
+    # its own over bright road scenes
     set_speed_text = CRUISE_DISABLED_CHAR if not self.is_cruise_set else str(round(set_speed))
-    size = FONT_SIZES.set_speed * 3 / 5
-    tw = rl.measure_text_ex(self._font_display, set_speed_text, size, 0)
-    tx = x + circle_radius - tw.x / 2
-    ty = y + circle_radius - tw.y / 2
+    size = FONT_SIZES.set_speed / 2
+    tx = x + 10
+    ty = y + 8
     outline = rl.Color(0, 0, 0, int(255 * 0.9 * alpha))
     for ox, oy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-2, -2), (2, -2), (-2, 2), (2, 2)):
       rl.draw_text_ex(self._font_display, set_speed_text, rl.Vector2(tx + ox, ty + oy), size, 0, outline)
