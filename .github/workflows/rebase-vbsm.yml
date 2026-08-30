@@ -125,6 +125,7 @@ jobs:
           check VBSM_QUIET       openpilot/sunnypilot/models/fetcher.py
           check VBSM_EXP_TOGGLE  openpilot/selfdrive/selfdrived/selfdrived.py
           check VBSM_EXP_TOGGLE  openpilot/sunnypilot/mads/mads.py
+          check VBSM_HUD         openpilot/selfdrive/ui/mici/layouts/home.py
           check uiwatchdog       openpilot/system/manager/process_config.py
           check VBSM_RESTART     openpilot/system/manager/process.py
           # a lost restart policy is silent until something dies mid-drive, so
