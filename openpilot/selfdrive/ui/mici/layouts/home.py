@@ -11,12 +11,58 @@ from openpilot.system.ui.widgets.label import UnifiedLabel, gui_label
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
 from openpilot.selfdrive.ui.ui_state import ui_state, ChestnutState
 from openpilot.common.version import RELEASE_BRANCHES
+import openpilot.cereal.messaging as messaging
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 
 HEAD_BUTTON_FONT_SIZE = 40
 HOME_PADDING = 8
 ALERTS_ZONE_WIDTH = 180
 
 NetworkType = log.DeviceState.NetworkType
+
+
+class VoltageLabel(Widget):
+  # VBSM_HUD: parked 12V battery readout ("12.2V") in the home footer, right
+  # of the chestnut icon. Reads pandad's peripheralState (published offroad;
+  # the same source the power monitor uses) on its own tiny SubMaster, polled
+  # at 2 Hz -- the UI's shared SubMaster does not carry this service. Renders
+  # only while the home screen is already awake, so it adds no screen-on time
+  # and no measurable power.
+  POLL_S = 0.5
+
+  def __init__(self):
+    super().__init__()
+    self._sm = messaging.SubMaster(["peripheralState"])
+    self._font = gui_app.font(FontWeight.MEDIUM)
+    self._font_size = 30
+    self._volts: float | None = None
+    self._last_poll = 0.0
+    # fixed-width rect sized for the widest plausible text keeps the footer
+    # layout from jittering as digits change
+    w = measure_text_cached(self._font, "88.8V", self._font_size).x
+    self.set_rect(rl.Rectangle(0, 0, float(int(w) + 4), 48.0))
+    self.set_enabled(False)
+
+  def _update_state(self):
+    now = time.monotonic()
+    if now - self._last_poll < self.POLL_S:
+      return
+    self._last_poll = now
+    self._sm.update(0)
+    if self._sm.recv_frame["peripheralState"] > 0:
+      v = self._sm["peripheralState"].voltage / 1000.0
+      self._volts = v if 5.0 < v < 20.0 else None
+    # NOTE: never set_visible(False) here -- HBoxLayout stops rendering (and
+    # therefore updating) invisible children, so the widget could never come
+    # back. With no data it stays visible and just draws nothing.
+
+  def _render(self, _):
+    if self._volts is None:
+      return
+    text = f"{self._volts:.1f}V"
+    size = measure_text_cached(self._font, text, self._font_size)
+    pos = rl.Vector2(self._rect.x, self._rect.y + (self._rect.height - size.y) / 2)
+    rl.draw_text_ex(self._font, text, pos, self._font_size, 0, rl.Color(255, 255, 255, 220))
 
 NETWORK_TYPES = {
   NetworkType.none: "Offline",
@@ -152,6 +198,7 @@ class MiciHomeLayout(Widget):
       self._experimental_icon,
       self._chestnut_icon,
       self._chestnut_failed_icon,
+      VoltageLabel(),  # VBSM_HUD: parked battery voltage, right of the chestnut icon
       self._body_icon,
       self._mic_icon,
     ], spacing=18)

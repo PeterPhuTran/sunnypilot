@@ -79,6 +79,10 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   moved from top-left (where the persistent set-speed kept it hidden whenever engaged) to the
   bottom-right eGPU slot; it appears once the eGPU status icon fades. The eGPU icon also lingers
   6 s after a state change (was 2.5 s) so its color is actually readable.
+- **Parked battery voltage** (`layouts/home.py`): "12.2V" readout in the home-screen footer,
+  right of the chestnut icon — pandad's peripheralState on a widget-local 2 Hz SubMaster (the
+  same source the power monitor uses). Renders only while the screen is already awake; adds no
+  screen-on time and no measurable power draw.
 
 ### 6. Boot & log hygiene — `VBSM_QUIET`
 - **Chunk-manifest storm fix** (`models/fetcher.py`): two catalog entries share a fileName with
@@ -89,7 +93,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   iterations before `DoShutdown` fires — kills the race where a shutdown latched in the same
   sampling window as an ignition rise and turned a departure into a double boot.
 
-## Managed files (18) and markers
+## Managed files (19) and markers
 
 | File | Mods | Markers |
 |---|---|---|
@@ -106,6 +110,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1 settings | `BigConfigControl` |
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap | `BSM_STATE_PATH`, `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD` |
+| `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
 | `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap + fallback | `VBSM_GPU_FALLBACK`, `VBSM_GPU_PPT` |
 | `openpilot/system/hardware/hardwared.py` | §4 idle power, §6 shutdown debounce | `VBSM_GPU_IDLE` |

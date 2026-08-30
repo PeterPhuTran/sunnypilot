@@ -18,6 +18,7 @@
     "openpilot/system/hardware/hardwared.py",
     "openpilot/sunnypilot/chestnut_power.py",
     "openpilot/sunnypilot/models/fetcher.py",
-    "openpilot/sunnypilot/mads/mads.py"
+    "openpilot/sunnypilot/mads/mads.py",
+    "openpilot/selfdrive/ui/mici/layouts/home.py"
   ]
 }
