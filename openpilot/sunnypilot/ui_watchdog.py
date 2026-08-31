@@ -49,6 +49,7 @@ from openpilot.cereal import messaging
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.modeld.helpers import chestnut_present
+from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS
 
 UI_PROCTITLE = "openpilot.selfdrive.ui.ui"
 EVIDENCE_DIR = "/data/vbsm_eval"
@@ -226,9 +227,12 @@ class GpuKick:
     if self.params.get_bool("ChestnutActive"):
       return
 
-    # upstream moved to per-hardware bundle SLOTS: only kick when the USBGPU
-    # slot actually holds a bundle for the restarted modeld to load
-    if self.params.get("ModelManager_ActiveBundleUSBGPU") is None:
+    # upstream moved to per-hardware bundle SLOTS: only kick when the big-model
+    # slot actually holds a bundle for the restarted modeld to load. Read the
+    # key through ACTIVE_BUNDLE_KEYS -- this gate was still naming the
+    # pre-rename ModelManager_ActiveBundleUSBGPU param, which upstream keeps
+    # only for migration, so the next rename should not silently strand it.
+    if self.params.get(ACTIVE_BUNDLE_KEYS["chestnut"]) is None:
       return
 
     # only at a standstill with openpilot disengaged — never take the model

@@ -54,7 +54,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   the lock holder via `fuser` at the moment of failure.
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
-  `UsbGpuActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything
+  `ChestnutActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything
   else); vetoes the boot when a GPU-active modeld dies.
 - **HUD status**: upstream's chestnut icon (pulsing = loading, green = big model live, orange =
   fallback) is now driven by a proper state machine whose compiled-gate checks the bundle chunk

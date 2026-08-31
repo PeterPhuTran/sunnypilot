@@ -272,7 +272,9 @@ class MiciHomeLayout(Widget):
 
     text = slot("qcom", DEFAULT_MODEL)
     if ui_state.chestnut_present:
-      text += " · " + slot("chestnut", DEFAULT_BIG_MODEL)
+      # ASCII only: the font atlas is built from chr(32..126) plus translation
+      # glyphs, so a middle dot renders as "?" on this screen
+      text += " / " + slot("chestnut", DEFAULT_BIG_MODEL)
     return text
 
   def _get_version_text(self) -> tuple[str, str, str, str] | None:
