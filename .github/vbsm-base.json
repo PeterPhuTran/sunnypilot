@@ -19,6 +19,8 @@
     "openpilot/sunnypilot/chestnut_power.py",
     "openpilot/sunnypilot/models/fetcher.py",
     "openpilot/sunnypilot/mads/mads.py",
-    "openpilot/selfdrive/ui/mici/layouts/home.py"
+    "openpilot/selfdrive/ui/mici/layouts/home.py",
+    "openpilot/selfdrive/pandad/pandad.py",
+    "openpilot/sunnypilot/parkwatchd.py"
   ]
 }

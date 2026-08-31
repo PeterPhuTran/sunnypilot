@@ -26,6 +26,11 @@ MICI = HARDWARE.get_device_type() == "mici"
 def vision_bsm(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and os.path.isfile("/data/vision_bsm.json")
 
+# VBSM_PARKWATCH: runs on and offroad -- it has to observe the ignition-off edge
+# itself, and it is the offroad half that does the actual work.
+def parkwatch(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return os.path.isfile("/data/parkwatch.json")
+
 def notcar(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and CP.notCar
 
@@ -184,6 +189,7 @@ procs += [
   # Camera blind spot monitor
   PythonProcess("visionbsmd", "openpilot.sunnypilot.vision_bsm", vision_bsm, enabled=MICI),
   PythonProcess("uiwatchdog", "openpilot.sunnypilot.ui_watchdog", always_run, enabled=MICI),
+  PythonProcess("parkwatchd", "openpilot.sunnypilot.parkwatchd", parkwatch),
 
   # mapd
   NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),
