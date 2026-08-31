@@ -91,6 +91,12 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   moved from top-left (where the persistent set-speed kept it hidden whenever engaged) to the
   bottom-right eGPU slot; it appears once the eGPU status icon fades. The eGPU icon also lingers
   6 s after a state change (was 2.5 s) so its color is actually readable.
+- **Active model names** (`layouts/home.py`): the home screen names both driving-model slots on the
+  version line beside the commit hash — the SoC model, plus the big GPU model when the chestnut is
+  attached (e.g. `wmiv12 · bmv4`). Short catalog names (`internalName`) only: `displayName` runs to
+  56 characters and will not fit the 536 px line. Read from the two `ModelManager_ActiveBundle*`
+  params at 1 Hz, never from `modelManagerSP` (which republishes a tick late and would flash the
+  wrong model on a chestnut transition).
 - **Parked battery voltage** (`layouts/home.py`): "12.2V" readout in the home-screen footer,
   right of the chestnut icon — pandad's peripheralState on a widget-local 2 Hz SubMaster (the
   same source the power monitor uses). Renders only while the screen is already awake; adds no

@@ -11,6 +11,8 @@ from openpilot.system.ui.widgets.label import UnifiedLabel, gui_label
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
 from openpilot.selfdrive.ui.ui_state import ui_state, ChestnutState
 from openpilot.common.version import RELEASE_BRANCHES
+from openpilot.sunnypilot.models.helpers import get_selected_bundle
+from openpilot.sunnypilot.models.model_name import DEFAULT_MODEL, DEFAULT_BIG_MODEL
 import openpilot.cereal.messaging as messaging
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 
@@ -209,6 +211,10 @@ class MiciHomeLayout(Widget):
     self._date_label = UnifiedLabel("", font_size=36, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
     self._branch_label = UnifiedLabel("", font_size=36, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, scroll=True)
     self._version_commit_label = UnifiedLabel("", font_size=36, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
+    # VBSM_HUD: the two driving-model slots, drawn beside the commit hash
+    self._model_label = UnifiedLabel("", font_size=30, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
+    self._model_text: str = ""
+    self._model_poll: float = 0.0
 
   def _update_state(self):
     if self.is_pressed and not self._is_pressed_prev:
@@ -217,6 +223,13 @@ class MiciHomeLayout(Widget):
       self._mouse_down_t = None
       self._did_long_press = False
     self._is_pressed_prev = self.is_pressed
+
+    # VBSM_HUD: the model names only change when the user picks a model, and
+    # each read touches the filesystem, so poll at 1 Hz rather than per frame
+    now = time.monotonic()
+    if now - self._model_poll > 1.0:
+      self._model_poll = now
+      self._model_text = self._read_model_names()
 
     if self._mouse_down_t is not None:
       if time.monotonic() - self._mouse_down_t > 0.5:
@@ -245,6 +258,22 @@ class MiciHomeLayout(Widget):
       elif self._on_settings_click:
         self._on_settings_click()
     self._did_long_press = False
+
+  def _read_model_names(self) -> str:
+    # VBSM_HUD: name both driving-model slots -- the SoC model, plus the big
+    # GPU model when the chestnut is attached. internalName is the short
+    # catalog name (<= 8 chars); displayName runs to 56 and will not fit here.
+    def slot(source: str, fallback: str) -> str:
+      try:
+        bundle = get_selected_bundle(ui_state.params, source)
+      except Exception:
+        bundle = None
+      return (bundle.internalName if bundle else fallback).lower()
+
+    text = slot("qcom", DEFAULT_MODEL)
+    if ui_state.chestnut_present:
+      text += " · " + slot("chestnut", DEFAULT_BIG_MODEL)
+    return text
 
   def _get_version_text(self) -> tuple[str, str, str, str] | None:
     version = ui_state.params.get("Version")
@@ -292,6 +321,16 @@ class MiciHomeLayout(Widget):
         self._version_commit_label.set_text(self._version_text[2])
         self._version_commit_label.set_position(version_pos.x, version_pos.y + self._date_label.font_size + 7)
         self._version_commit_label.render()
+
+      # VBSM_HUD: active driving models share the 2nd line -- right of the
+      # commit hash, or taking the line itself on a release branch (which has
+      # no commit). text_width is only valid after the label has rendered.
+      if self._model_text:
+        model_x = version_pos.x + (0 if release_branch else self._version_commit_label.text_width + 12)
+        self._model_label.set_max_width(self.rect.x + self.rect.width - model_x - HOME_PADDING)
+        self._model_label.set_text(self._model_text)
+        self._model_label.set_position(model_x, version_pos.y + self._date_label.font_size + 10)
+        self._model_label.render()
 
     # ***** Center-aligned bottom section icons *****
     self._experimental_icon.set_visible(ui_state.experimental_mode)
