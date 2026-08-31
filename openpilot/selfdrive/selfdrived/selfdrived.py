@@ -66,6 +66,7 @@ class SelfdriveD(CruiseHelper):
     self.params = Params()
 
     self._vbsm_counter = 0
+    self._vbsm_chime = True
     self._vbsm_chime_always = False
     self._vbsm_detected_prev = False
     self._vbsm_hold = 0
@@ -376,8 +377,13 @@ class SelfdriveD(CruiseHelper):
       try:
         with open(VBSM_CONFIG) as f:
           config = json.load(f)
+        # VBSM_HUD: "chime" is the master switch for the blind spot chime;
+        # "chime_always" is its sub-option (fire on entry, not just on signal).
+        # Absent means on, matching the settings toggle's default.
+        self._vbsm_chime = bool(config.get("chime", True))
         self._vbsm_chime_always = bool(config.get("enabled")) and bool(config.get("chime_always"))
       except (OSError, ValueError):
+        self._vbsm_chime = True
         self._vbsm_chime_always = False
 
     detected = CS.leftBlindspot or CS.rightBlindspot
@@ -390,7 +396,7 @@ class SelfdriveD(CruiseHelper):
     self._vbsm_detected_prev = detected
     self._vbsm_hold = max(0, self._vbsm_hold - 1)
 
-    if signalled or self._vbsm_hold > 0:
+    if self._vbsm_chime and (signalled or self._vbsm_hold > 0):
       if self.sm['modelV2'].meta.laneChangeState != LaneChangeState.preLaneChange:
         self.events.add(EventName.laneChangeBlocked)
 

@@ -23,18 +23,21 @@ class BigConfigControl(BigToggle):
   own, but it still belongs in the same settings list as everything else.
   """
 
-  def __init__(self, text: str, key: str, path: str = VBSM_CONFIG, toggle_callback=None):
+  def __init__(self, text: str, key: str, path: str = VBSM_CONFIG, default: bool = False, toggle_callback=None):
     super().__init__(text, "", toggle_callback=toggle_callback)
     self.key = key
     self.path = path
+    self.default = default
     self.set_checked(self._read())
 
   def _read(self) -> bool:
+    # an absent key falls back to the consumer's own default, so a toggle never
+    # reads OFF for a feature that is actually running
     try:
       with open(self.path) as f:
-        return bool(json.load(f).get(self.key))
+        return bool(json.load(f).get(self.key, self.default))
     except (OSError, ValueError):
-      return False
+      return self.default
 
   def _write(self, value: bool) -> None:
     try:
@@ -98,7 +101,12 @@ class TogglesLayoutMici(NavScroller):
     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
     enable_openpilot = BigParamControl("enable sunnypilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
     self._vision_bsm = BigConfigControl("camera blind spot monitor", "enabled")
-    self._vision_bsm_chime = BigConfigControl("chime on every blind spot car", "chime_always")
+    # the three blind spot outputs, independently switchable: what you see on
+    # screen, what you hear, and whether the window view takes over
+    self._vision_bsm_icons = BigParamControl("blind spot icons on screen", "BlindSpot")
+    self._vision_bsm_chime = BigConfigControl("blind spot chime on signal", "chime", default=True)
+    self._vision_bsm_chime_always = BigConfigControl("chime on every blind spot car", "chime_always")
+    self._vision_bsm_view = BigConfigControl("blind spot window view on signal", "camera_view")
 
     self._scroller.add_widgets([
       self._personality_toggle,
@@ -107,7 +115,10 @@ class TogglesLayoutMici(NavScroller):
       ldw_toggle,
       always_on_dm_toggle,
       self._vision_bsm,
+      self._vision_bsm_icons,
       self._vision_bsm_chime,
+      self._vision_bsm_chime_always,
+      self._vision_bsm_view,
       record_front,
       record_mic,
       enable_openpilot,
@@ -119,6 +130,7 @@ class TogglesLayoutMici(NavScroller):
       ("IsMetric", is_metric_toggle),
       ("IsLdwEnabled", ldw_toggle),
       ("AlwaysOnDM", always_on_dm_toggle),
+      ("BlindSpot", self._vision_bsm_icons),
       ("RecordFront", record_front),
       ("RecordAudio", record_mic),
       ("OpenpilotEnabledToggle", enable_openpilot),
@@ -169,6 +181,8 @@ class TogglesLayoutMici(NavScroller):
     # config backed, so not in the params list above
     self._vision_bsm.refresh()
     self._vision_bsm_chime.refresh()
+    self._vision_bsm_chime_always.refresh()
+    self._vision_bsm_view.refresh()
 
   def _on_experimental_mode(self, state: bool):
     if state and not ui_state.params.get_bool("ExperimentalModeConfirmed"):

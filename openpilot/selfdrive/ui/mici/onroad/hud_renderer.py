@@ -137,9 +137,10 @@ class HudRenderer(Widget):
     self._txt_chestnut_green: rl.Texture = gui_app.texture('icons_mici/chestnut_green.png', 60, 44)
     self._txt_chestnut_orange: rl.Texture = gui_app.texture('icons_mici/chestnut_orange.png', 75, 44)
     self._chestnut_icon: rl.Texture | None = None
-    # VBSM_HUD: engaged bottom-left badge -- experimental flask vs stock couch
+    # VBSM_HUD: bottom-left mode badge. Stock keeps the steering wheel loaded
+    # above; only experimental needs its own icon. (icons/couch.png, the old
+    # stock badge, is black at 40% alpha -- it drew, but was invisible.)
     self._txt_mode_exp: rl.Texture = gui_app.texture('icons_mici/experimental_mode.png', 50, 50)
-    self._txt_mode_stock: rl.Texture = gui_app.texture('icons/couch.png', 50, 50)
     self._wheel_alpha_filter = FirstOrderFilter(0, 0.05, 1 / gui_app.target_fps)
     self._wheel_y_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
 
@@ -254,11 +255,14 @@ class HudRenderer(Widget):
       self._wheel_alpha_filter.update(255)
       self._wheel_y_filter.update(0)
     else:
-      if ui_state.status == UIStatus.DISENGAGED or bsm_detected:
+      # VBSM_HUD: the mode badge stays readable at all times, so disengaged
+      # dims it rather than sliding it away. A blind spot still takes the slot.
+      if bsm_detected:
         self._wheel_alpha_filter.update(0)
         self._wheel_y_filter.update(wheel_txt.height / 2)
       else:
-        self._wheel_alpha_filter.update(255 * 0.9)
+        engaged = ui_state.status != UIStatus.DISENGAGED
+        self._wheel_alpha_filter.update(255 * (0.9 if engaged else 0.45))
         self._wheel_y_filter.update(0)
 
     # pos
@@ -266,12 +270,12 @@ class HudRenderer(Widget):
     pos_y = int(rect.y + rect.height - 14 - wheel_txt.height / 2 + self._wheel_y_filter.x)
     rotation = -ui_state.sm['carState'].steeringAngleDeg
 
-    # VBSM_HUD: while engaged (and not steer-critical) the bottom-left slot
-    # shows the driving mode instead of the wheel: flask = experimental,
-    # couch = stock. Same 50x50 box, so the turn-intent ring and the
-    # disengage/blind-spot fade behave unchanged.
-    if self._engaged and not self._show_wheel_critical:
-      wheel_txt = self._txt_mode_exp if ui_state.sm['selfdriveState'].experimentalMode else self._txt_mode_stock
+    # VBSM_HUD: the bottom-left slot shows the driving mode whether or not
+    # openpilot is engaged -- flask = experimental, the steering wheel itself
+    # = stock. Same 50x50 box, so the turn-intent ring is unchanged; the wheel
+    # keeps tracking steering angle, the flask sits still.
+    if not self._show_wheel_critical and ui_state.sm['selfdriveState'].experimentalMode:
+      wheel_txt = self._txt_mode_exp
       rotation = 0.0
 
     turn_intent_margin = 25

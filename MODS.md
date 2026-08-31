@@ -19,6 +19,14 @@ Files: `vision_bsm.py` (daemon), `card.py` (carState injection), `selfdrived.py`
 `VBSM`), `process_config.py` (process entries), `toggles.py` (settings), `augmented_road_view.py`
 (cabin preview + chevrons).
 
+Its three outputs are independently switchable from the on-device toggles page, because they suit
+different drivers at different times: **icons on screen** (the upstream `BlindSpot` param — which
+also stops the steering wheel yielding its slot), **chime on signal** (`chime` in the JSON, with
+`chime_always` as its sub-option: chime on entry rather than only on a signal), and the **window
+view on signal** (`camera_view`). Fork settings live in that JSON rather than in params because the
+branch ships a prebuilt `libparams_c.so`: a new key added to `params_keys.h` is never compiled, so
+it would raise `UnknownKeyName` on-device.
+
 ### 2. Privacy guards — `VBSM_PRIVACY`
 In-cabin footage never leaves the device: `athenad.py` refuses on-demand uploads and clip creation
 for driver-camera files, covering both the comma and sunnylink remote-procedure sockets (they share
@@ -66,9 +74,13 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   personality live from selfdrived's own state. Tap to cycle; selfdrived adopts external personality
   changes on its periodic check (upstream reads the param only at boot and from the wheel button)
   and fires the stock personality-changed alert as feedback.
-- **Driving-mode badge** (`hud_renderer.py`): while engaged, the bottom-left wheel icon becomes a
-  mode badge — flask = experimental, couch = stock. The steer-required critical wheel and its
-  exclamation mark are untouched, as are the disengage fade and turn-intent arrows.
+- **Driving-mode badge** (`hud_renderer.py`): the bottom-left slot always shows the driving mode —
+  flask = experimental, the steering wheel itself = stock — whether or not openpilot is engaged.
+  Engagement is carried by opacity (dimmed when disengaged) rather than hiding the icon, and the
+  wheel keeps tracking the steering angle while the flask sits still. The steer-required critical
+  wheel and its exclamation mark are untouched, as are the turn-intent arrows and the blind-spot
+  yield. (The original stock badge used `icons/couch.png`, which is black at 40 % alpha — it drew
+  every frame and was invisible over the camera feed.)
 - **LKAS button = experimental toggle** (`VBSM_EXP_TOGGLE`, `selfdrived.py` + `mads.py`): one press
   of the wheel's LKAS/LDA button flips `ExperimentalMode` (live within ~100 ms via the stack's
   param threads) and fires the stock "Experimental Mode Switched" alert. MADS's stock use of the
@@ -124,7 +136,8 @@ left the managed set with it).
 
 | Control | Effect |
 |---|---|
-| `/data/vision_bsm.json` | blind spot monitor enable + config (its presence gates the daemon) |
+| `/data/vision_bsm.json` | blind spot monitor config — `enabled` (gates the daemon), `camera_view`, `chime`, `chime_always`, calibrated `zones`; all settable from the toggles page |
+| `BlindSpot` (param) | on-screen blind spot icons — the one BSM setting that is a param, because upstream owns it |
 | `/data/vbsm_gpu_ppt_w` | GPU power cap in watts (default 80, clamp 40–220, 0 disables) |
 | `/data/vbsm_no_gpu_idle_off` | opt out of the parked GPU power-off |
 | `/dev/shm/vbsm_usbgpu_veto` | per-boot GPU veto (set automatically on failures; clears at reboot) |
