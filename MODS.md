@@ -51,7 +51,11 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   load exits for a manager respawn (in-process fallbacks die with the GIL when USB wedges); first
   failure gets a free retry, the second vetoes the boot (`/dev/shm/vbsm_usbgpu_veto`, cleared each
   reboot) and the respawn loads the Qualcomm bundle slot in ~2 s. Lock-contention failures capture
-  the lock holder via `fuser` at the moment of failure.
+  the lock holder via `fuser` at the moment of failure. A hang *during* a run vetoes immediately
+  with no free retry — a device that already loaded and ran for minutes is not failing on a
+  cold-start transient — and modeld writes that veto itself before replacing its process, so a
+  respawn can never re-attempt a browned-out GPU (previously the veto arrived from the watchdog
+  0.9 s *after* the manager had already respawned).
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
   `ChestnutActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything

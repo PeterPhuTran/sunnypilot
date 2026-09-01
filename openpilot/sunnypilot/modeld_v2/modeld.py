@@ -582,7 +582,38 @@ def main(demo=False):
       inputs['action_t'] = np.array([lat_action_t, long_action_t], dtype=np.float32)
 
     mt1 = time.perf_counter()
-    model_output = model.run(bufs, transforms, inputs, prepare_only)
+    try:
+      model_output = model.run(bufs, transforms, inputs, prepare_only)
+    except Exception as e:
+      # VBSM_GPU_FALLBACK: an in-run device hang -- the eGPU browning out on the
+      # accessory-outlet rail mid-drive -- leaves the AMD device wedged, and
+      # unwinding it is slow: on 2026-09-01 the interpreter took 11.6s from the
+      # hang to the manager seeing the exit, a third of a 30.7s no-model window.
+      # Worse, nothing had vetoed the GPU yet, so the veto landed 0.9s AFTER the
+      # manager respawned modeld, and only ui_watchdog's corpse check saved it.
+      # Veto first, then replace the process. Unlike the load ladder there is no
+      # free retry: a device that already loaded and ran for minutes is not
+      # failing on a cold-start transient.
+      # NOTE run() spans BOTH devices -- the warp stage runs on QCOM, only the
+      # policy and readbacks are AMD -- so record what actually raised. A
+      # non-eGPU fault vetoed here would otherwise be mislabelled, and would
+      # recur on the SoC path anyway.
+      if gpu_active:
+        vetoed = True
+        try:
+          with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
+            f.write(f"hang {type(e).__name__}: {e}"[:200])
+        except OSError as ve:
+          vetoed = False
+          cloudlog.error(f"eGPU veto write failed, respawn may retry the GPU: {ve}")
+        # deterministic input to selfdrived's bigModelFailed instead of racing
+        # the modelV2 alive timeout; mirrors selfdrive/modeld/modeld.py
+        params.put_bool("ChestnutActive", False)
+        cloudlog.exception(f"eGPU hung mid-run; exiting for SoC respawn (vetoed={vetoed})")
+        sentry.capture_exception()
+        time.sleep(0.2)
+        os._exit(1)
+      raise
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
