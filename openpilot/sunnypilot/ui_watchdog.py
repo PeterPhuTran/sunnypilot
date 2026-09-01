@@ -63,12 +63,14 @@ MIN_KILL_GAP_S = 60.0    # manager restart + UI startup needs room to finish
 
 GPU_VETO_FILE = "/dev/shm/vbsm_usbgpu_veto"  # tmpfs: a reboot grants a fresh chance
 GPU_HANG_COUNT_FILE = "/dev/shm/vbsm_gpu_hangs"  # per-boot mid-run hang strikes
-MAX_GPU_HANGS_PER_BOOT = 2  # first strike is cleared at drive end; second sticks
+MAX_GPU_HANGS_PER_BOOT = 6  # backstop only: a rail this bad stops earning retries
+GPU_RETRY_RAIL_MV = 13000     # rail back in the charging band...
+GPU_RETRY_RAIL_HOLD_S = 60.0  # ...and holding it, before spending a retry
 GPU_LOAD_DEADLINE_S = 90.0  # every legitimate load path resolves by 60s
 GPU_STABLE_S = 10.0      # enclosure must stay enumerated this long
 MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write ChestnutLoading
 GPU_KICK_COOLDOWN_S = 120.0
-MAX_GPU_KICKS = 2        # per boot; a modeld that then dies on AMD is the
+MAX_GPU_KICKS = 2        # per drive; a modeld that then dies on AMD is the
                          # manager restart policy's problem, not a kick loop
 GPU_VEGO_MAX = 0.5       # m/s — only ever kick at a standstill
 
@@ -147,8 +149,11 @@ class GpuKick:
     self.gpu_was_active = False
     self.kicks = 0
     self.last_kick = 0.0
+    self.rail_ok_since = None   # monotonic since the rail entered the charging band
+    self.retry_used = False     # one mid-drive eGPU retry per drive
+    self.veto_seen = False      # edge-detect a fresh veto to restart the hold window
 
-  def _veto(self):
+  def _veto(self, kind="hang"):
     """Sustained inference hangs the accessory-outlet enclosure (tinygrad
     "Device hang detected"); without a veto every restart after a hang burned
     another 60s no-model window re-attempting the GPU mid-drive. One inference
@@ -169,11 +174,29 @@ class GpuKick:
       pass
     try:
       with open(GPU_VETO_FILE, "w") as f:
-        f.write(str(int(time.time())))
+        f.write(f"{kind} {int(time.time())}")
       cloudlog.error(f"ui_watchdog: eGPU-active modeld died; vetoing the GPU "
-                     f"(strike {hangs}/{MAX_GPU_HANGS_PER_BOOT} this boot)")
+                     f"(strike {hangs}/{MAX_GPU_HANGS_PER_BOOT} this boot, {kind})")
     except OSError as e:
       cloudlog.error(f"ui_watchdog: veto write failed: {e}")
+
+  def _veto_from_hang(self):
+    """Only a mid-RUN death earns a drive-end clear or a retry. Match "hang"
+    positively: a device that never came up (the load ladder, or a loader
+    wedged past the deadline) has not shown it can run on this rail, and a
+    truncated or unreadable marker must not read as permission."""
+    try:
+      with open(GPU_VETO_FILE) as f:
+        return f.read(4) == "hang"
+    except OSError:
+      return False
+
+  def _hang_strikes(self):
+    try:
+      with open(GPU_HANG_COUNT_FILE) as f:
+        return int(f.read().strip())
+    except (OSError, ValueError):
+      return 0
 
   def tick(self, sm, started, now):
     if not started:
@@ -187,25 +210,43 @@ class GpuKick:
       # Load-ladder vetoes (payload "load") stay boot-scoped: that device
       # never even ran, and the ladder already spent its own free retry.
       if os.path.exists(GPU_VETO_FILE):
-        hangs = 0
-        try:
-          with open(GPU_HANG_COUNT_FILE) as f:
-            hangs = int(f.read().strip())
-        except (OSError, ValueError):
-          pass
-        try:
-          with open(GPU_VETO_FILE) as f:
-            from_load = f.read(4) == "load"
-          if not from_load and hangs < MAX_GPU_HANGS_PER_BOOT:
+        hangs = self._hang_strikes()
+        if self._veto_from_hang() and hangs < MAX_GPU_HANGS_PER_BOOT:
+          try:
             os.remove(GPU_VETO_FILE)
             cloudlog.warning(f"ui_watchdog: drive over; eGPU veto cleared for next "
                              f"ignition (hang {hangs}/{MAX_GPU_HANGS_PER_BOOT} this boot)")
-        except OSError:
-          pass
+          except OSError:
+            pass
+      # per-DRIVE budgets: the device stays up for days, so boot-scoped counters
+      # would let one bad day strand the big model until a manual reboot -- the
+      # same trap the veto itself had. The strike file stays boot-scoped as a
+      # backstop against a genuinely dying rail earning retries forever.
+      self.kicks = 0
+      self.retry_used = False
+      self.rail_ok_since = None
+      self.veto_seen = False
       self.gpu_since = None
       self.modeld_seen = None
       self.gpu_was_active = False
       return
+
+    # VBSM_GPU_RETRY: track how long the car rail has held the charging band.
+    # Updated before every early return below so the hold timer is continuous.
+    # A newly appeared veto restarts the window: the rail must prove itself for
+    # the full hold AFTER the hang rather than inherit credit from before it,
+    # or a hang during an otherwise healthy stretch would earn an instant retry.
+    veto = os.path.exists(GPU_VETO_FILE)
+    if veto and not self.veto_seen:
+      self.rail_ok_since = None
+    self.veto_seen = veto
+    volt = sm['peripheralState'].voltage if sm.alive['peripheralState'] else 0
+    if not 5000 < volt < 20000:   # implausible or absent reads as "not charging"
+      volt = 0
+    if volt < GPU_RETRY_RAIL_MV:
+      self.rail_ok_since = None
+    elif self.rail_ok_since is None:
+      self.rail_ok_since = now
 
     if not chestnut_present():
       self.gpu_since = None
@@ -241,7 +282,7 @@ class GpuKick:
     # path -- success or the in-process exit -- resolves by 60s.
     if (self.params.get_bool("ChestnutLoading") and now - self.modeld_seen[1] > GPU_LOAD_DEADLINE_S
         and not os.path.exists(GPU_VETO_FILE)):
-      self._veto()
+      self._veto("load")
       cloudlog.error(f"ui_watchdog: modeld pid {pid} wedged in eGPU load "
                      f"({now - self.modeld_seen[1]:.0f}s), killing for vetoed respawn")
       try:
@@ -255,8 +296,23 @@ class GpuKick:
       return
     if self.kicks >= MAX_GPU_KICKS or now - self.last_kick < GPU_KICK_COOLDOWN_S:
       return
-    if os.path.exists(GPU_VETO_FILE):
-      return
+    # VBSM_GPU_RETRY: a mid-run hang vetoes the eGPU for the drive, but the
+    # brownout behind it is transient -- the rail returns to the charging band
+    # later in most drives (2026-09-01 b1: 13.4V for 18 min, 12.1V for 50, then
+    # 13.35V again). Spend ONE retry per drive once the rail has held the band,
+    # and only through the standstill/disengaged gate below.
+    # Deliberately asymmetric: this same voltage signal was REFUTED as a
+    # proactive veto -- route af ran 37 min with 869 samples under 12.5V -- but
+    # as a retry gate a false negative only costs a missed opportunity, while a
+    # false positive there cost the big model outright.
+    retry_pending = False
+    if os.path.exists(GPU_VETO_FILE):   # fresh read: `veto` above only edge-detects
+      if (self.retry_used or not self._veto_from_hang()
+          or self._hang_strikes() >= MAX_GPU_HANGS_PER_BOOT
+          or self.rail_ok_since is None
+          or now - self.rail_ok_since < GPU_RETRY_RAIL_HOLD_S):
+        return
+      retry_pending = True
 
     # the running modeld must itself say it booted without the GPU; a missing
     # param proves nothing and must never trigger a kill. Loading alone is NOT
@@ -279,10 +335,30 @@ class GpuKick:
 
     # only at a standstill with openpilot disengaged — never take the model
     # away from a moving car
-    if not (sm.seen['carState'] and sm.seen['selfdriveState']):
+    # alive/valid, not seen: `seen` latches True forever and the last message is
+    # retained, so a DEAD carState publisher would freeze vEgo at its last value
+    # -- frozen near zero, that reads as a permanent standstill and this would
+    # SIGKILL modeld at any speed.
+    if not (sm.alive['carState'] and sm.valid['carState']
+            and sm.alive['selfdriveState'] and sm.valid['selfdriveState']):
       return
     if sm['carState'].vEgo > GPU_VEGO_MAX or sm['selfdriveState'].enabled:
       return
+
+    # clear the veto only here, with the car stopped and disengaged and the kick
+    # about to fire, so an eligible-but-ungated retry can never leave the GPU
+    # unvetoed for some unrelated modeld restart to pick up while moving. After
+    # the kick it stays cleared for the drive by design: the reload either
+    # reaches ChestnutActive, or fails and re-vetoes itself.
+    if retry_pending:
+      try:
+        os.remove(GPU_VETO_FILE)
+      except OSError as e:
+        cloudlog.error(f"ui_watchdog: retry veto clear failed: {e}")
+        return
+      self.retry_used = True
+      cloudlog.warning(f"ui_watchdog: rail held {volt}mV for "
+                       f"{now - self.rail_ok_since:.0f}s; spending this drive's one eGPU retry")
 
     self.kicks += 1
     self.last_kick = now
@@ -297,7 +373,8 @@ class GpuKick:
 
 def main():
   params = Params()
-  sm = messaging.SubMaster(['uiDebug', 'deviceState', 'carState', 'selfdriveState'])
+  sm = messaging.SubMaster(['uiDebug', 'deviceState', 'carState', 'selfdriveState',
+                            'peripheralState'])
   gpu = GpuKick(params)
   now = time.monotonic()
   last_frame = now

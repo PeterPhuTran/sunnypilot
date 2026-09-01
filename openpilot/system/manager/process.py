@@ -54,7 +54,7 @@ def nativelauncher(pargs: list[str], cwd: str, name: str) -> None:
 
 # VBSM_RESTART: a crash-looping process must end up parked with its crash
 # files, not restarting forever
-MAX_RESTARTS_PER_SESSION = 3
+MAX_RESTARTS_PER_SESSION = 5  # per DRIVE, reset in ensure_running()
 MIN_RESTART_GAP_S = 10.0
 
 
@@ -262,10 +262,26 @@ class DaemonProcess(ManagerProcess):
     pass
 
 
+_started_prev = False
+
+
 def ensure_running(procs: ValuesView[ManagerProcess], started: bool, params: Params, CP: car.CarParams,
                    not_run: list[str] | None=None) -> list[ManagerProcess]:
   if not_run is None:
     not_run = []
+
+  # VBSM_RESTART: the budget is per DRIVE, not per boot. Nothing reset it and
+  # the device stays up for days across ignition cycles, so it drained silently
+  # -- and once spent, the very next crash stranded the process for every
+  # remaining drive, which is exactly the processNotRunning failure
+  # hold_dead_proc() exists to prevent. A crash LOOP is still bounded inside a
+  # drive by the cap and MIN_RESTART_GAP_S; what is no longer bounded is the
+  # unrelated-crashes-spread-over-a-week case, which was never a loop.
+  global _started_prev
+  if started and not _started_prev:
+    for p in procs:
+      p.restarts = 0
+  _started_prev = started
 
   running = []
   for p in procs:

@@ -36,8 +36,12 @@ two on-demand paths. Honest failures, not faked successes.
 ### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`
 - `process.py`: upstream's manager never restarts a process that dies mid-session — one crash means
   the process (and, for the driving model, openpilot engagement) is gone until reboot. The manager
-  now reaps a dead child and rebuilds it: 3 restarts per session, 10 s apart, then it parks with its
-  crash files. Field-proven on the driving model, microphone, and sound daemons.
+  now reaps a dead child and rebuilds it: 5 restarts per DRIVE, 10 s apart, then it parks with its
+  crash files. Field-proven on the driving model, microphone, and sound daemons. The budget resets
+  on the offroad→onroad edge in `ensure_running()`: it read "per session" but nothing ever reset it,
+  and this device stays up for days across ignition cycles — so it drained silently and then a
+  single crash stranded the process for every later drive, the exact failure this exists to prevent.
+  A crash *loop* is still bounded within a drive by the cap and `MIN_RESTART_GAP_S`.
 - `ui_watchdog.py`: detects a UI that is alive but no longer rendering (frame-beacon based, exact
   proctitle match) and kills it for the manager to rebuild. Grew three GPU duties over time — see §4.
 
@@ -57,9 +61,19 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   respawn can never re-attempt a browned-out GPU (previously the veto arrived from the watchdog
   0.9 s *after* the manager had already respawned). Mid-run vetoes are scoped to the DRIVE, not
   the boot: the device stays up across car restarts, so ui_watchdog clears a first-strike veto
-  once offroad (making the "Restart the car to retry" alert true) and only a second mid-run hang
-  in the same boot sticks until the device reboots (`/dev/shm/vbsm_gpu_hangs` counts strikes).
-  Load-ladder vetoes stay boot-scoped.
+  once offroad (making the "Restart the car to retry" alert true). Within a drive the eGPU also
+  gets ONE retry: once the car rail has held the charging band (>=13.0 V for 60 s, the state the
+  eGPU has demonstrably run tens of minutes in) the hang veto is cleared and the existing GPU kick
+  reloads modeld — but only through its standstill + disengaged gate, so the model is never taken
+  away from a moving car. The kick and retry budgets reset each drive, since the device stays up
+  for days and boot-scoped counters would strand the big model until a manual reboot;
+  `/dev/shm/vbsm_gpu_hangs` stays boot-scoped as a backstop (6 strikes, checked by both the
+  drive-end clear and the retry gate) against a dying rail earning retries forever. Vetoes are
+  classified by their payload prefix: only `hang` (a mid-run death) is clearable or retryable —
+  `load`, written by the load ladder and by a loader wedged past the deadline, stays boot-scoped,
+  because a device that never came up has not shown it can run on this rail.
+  Note the deliberate asymmetry: rail voltage is used to *permit a retry*, never to *pre-emptively
+  veto* — as a veto it was refuted (route af ran 37 min with 869 samples below 12.5 V).
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
   `ChestnutActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything
