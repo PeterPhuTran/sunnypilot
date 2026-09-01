@@ -599,6 +599,21 @@ def main(demo=False):
       # non-eGPU fault vetoed here would otherwise be mislabelled, and would
       # recur on the SoC path anyway.
       if gpu_active:
+        # per-boot strike counter: ui_watchdog clears a first-strike veto once
+        # the drive ends (an ignition cycle is the retry point, since the
+        # device itself stays up across car restarts); a second strike keeps
+        # the veto for the whole boot. Advisory -- veto write is the real gate.
+        hangs = 1
+        try:
+          with open('/dev/shm/vbsm_gpu_hangs') as f:
+            hangs = int(f.read().strip()) + 1
+        except (OSError, ValueError):
+          pass
+        try:
+          with open('/dev/shm/vbsm_gpu_hangs', 'w') as f:
+            f.write(str(hangs))
+        except OSError:
+          pass
         vetoed = True
         try:
           with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:

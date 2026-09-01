@@ -55,7 +55,11 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   with no free retry — a device that already loaded and ran for minutes is not failing on a
   cold-start transient — and modeld writes that veto itself before replacing its process, so a
   respawn can never re-attempt a browned-out GPU (previously the veto arrived from the watchdog
-  0.9 s *after* the manager had already respawned).
+  0.9 s *after* the manager had already respawned). Mid-run vetoes are scoped to the DRIVE, not
+  the boot: the device stays up across car restarts, so ui_watchdog clears a first-strike veto
+  once offroad (making the "Restart the car to retry" alert true) and only a second mid-run hang
+  in the same boot sticks until the device reboots (`/dev/shm/vbsm_gpu_hangs` counts strikes).
+  Load-ladder vetoes stay boot-scoped.
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
   `ChestnutActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything

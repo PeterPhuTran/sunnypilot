@@ -62,6 +62,8 @@ MAX_KILLS_PER_BOOT = 3
 MIN_KILL_GAP_S = 60.0    # manager restart + UI startup needs room to finish
 
 GPU_VETO_FILE = "/dev/shm/vbsm_usbgpu_veto"  # tmpfs: a reboot grants a fresh chance
+GPU_HANG_COUNT_FILE = "/dev/shm/vbsm_gpu_hangs"  # per-boot mid-run hang strikes
+MAX_GPU_HANGS_PER_BOOT = 2  # first strike is cleared at drive end; second sticks
 GPU_LOAD_DEADLINE_S = 90.0  # every legitimate load path resolves by 60s
 GPU_STABLE_S = 10.0      # enclosure must stay enumerated this long
 MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write ChestnutLoading
@@ -150,16 +152,56 @@ class GpuKick:
     """Sustained inference hangs the accessory-outlet enclosure (tinygrad
     "Device hang detected"); without a veto every restart after a hang burned
     another 60s no-model window re-attempting the GPU mid-drive. One inference
-    death = SoC for the rest of this boot; modeld checks the marker at start."""
+    death = SoC for the rest of this DRIVE (tick() clears a first-strike veto
+    once offroad); the second strike this boot sticks until reboot. modeld
+    checks the marker at start and bumps the same counter from its own in-run
+    hang handler."""
+    hangs = 1
+    try:
+      with open(GPU_HANG_COUNT_FILE) as f:
+        hangs = int(f.read().strip()) + 1
+    except (OSError, ValueError):
+      pass
+    try:
+      with open(GPU_HANG_COUNT_FILE, "w") as f:
+        f.write(str(hangs))
+    except OSError:
+      pass
     try:
       with open(GPU_VETO_FILE, "w") as f:
         f.write(str(int(time.time())))
-      cloudlog.error("ui_watchdog: eGPU-active modeld died; vetoing the GPU until reboot")
+      cloudlog.error(f"ui_watchdog: eGPU-active modeld died; vetoing the GPU "
+                     f"(strike {hangs}/{MAX_GPU_HANGS_PER_BOOT} this boot)")
     except OSError as e:
       cloudlog.error(f"ui_watchdog: veto write failed: {e}")
 
   def tick(self, sm, started, now):
     if not started:
+      # An ignition cycle, not a device reboot, is the natural retry point:
+      # the device stays up across car restarts, so a boot-scoped veto from
+      # one supply transient (2026-09-01: the car's charging cutting out
+      # mid-drive) stranded the big model for every later drive that boot --
+      # and made the "Restart the car to retry" alert a lie. First mid-run
+      # hang: the veto dies with the drive, cleared here. Second hang this
+      # boot: the rail is not having a transient day, the veto keeps.
+      # Load-ladder vetoes (payload "load") stay boot-scoped: that device
+      # never even ran, and the ladder already spent its own free retry.
+      if os.path.exists(GPU_VETO_FILE):
+        hangs = 0
+        try:
+          with open(GPU_HANG_COUNT_FILE) as f:
+            hangs = int(f.read().strip())
+        except (OSError, ValueError):
+          pass
+        try:
+          with open(GPU_VETO_FILE) as f:
+            from_load = f.read(4) == "load"
+          if not from_load and hangs < MAX_GPU_HANGS_PER_BOOT:
+            os.remove(GPU_VETO_FILE)
+            cloudlog.warning(f"ui_watchdog: drive over; eGPU veto cleared for next "
+                             f"ignition (hang {hangs}/{MAX_GPU_HANGS_PER_BOOT} this boot)")
+        except OSError:
+          pass
       self.gpu_since = None
       self.modeld_seen = None
       self.gpu_was_active = False
