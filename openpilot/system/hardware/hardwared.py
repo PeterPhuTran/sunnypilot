@@ -10,7 +10,7 @@ import time
 from collections import OrderedDict, namedtuple
 
 import openpilot.cereal.messaging as messaging
-from openpilot.cereal import log
+from openpilot.cereal import log, custom
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.utils import strip_deprecated_keys
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -25,6 +25,7 @@ from openpilot.common.linux import LinuxSystemStats
 from openpilot.system.loggerd.config import get_available_percent
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.system.statsd import statlog
+from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.system.hardware.power_monitoring import PowerMonitoring
 from openpilot.system.hardware.fan_controller import FanController
 from openpilot.system.hardware.chestnut.status import ChestnutStatus
@@ -379,9 +380,18 @@ def hardware_thread(end_event, hw_queue) -> None:
     chestnut.update(started_ts is None, last_hw_state.usb_state)
     chestnut_state = sm["chestnutState"]
     chestnut_valid = sm.alive["chestnutState"] and sm.valid["chestnutState"]
+    # VBSM_GPU_IDLE-adjacent: Offroad_ChestnutUncompiled keys on the STOCK big
+    # model's compiled pkl, which never exists for a tinygrad bundle in the
+    # chestnut slot and never needs to. Upstream's own UI already treats
+    # runner==tinygrad as compiled (selfdrive/ui/sunnypilot/ui_state.py) but
+    # status.py does not, so bundle users would carry the alert forever.
+    def _chestnut_alert(name: str, show: bool, extra_text: str | None = None) -> None:
+      if name == "Offroad_ChestnutUncompiled" and show and           int(get_active_model_runner(params)) == int(custom.ModelManagerSP.Runner.tinygrad):
+        show = False
+      set_offroad_alert_if_changed(name, show, extra_text)
     chestnut_status.update(started_ts is None, branch, last_hw_state.usb_state, chestnut.failed,
                            params.get_bool("ChestnutLoading"), params.get("ChestnutActive"),
-                           chestnut_state if chestnut_valid else None, set_offroad_alert_if_changed)
+                           chestnut_state if chestnut_valid else None, _chestnut_alert)
     # this subset is only used for offroad
     temp_sources = [
       msg.deviceState.memoryTempC,

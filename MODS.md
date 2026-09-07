@@ -58,6 +58,9 @@ hand-merge of six managed files. Substantive changes to the fork layer:
   `ChestnutModelError` param is set/cleared as upstream does.
 - `hardwared.py`: upstream replaced the bare USB-id tuples with `is_chestnut_usb_id()` and added
   `ChestnutStatus`; the rail switch's presence test goes through the helper (real device only).
+  `Offroad_ChestnutUncompiled` is suppressed while the active runner is tinygrad: it keys on the
+  stock big model's compiled pkl, which bundle users never have (upstream's UI already exempts the
+  tinygrad runner; its status.py does not).
 - `home.py`, `augmented_road_view.py`: upstream's `TextAlignment` enums replace `rl.GuiTextAlignment`;
   upstream added USB/loading chestnut icons beside the fork's voltage label.
 
