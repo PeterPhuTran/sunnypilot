@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import time
 import threading
@@ -26,6 +27,12 @@ from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_ca
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
 
 REPLAY = "REPLAY" in os.environ
+
+# camera blind spot monitor: visionbsmd writes this at 5Hz, so polling the file
+# every 20th cycle of the 100Hz car thread is plenty
+VISION_BSM_STATE = "/dev/shm/vision_bsm_state"
+VISION_BSM_POLL = 20
+VISION_BSM_STALE = 2.0
 
 EventName = log.OnroadEvent.EventName
 
@@ -72,6 +79,10 @@ class Car:
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
     self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'])
+
+    self._vision_bsm_counter = 0
+    self._vision_bsm_left = False
+    self._vision_bsm_right = False
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
@@ -222,6 +233,21 @@ class Car:
     # TODO: mirror the carState.cruiseState struct?
     CS.vCruise = float(self.v_cruise_helper.v_cruise_kph)
     CS.vCruiseCluster = float(self.v_cruise_helper.v_cruise_cluster_kph)
+
+    # a camera detected blind spot reads exactly like a factory one, so the
+    # indicator, the chime and the lane change logic all pick it up unchanged
+    self._vision_bsm_counter += 1
+    if self._vision_bsm_counter % VISION_BSM_POLL == 0:
+      try:
+        with open(VISION_BSM_STATE) as f:
+          state = json.load(f)
+        fresh = time.clock_gettime(time.CLOCK_BOOTTIME) - state.get("ts", -1e9) < VISION_BSM_STALE
+        self._vision_bsm_left = fresh and bool(state.get("left"))
+        self._vision_bsm_right = fresh and bool(state.get("right"))
+      except (OSError, ValueError):
+        self._vision_bsm_left = self._vision_bsm_right = False
+    CS.leftBlindspot = CS.leftBlindspot or self._vision_bsm_left
+    CS.rightBlindspot = CS.rightBlindspot or self._vision_bsm_right
 
     return CS, CS_SP, RD
 

@@ -591,6 +591,7 @@ class VideoClips:
     camera = clip["camera"]
     filename = clip["filename"]
     assert camera == os.path.basename(camera) and camera.endswith("camera.hevc"), "invalid camera filename"
+    assert "dcamera" not in camera, "VBSM_PRIVACY: driver camera is private, no clips"
     assert filename == os.path.basename(filename), "invalid filename"
     with self.lock:
       self.clips[filename] = self.Clip(route_name, camera, source_start_time, source_end_time, clip["bitrate"], clip["speedup"],
@@ -659,6 +660,12 @@ def uploadFilesToUrls(files_data: list[UploadFileDict]) -> UploadFilesToUrlRespo
   failed: list[str] = []
   for file in files:
     if len(file.fn) == 0 or file.fn[0] == '/' or '..' in file.fn or len(file.url) == 0:
+      failed.append(file.fn)
+      continue
+
+    # VBSM_PRIVACY: in-cabin footage stays on the device; refuse any requested
+    # upload of driver camera files regardless of who asks over the socket
+    if "dcamera" in os.path.basename(file.fn):
       failed.append(file.fn)
       continue
 
