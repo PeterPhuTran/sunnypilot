@@ -45,7 +45,23 @@ two on-demand paths. Honest failures, not faked successes.
 - `ui_watchdog.py`: detects a UI that is alive but no longer rendering (frame-beacon based, exact
   proctitle match) and kills it for the manager to rebuild. Grew three GPU duties over time — see §4.
 
-### 4. eGPU (chestnut) integration — `VBSM_GPU_*`
+#### Port note — 2026-09-07 rebase onto sunnypilot `40d6afd3` (v2026.003.000)
+Upstream squashed `staging` (no common ancestor with the previous base `45515f72`), so this was a
+hand-merge of six managed files. Substantive changes to the fork layer:
+- `modeld.py`: upstream now keeps the SoC model resident and swaps to it **in-process** on an eGPU
+  exception (no restart, no no-model window). The fork's exit-for-respawn path is retired; the
+  veto/strike bookkeeping (`/dev/shm/vbsm_usbgpu_veto`, `vbsm_gpu_hangs`) stays so `ui_watchdog`'s
+  drive-scoped veto and mid-drive retry keep working. The PPT cap now runs inside upstream's
+  `load_big()` before the transfer. Load failures: a *wedged* loader (thread still alive after the
+  timeout) still exits for process replacement; a *clean* load failure falls through to upstream's
+  in-process SoC path. The load-fail counter is now cleared on a successful load. Upstream's
+  `ChestnutModelError` param is set/cleared as upstream does.
+- `hardwared.py`: upstream replaced the bare USB-id tuples with `is_chestnut_usb_id()` and added
+  `ChestnutStatus`; the rail switch's presence test goes through the helper (real device only).
+- `home.py`, `augmented_road_view.py`: upstream's `TextAlignment` enums replace `rl.GuiTextAlignment`;
+  upstream added USB/loading chestnut icons beside the fork's voltage label.
+
+## 4. eGPU (chestnut) integration — `VBSM_GPU_*`
 The enclosure runs from the 12 V accessory outlet, which shaped everything (measured ~0.45 Ω supply
 path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 - **Power cap** (`VBSM_GPU_PPT`, `modeld_v2/modeld.py`): 80 W SMU package-power limit applied
