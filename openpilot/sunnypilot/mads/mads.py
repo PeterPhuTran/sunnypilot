@@ -20,10 +20,12 @@ EventNameSP = custom.OnroadEventSP.EventName
 GearShifter = structs.CarState.GearShifter
 SafetyModel = structs.CarParams.SafetyModel
 
-# VBSM_EXP_TOGGLE: the LKAS button is repurposed to toggle experimental mode
-# (selfdrived.py, same marker); MADS must not also toggle lateral on the same
-# press. Set to False to restore the stock MADS button behavior.
-VBSM_LKAS_REPURPOSED = True
+# VBSM_EXP_TOGGLE: the LKAS button once toggled experimental mode here
+# (selfdrived.py, same marker). Returned to its stock MADS duty on 2026-09-08:
+# experimental switching lives on the distance-button hold (cruise_helpers.py,
+# 0.5 s), so the wheel button is free to enable/disable MADS. True re-arms the
+# old repurpose (and re-add the selfdrived block).
+VBSM_LKAS_REPURPOSED = False
 
 SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
