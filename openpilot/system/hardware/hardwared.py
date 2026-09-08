@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import fcntl
+import json
+import datetime
 import os
 import queue
 import struct
@@ -26,7 +28,7 @@ from openpilot.system.loggerd.config import get_available_percent
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.system.statsd import statlog
 from openpilot.sunnypilot.models.helpers import get_active_model_runner
-from openpilot.system.hardware.power_monitoring import PowerMonitoring
+from openpilot.system.hardware.power_monitoring import PowerMonitoring, PARK_SHUTDOWN_LOG
 from openpilot.system.hardware.fan_controller import FanController
 from openpilot.system.hardware.chestnut.status import ChestnutStatus
 from openpilot.common.version import terms_version, training_version, get_build_metadata, terms_version_sp
@@ -176,6 +178,30 @@ OFFROAD_DANGER_TEMP = 85 if HARDWARE.get_device_type() == "mici" else 75
 
 prev_offroad_states: dict[str, tuple[bool, str | None]] = {}
 
+
+
+def _record_park_shutdown(power_monitor, off_ts: float | None) -> None:
+  """VBSM_PARK: one JSON line per shutdown decision -- which rule fired
+  (timer / voltage / budget / force), the balance and voltages at that moment,
+  and both clocks (the wall clock can be stale-from-boot; the monotonic one is
+  not). Never allowed to block the shutdown itself. Bounded to the last 300."""
+  try:
+    rec = power_monitor.shutdown_record()
+    rec.update({"wall_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                "uptime_s": round(time.monotonic(), 1), "offroad_since_mono": round(off_ts, 1) if off_ts else None})
+    lines = []
+    try:
+      with open(PARK_SHUTDOWN_LOG) as f:
+        lines = f.readlines()[-299:]
+    except OSError:
+      pass
+    lines.append(json.dumps(rec, separators=(",", ":")) + "\n")
+    with open(PARK_SHUTDOWN_LOG + ".tmp", "w") as f:
+      f.writelines(lines)
+    os.replace(PARK_SHUTDOWN_LOG + ".tmp", PARK_SHUTDOWN_LOG)
+    cloudlog.event("vbsm park shutdown", **{k: rec[k] for k in ("reason", "offroad_s", "capacity_wh", "used_wh", "lpf_mV")})
+  except Exception:
+    cloudlog.exception("vbsm park shutdown record failed")
 
 
 def set_offroad_alert_if_changed(offroad_alert: str, show_alert: bool, extra_text: str | None=None):
@@ -536,6 +562,7 @@ def hardware_thread(end_event, hw_queue) -> None:
       shutdown_ticks += 1
       if shutdown_ticks >= 2:
         cloudlog.warning(f"shutting device down, offroad since {off_ts}")
+        _record_park_shutdown(power_monitor, off_ts)
         params.put_bool("DoShutdown", True, block=True)
     else:
       shutdown_ticks = 0

@@ -33,6 +33,18 @@ for driver-camera files, covering both the comma and sunnylink remote-procedure 
 a dispatcher). Background uploaders never sent camera footage to begin with; these guards close the
 two on-demand paths. Honest failures, not faked successes.
 
+### 2b. Parked power — `VBSM_PARK`
+- `power_monitoring.py` (managed from 2026-09-08): the parked energy allowance is read from
+  `/data/vbsm_park_budget_wh` (whole Wh, clamped 5..30; absent = stock 30). It is the only lever that
+  changes what the device takes from the 12V battery per park (a weak hybrid AGM resting ~55% SoC;
+  ~56 Wh/day simulated at stock). `should_shutdown()` makes the identical decision as upstream
+  (bench: 6144-point grid) but keeps a term-by-term record of WHY.
+- `hardwared.py`: when the (2-tick) shutdown decision fires it appends one JSON line to
+  `/data/vbsm_shutdowns.jsonl` — reason (timer / voltage / budget / force), balance and Wh used,
+  LPF + instant rail voltage, offroad seconds, both clocks (wall can be stale-from-boot) — bounded to
+  the last 300 and never allowed to block the shutdown. Until now a short park could not be told
+  apart as timer, voltage or budget.
+
 ### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`
 - `process.py`: upstream's manager never restarts a process that dies mid-session — one crash means
   the process (and, for the driving model, openpilot engagement) is gone until reboot. The manager
