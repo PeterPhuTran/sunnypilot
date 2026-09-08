@@ -130,6 +130,8 @@ jobs:
           check VBSM_RESTART     openpilot/system/manager/process.py
           check VBSM_PARKWATCH   openpilot/selfdrive/pandad/pandad.py
           check VBSM_PARKWATCH   openpilot/system/manager/process_config.py
+          check VBSM_PARK        openpilot/system/hardware/power_monitoring.py
+          check VBSM_PARK        openpilot/system/hardware/hardwared.py
           # a lost restart policy is silent until something dies mid-drive, so
           # assert the call sites too, not just the marker comment
           test "$(git cat-file blob "$C:openpilot/system/manager/process.py" \
