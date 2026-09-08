@@ -117,6 +117,7 @@ class HudRenderer(Widget):
     self.speed: float = 0.0
     self.v_ego_cluster_seen: bool = False
     self._engaged: bool = False
+    self._cruise_resumable: bool = False
     self._chestnut_fade_time: float = 0
 
     self._can_draw_top_icons = True
@@ -169,6 +170,7 @@ class HudRenderer(Widget):
     sm = ui_state.sm
     if sm.recv_frame["carState"] < ui_state.started_frame:
       self.is_cruise_set = False
+      self._cruise_resumable = False
       self.set_speed = SET_SPEED_NA
       self.speed = 0.0
       return
@@ -195,6 +197,11 @@ class HudRenderer(Widget):
     self.set_speed = set_speed
     self.is_cruise_set = 0 < self.set_speed < SET_SPEED_NA
     self.is_cruise_available = self.set_speed != -1
+    # VBSM_HUD: "resumable" = ACC main still on with a retained set speed.
+    # A brake-pedal disengage on Toyota keeps both, so RES brings that number
+    # back; a stalk cancel or main-off drops the retained speed and the
+    # cluster reports none.
+    self._cruise_resumable = bool(car_state.cruiseState.available) and self.is_cruise_set
 
     v_ego_cluster = car_state.vEgoCluster
     self.v_ego_cluster_seen = self.v_ego_cluster_seen or v_ego_cluster != 0.0
@@ -304,11 +311,13 @@ class HudRenderer(Widget):
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""
     # VBSM_HUD: the set speed used to fade 2.5s after a change, leaving the
-    # driver blind to it for most of the drive; keep it up whenever engaged.
-    # Known trade-off: the dmoji yields to top icons, so it hides while
-    # engaged now. Disengaged keeps the old change-triggered fade.
+    # driver blind to it for most of the drive; keep it up whenever engaged
+    # AND whenever cruise can be resumed (main on, set speed retained), so the
+    # driver sees what RES will bring back. Cancelled/unavailable cruise keeps
+    # the old change-triggered fade. Known trade-off: the dmoji yields to top
+    # icons, so it hides while the number is up.
     alpha = self._set_speed_alpha_filter.update(self._can_draw_top_icons and
-                                                (self._engaged or
+                                                (self._engaged or self._cruise_resumable or
                                                  0 < rl.get_time() - self._set_speed_changed_time < SET_SPEED_PERSISTENCE))
     if alpha < 1e-2:
       return

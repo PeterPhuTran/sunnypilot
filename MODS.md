@@ -120,6 +120,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   writing bytecode into the tree silently breaks the updater's git clean.
 
 ### 5. Driver HUD — `VBSM_HUD`, `VBSM_EXP_TOGGLE`
+- `hud_renderer.py` set speed (2026-09-08): shown while engaged and whenever cruise is *resumable* — ACC main on with a retained set speed (`carState.cruiseState.available`) — hidden otherwise after the stock 2.5 s fade, so the driver sees what RES will bring back.
 - **Persistent set speed** (`hud_renderer.py`): the cruise set-speed no longer fades 2.5 s after a
   change; it stays up whenever engaged.
 - **Gap-profile chip** (`hud_renderer.py` + `augmented_road_view.py` + `selfdrived.py`): top-right
