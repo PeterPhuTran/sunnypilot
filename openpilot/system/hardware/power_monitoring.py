@@ -20,6 +20,12 @@ PARK_BUDGET_FILE = "/data/vbsm_park_budget_wh"
 PARK_BUDGET_MIN_WH = 5
 PARK_BUDGET_MAX_WH = 30
 PARK_SHUTDOWN_LOG = "/data/vbsm_shutdowns.jsonl"
+# VBSM_PARK: the comma four has no /sys/class/hwmon/hwmon1/power1_input, so
+# HARDWARE.get_current_power_draw() reads 0 W there and the budget never
+# integrated (field, 2026-09-08: 9.1 h parked, used_wh 0.0, shutdown on the
+# voltage rule). Fall back to the SoM battery-management reading (a lower bound
+# of the whole device: ~2.7 W idle), then to a fixed floor.
+PARK_DRAW_FLOOR_W = 3.0
 
 
 def park_budget_uWh() -> float:
@@ -29,6 +35,24 @@ def park_budget_uWh() -> float:
   except (OSError, ValueError):
     return CAR_BATTERY_CAPACITY_uWh
   return float(max(PARK_BUDGET_MIN_WH, min(PARK_BUDGET_MAX_WH, wh))) * 1e6
+
+
+def park_power_draw() -> tuple[float, str]:
+  """VBSM_PARK: (watts, source) -- the platform sensor when it reads, else the
+  SoM BMS reading, else PARK_DRAW_FLOOR_W. Never below zero."""
+  try:
+    p = float(HARDWARE.get_current_power_draw() or 0.0)
+  except Exception:
+    p = 0.0
+  if p > 0:
+    return p, "hwmon"
+  try:
+    som = float(HARDWARE.get_som_power_draw() or 0.0)
+  except Exception:
+    som = 0.0
+  if som > 0:
+    return som, "bms"
+  return PARK_DRAW_FLOOR_W, "floor"
 
 VBATT_PAUSE_CHARGING = 11.8           # Lower limit on the LPF car battery voltage
 MAX_TIME_OFFROAD_S = 30*3600
@@ -53,6 +77,9 @@ class PowerMonitoring:
     # cap in calculate() brings a saved balance above the new budget down.
     self.budget_uWh = park_budget_uWh()
     self.last_eval: dict = {}
+    self.draw_w = 0.0
+    self.draw_source = "none"
+    self._draw_source_logged: str | None = None
     if self.budget_uWh != CAR_BATTERY_CAPACITY_uWh:
       cloudlog.event("vbsm park budget", wh=self.budget_uWh / 1e6, stock_wh=CAR_BATTERY_CAPACITY_uWh / 1e6)
 
@@ -101,7 +128,11 @@ class PowerMonitoring:
           self.last_measurement_time = now
       else:
         # Get current power draw somehow
-        current_power = HARDWARE.get_current_power_draw()
+        current_power, self.draw_source = park_power_draw()
+        self.draw_w = current_power
+        if self.draw_source != self._draw_source_logged:
+          self._draw_source_logged = self.draw_source
+          cloudlog.event("vbsm park draw source", source=self.draw_source, watts=round(current_power, 2))
 
         # Do the integration
         self._perform_integration(now, current_power)
@@ -171,7 +202,7 @@ class PowerMonitoring:
       "delay_ok": bool(offroad_time > DELAY_SHUTDOWN_TIME_S), "min_on_ok": bool(min_on_ok), "started_seen": bool(started_seen),
       "offroad_s": round(offroad_time, 1), "monotonic_s": round(now, 1),
       "capacity_wh": round(self.car_battery_capacity_uWh / 1e6, 3), "used_wh": round(self.power_used_uWh / 1e6, 3),
-      "budget_wh": round(self.budget_uWh / 1e6, 1),
+      "budget_wh": round(self.budget_uWh / 1e6, 1), "draw_w": round(self.draw_w, 2), "draw_source": self.draw_source,
       "lpf_mV": int(self.car_voltage_mV), "instant_mV": int(self.car_voltage_instant_mV),
     }
     return should_shutdown

@@ -45,6 +45,8 @@ two on-demand paths. Honest failures, not faked successes.
   the last 300 and never allowed to block the shutdown. Until now a short park could not be told
   apart as timer, voltage or budget.
 
+- 2026-09-08: the budget integrator was inert on the comma four (`get_current_power_draw()` reads a hwmon node that does not exist there, so 0 W). `park_power_draw()` now falls back to the SoM BMS reading (~2.7 W idle, a lower bound of the whole device), then a 3 W floor; the shutdown record carries `draw_w` / `draw_source`. First real record: 9.1 h parked, used 0.0 Wh, ended by the 11.8 V voltage rule.
+
 ### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`
 - `process.py`: upstream's manager never restarts a process that dies mid-session — one crash means
   the process (and, for the driving model, openpilot engagement) is gone until reboot. The manager
