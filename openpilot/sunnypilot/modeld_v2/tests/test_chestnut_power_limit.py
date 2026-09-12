@@ -46,7 +46,7 @@ class TestChestnutPowerLimit(OpenpilotTestCase):
 
   def test_clamped_to_range(self):
     for raw, expected in ((80, 80), (10, chestnut_power_limit.POWER_LIMIT_MIN_W), (500, chestnut_power_limit.POWER_LIMIT_MAX_W), (-5, 0)):
-      self.params.put("ChestnutPowerLimit", raw)
+      self.params.put("ChestnutPowerLimit", raw, block=True)
       assert chestnut_power_limit.get_power_limit(self.params) == expected
 
   def test_garbage_is_stock(self, monkeypatch):
