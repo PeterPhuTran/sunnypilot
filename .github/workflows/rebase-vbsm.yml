@@ -30,7 +30,7 @@ permissions:
   contents: write
 
 env:
-  BRANCH: vbsm-sp-staging-v2026.003.000
+  BRANCH: phu-staging
   MANIFEST: .github/vbsm-base.json
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
       - name: check out the mod branch
         uses: actions/checkout@v4
         with:
-          ref: vbsm-sp-staging-v2026.003.000
+          ref: phu-staging
           fetch-depth: 0
           filter: blob:none
 
