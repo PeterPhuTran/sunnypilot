@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 
@@ -26,6 +27,21 @@ PARK_SHUTDOWN_LOG = "/data/vbsm_shutdowns.jsonl"
 # voltage rule). Fall back to the SoM battery-management reading (a lower bound
 # of the whole device: ~2.7 W idle), then to a fixed floor.
 PARK_DRAW_FLOOR_W = 3.0
+# VBSM_PARK: while the home Pi is actively pulling footage it touches this
+# tmpfs marker (once per batch). A fresh marker suspends the budget and timer
+# rules so a park never ends mid-sync; the 11.8 V rule and ForcePowerDown are
+# untouched -- the battery floor is not negotiable. tmpfs clears on reboot and
+# the TTL bounds a Pi that vanished mid-sync (wall-clock mtime: a forward NTP
+# jump can only expire it early, which fails safe).
+SYNC_ACTIVE_FILE = "/dev/shm/vbsm_sync_active"
+SYNC_ACTIVE_TTL_S = 30 * 60
+
+
+def sync_active() -> bool:
+  try:
+    return (time.time() - os.path.getmtime(SYNC_ACTIVE_FILE)) < SYNC_ACTIVE_TTL_S
+  except OSError:
+    return False
 
 
 def park_budget_uWh() -> float:
@@ -180,8 +196,9 @@ class PowerMonitoring:
     # VBSM_PARK: the same decision as upstream, evaluated term by term so the
     # reason survives to the shutdown record -- until now a park that ended
     # early could not be told apart as timer, voltage or budget.
-    timer = self.max_time_offroad_exceeded(offroad_time)
-    budget = self.car_battery_capacity_uWh <= 0
+    sync = sync_active()  # VBSM_PARK: footage pull in progress -> budget/timer suspended, voltage kept
+    timer = self.max_time_offroad_exceeded(offroad_time) and not sync
+    budget = self.car_battery_capacity_uWh <= 0 and not sync
     disable_power_down = self.params.get_bool("DisablePowerDown")
     force = self.params.get_bool("ForcePowerDown")
     min_on_ok = started_seen or (now > MIN_ON_TIME_S)
@@ -197,7 +214,7 @@ class PowerMonitoring:
     reasons = [name for name, hit in (("force", force), ("budget", budget), ("voltage", low_voltage_shutdown), ("timer", timer)) if hit]
     self.last_eval = {
       "decision": bool(should_shutdown), "reason": "+".join(reasons) if reasons else "none",
-      "timer": bool(timer), "voltage": bool(low_voltage_shutdown), "budget": bool(budget), "force": bool(force),
+      "timer": bool(timer), "voltage": bool(low_voltage_shutdown), "budget": bool(budget), "force": bool(force), "sync_active": bool(sync),
       "ignition": bool(ignition), "in_car": bool(in_car), "disable_power_down": bool(disable_power_down),
       "delay_ok": bool(offroad_time > DELAY_SHUTDOWN_TIME_S), "min_on_ok": bool(min_on_ok), "started_seen": bool(started_seen),
       "offroad_s": round(offroad_time, 1), "monotonic_s": round(now, 1),

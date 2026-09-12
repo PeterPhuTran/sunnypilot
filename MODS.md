@@ -23,7 +23,10 @@ Its three outputs are independently switchable from the on-device toggles page, 
 different drivers at different times: **icons on screen** (the upstream `BlindSpot` param — which
 also stops the steering wheel yielding its slot), **chime on signal** (`chime` in the JSON, with
 `chime_always` as its sub-option: chime on entry rather than only on a signal), and the **window
-view on signal** (`camera_view`). Fork settings live in that JSON rather than in params because the
+view on signal** (`camera_view`). The window view depends only on `camera_view` (plus the calibrated
+zones): with the monitor itself (`enabled`) off the daemon idles without a model and the view is a plain
+mirror of the signalled side -- no chevrons, chime or icons, and no CPU spent on inference (2026-09-11:
+the model is shelved this way while the SoC runs the big-model warp; flip `enabled` to bring it back). Fork settings live in that JSON rather than in params because the
 branch ships a prebuilt `libparams_c.so`: a new key added to `params_keys.h` is never compiled, so
 it would raise `UnknownKeyName` on-device.
 
@@ -45,6 +48,9 @@ two on-demand paths. Honest failures, not faked successes.
   the last 300 and never allowed to block the shutdown. Until now a short park could not be told
   apart as timer, voltage or budget.
 
+- Sync-aware park (2026-09-11): while the home Pi is pulling footage it touches `/dev/shm/vbsm_sync_active`
+  once per batch; a marker younger than 30 min suspends the budget and timer rules so a park never ends
+  mid-sync. The 11.8 V rule and ForcePowerDown are untouched. The record carries `sync_active`.
 - 2026-09-08: the budget integrator was inert on the comma four (`get_current_power_draw()` reads a hwmon node that does not exist there, so 0 W). `park_power_draw()` now falls back to the SoM BMS reading (~2.7 W idle, a lower bound of the whole device), then a 3 W floor; the shutdown record carries `draw_w` / `draw_source`. First real record: 9.1 h parked, used 0.0 Wh, ended by the 11.8 V voltage rule.
 
 ### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`
@@ -204,6 +210,7 @@ left the managed set with it).
 | `/data/vbsm_gpu_ppt_w` | GPU power cap in watts (default 80, clamp 40–220, 0 disables) |
 | `/data/vbsm_no_gpu_idle_off` | opt out of the parked GPU power-off |
 | `/dev/shm/vbsm_usbgpu_veto` | per-boot GPU veto (set automatically on failures; clears at reboot) |
+| `/dev/shm/vbsm_sync_active` | touched by the Pi's footage sync per batch; fresh (<30 min) = budget/timer shutdown rules suspended, voltage rule kept |
 
 ## Operational notes
 

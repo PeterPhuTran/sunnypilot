@@ -222,7 +222,10 @@ class AugmentedRoadView(CameraView):
     try:
       with open(BSM_CONFIG_PATH) as f:
         config = json.load(f)
-      self._bsm_enabled = bool(config.get("enabled")) and bool(config.get("camera_view"))
+      # VBSM_HUD: the window view needs only camera_view + zones. `enabled`
+      # gates the detector (model, chevrons, chime, icons); with it off the
+      # view is a plain mirror of the signalled side and no CPU goes to the model.
+      self._bsm_enabled = bool(config.get("camera_view"))
       self._bsm_zones = config.get("zones", {}) if self._bsm_enabled else {}
     except (OSError, ValueError):
       self._bsm_enabled = False
