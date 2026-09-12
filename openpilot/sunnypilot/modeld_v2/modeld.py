@@ -325,6 +325,13 @@ def main(demo=False):
   config_realtime_process(7, 54)
 
   CHESTNUT = chestnut_present()
+  # VBSM_GPU_FALLBACK: set when an eGPU load fails twice or an eGPU-active
+  # modeld dies (accessory-outlet power limits); tmpfs clears it each boot.
+  # With the veto the SoC path runs, and the per-hardware bundle slots make
+  # ModelState(chestnut=False) select the Qualcomm slot on its own.
+  if CHESTNUT and os.path.exists('/dev/shm/vbsm_usbgpu_veto'):
+    cloudlog.event("eGPU vetoed earlier this boot; running SoC fallback", error=True)
+    CHESTNUT = False
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
@@ -360,24 +367,96 @@ def main(demo=False):
 
   model = None
   if CHESTNUT:
+    def apply_ppt_cap():
+      # VBSM_GPU_PPT: cap package power BEFORE the 1.7GB transfer -- the
+      # accessory-outlet 12V path (~0.45 ohm measured) browns out at stock
+      # boost transients, during load as well as inference. 80W ~ 6A fits.
+      # Tune via /data/vbsm_gpu_ppt_w (watts; 0 disables), clamp 40..220.
+      limit_w = 80
+      try:
+        with open("/data/vbsm_gpu_ppt_w") as f:
+          limit_w = int(f.read().strip())
+      except (OSError, ValueError):
+        pass
+      if limit_w <= 0:
+        return
+      limit_w = max(40, min(220, limit_w))
+      from tinygrad.device import Device
+      smu = Device["AMD"].iface.dev_impl.smu
+      smu._send_msg(smu.smu_mod.PPSMC_MSG_SetPptLimit, limit_w, timeout=100)
+      applied = smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
+      cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), error=False)
+
+    # VBSM_GPU_FALLBACK: load into a separate name so a late-completing or
+    # wedged loader thread can never clobber state after the timeout fires
     big_model = None
     def load_big():
       nonlocal big_model
       try:
+        apply_ppt_cap()
         m = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
         m.warmup()
         big_model = m
-      except Exception:
+      except Exception as e:
+        # a lock-flavored failure means another process held the tinygrad
+        # USB-GPU device lock; capture the holder while it still exists
+        if "acquire lock" in str(e) or "am_usb" in str(e):
+          try:
+            import glob as _glob, subprocess as _sp
+            for lk in _glob.glob("/tmp/am_usb:*.lock"):
+              r = _sp.run(["fuser", "-v", lk], capture_output=True, text=True, timeout=5)
+              cloudlog.event("eGPU lock holder", lock=lk, fuser=(r.stdout + r.stderr)[:500], error=True)
+          except Exception:
+            pass
         cloudlog.exception("chestnut load failed")
     loader = threading.Thread(target=load_big, daemon=True)
     loader.start()
     loader.join(BIG_MODEL_TIMEOUT)
     model = big_model
     if model is None:
+      # VBSM_GPU_FALLBACK: count the failure so a persistently failing load
+      # cannot be retried forever by ui_watchdog's GPU kick -- the second
+      # failure this boot vetoes the eGPU. A loader still alive here is wedged
+      # inside a C call (field-verified: it ignored SIGINT and needed SIGKILL);
+      # nothing in this process is safe behind it, so replace the process. A
+      # loader that finished and failed cleanly falls through to upstream's
+      # in-process small-model path: no restart, no manager budget spent.
+      fails = 1
+      try:
+        with open('/dev/shm/vbsm_gpu_load_fails') as f:
+          fails = int(f.read().strip()) + 1
+      except (OSError, ValueError):
+        pass
+      try:
+        with open('/dev/shm/vbsm_gpu_load_fails', 'w') as f:
+          f.write(str(fails))
+      except OSError:
+        pass
+      if fails >= 2:
+        try:
+          with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
+            f.write("load")
+        except OSError:
+          pass
+      if loader.is_alive():
+        cloudlog.event("eGPU load wedged; exiting for respawn", error=True, attempt=fails, vetoed=bool(fails >= 2))
+        # Params.put is write+rename, so these survive os._exit: selfdrived's
+        # bigModelFailed input stays deterministic across the respawn window
+        params.put_bool("ChestnutModelError", True)
+        params.put_bool("ChestnutActive", False)
+        time.sleep(0.2)
+        os._exit(1)
+      cloudlog.event("eGPU load failed; running SoC model in-process", error=True, attempt=fails, vetoed=bool(fails >= 2))
       params.put_bool("ChestnutModelError", True)
     params.put_bool("ChestnutActive", model is not None)
     if model is not None:
       params.remove("ChestnutModelError")
+      # a good load clears the ladder: the counter was never reset on success,
+      # so a stale count could turn the next transient into a boot-long veto
+      try:
+        os.remove('/dev/shm/vbsm_gpu_load_fails')
+      except OSError:
+        pass
 
   small_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False) if model is None or CHESTNUT else None
   if model is None:
@@ -516,10 +595,36 @@ def main(demo=False):
       send_chestnut = (chestnut_state is not None and
                        run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
       model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
-    except Exception:
+    except Exception as e:
       if not params.get_bool("ChestnutActive"):
         raise
-      cloudlog.exception("chestnut failed, falling back to small")
+      # VBSM_GPU_FALLBACK: upstream swaps to the already-loaded small model
+      # in-process -- no restart and no no-model window, which retires the
+      # fork's exit-for-respawn path (30.7s of no model on 2026-09-01). The
+      # fork's veto bookkeeping stays: ui_watchdog scopes the veto to the
+      # drive, retries the eGPU once the rail recovers, and any later respawn
+      # must not re-attempt a browned-out GPU. The payload records what raised
+      # because run() spans BOTH devices (warp on QCOM, policy on AMD): a USB
+      # bulk I/O error from a bad cable was diagnosed from exactly this string.
+      hangs = 1
+      try:
+        with open('/dev/shm/vbsm_gpu_hangs') as f:
+          hangs = int(f.read().strip()) + 1
+      except (OSError, ValueError):
+        pass
+      try:
+        with open('/dev/shm/vbsm_gpu_hangs', 'w') as f:
+          f.write(str(hangs))
+      except OSError:
+        pass
+      vetoed = True
+      try:
+        with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
+          f.write(f"hang {type(e).__name__}: {e}"[:200])
+      except OSError as ve:
+        vetoed = False
+        cloudlog.error(f"eGPU veto write failed, a respawn may retry the GPU: {ve}")
+      cloudlog.exception(f"chestnut failed, falling back to small (vetoed={vetoed}, strike {hangs})")
       params.put_bool("ChestnutModelError", True)
       params.put_bool("ChestnutActive", False)
       assert small_model is not None

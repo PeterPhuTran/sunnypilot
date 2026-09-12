@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 
@@ -11,6 +12,63 @@ CAR_VOLTAGE_LOW_PASS_K = 0.011 # LPF gain for 45s tau (dt/tau / (dt/tau + 1))
 # While driving, a battery charges completely in about 30-60 minutes
 CAR_BATTERY_CAPACITY_uWh = 30e6
 CAR_CHARGING_RATE_W = 45
+
+# VBSM_PARK: the parked energy allowance is the only lever that changes how
+# much the device takes from the 12V battery per park (a weak hybrid AGM that
+# rests at ~55% SoC; simulated ~56 Wh/day at the stock 30 Wh). Override in
+# whole Wh via /data/vbsm_park_budget_wh (clamped 5..30; absent = stock 30).
+PARK_BUDGET_FILE = "/data/vbsm_park_budget_wh"
+PARK_BUDGET_MIN_WH = 5
+PARK_BUDGET_MAX_WH = 30
+PARK_SHUTDOWN_LOG = "/data/vbsm_shutdowns.jsonl"
+# VBSM_PARK: the comma four has no /sys/class/hwmon/hwmon1/power1_input, so
+# HARDWARE.get_current_power_draw() reads 0 W there and the budget never
+# integrated (field, 2026-09-08: 9.1 h parked, used_wh 0.0, shutdown on the
+# voltage rule). Fall back to the SoM battery-management reading (a lower bound
+# of the whole device: ~2.7 W idle), then to a fixed floor.
+PARK_DRAW_FLOOR_W = 3.0
+# VBSM_PARK: while the home Pi is actively pulling footage it touches this
+# tmpfs marker (once per batch). A fresh marker suspends the budget and timer
+# rules so a park never ends mid-sync; the 11.8 V rule and ForcePowerDown are
+# untouched -- the battery floor is not negotiable. tmpfs clears on reboot and
+# the TTL bounds a Pi that vanished mid-sync (wall-clock mtime: a forward NTP
+# jump can only expire it early, which fails safe).
+SYNC_ACTIVE_FILE = "/dev/shm/vbsm_sync_active"
+SYNC_ACTIVE_TTL_S = 30 * 60
+
+
+def sync_active() -> bool:
+  try:
+    return (time.time() - os.path.getmtime(SYNC_ACTIVE_FILE)) < SYNC_ACTIVE_TTL_S
+  except OSError:
+    return False
+
+
+def park_budget_uWh() -> float:
+  try:
+    with open(PARK_BUDGET_FILE) as f:
+      wh = int(f.read().strip())
+  except (OSError, ValueError):
+    return CAR_BATTERY_CAPACITY_uWh
+  return float(max(PARK_BUDGET_MIN_WH, min(PARK_BUDGET_MAX_WH, wh))) * 1e6
+
+
+def park_power_draw() -> tuple[float, str]:
+  """VBSM_PARK: (watts, source) -- the platform sensor when it reads, else the
+  SoM BMS reading, else PARK_DRAW_FLOOR_W. Never below zero."""
+  try:
+    p = float(HARDWARE.get_current_power_draw() or 0.0)
+  except Exception:
+    p = 0.0
+  if p > 0:
+    return p, "hwmon"
+  try:
+    som = float(HARDWARE.get_som_power_draw() or 0.0)
+  except Exception:
+    som = 0.0
+  if som > 0:
+    return som, "bms"
+  return PARK_DRAW_FLOOR_W, "floor"
 
 VBATT_PAUSE_CHARGING = 11.8           # Lower limit on the LPF car battery voltage
 MAX_TIME_OFFROAD_S = 30*3600
@@ -31,8 +89,18 @@ class PowerMonitoring:
 
     car_battery_capacity_uWh = self.params.get("CarBatteryCapacity") or 0
 
+    # VBSM_PARK: the allowance and the boot floor scale with the knob; the
+    # cap in calculate() brings a saved balance above the new budget down.
+    self.budget_uWh = park_budget_uWh()
+    self.last_eval: dict = {}
+    self.draw_w = 0.0
+    self.draw_source = "none"
+    self._draw_source_logged: str | None = None
+    if self.budget_uWh != CAR_BATTERY_CAPACITY_uWh:
+      cloudlog.event("vbsm park budget", wh=self.budget_uWh / 1e6, stock_wh=CAR_BATTERY_CAPACITY_uWh / 1e6)
+
     # Reset capacity if it's low
-    self.car_battery_capacity_uWh = max((CAR_BATTERY_CAPACITY_uWh / 10), car_battery_capacity_uWh)
+    self.car_battery_capacity_uWh = max((self.budget_uWh / 10), car_battery_capacity_uWh)
 
   # Calculation tick
   def calculate(self, voltage: float | None, ignition: bool):
@@ -54,7 +122,7 @@ class PowerMonitoring:
 
       # Cap the car battery power and save it in a param every 10-ish seconds
       self.car_battery_capacity_uWh = max(self.car_battery_capacity_uWh, 0)
-      self.car_battery_capacity_uWh = min(self.car_battery_capacity_uWh, CAR_BATTERY_CAPACITY_uWh)
+      self.car_battery_capacity_uWh = min(self.car_battery_capacity_uWh, self.budget_uWh)
       if now - self.last_save_time >= 10:
         self.params.put("CarBatteryCapacity", int(self.car_battery_capacity_uWh))
         self.last_save_time = now
@@ -76,7 +144,11 @@ class PowerMonitoring:
           self.last_measurement_time = now
       else:
         # Get current power draw somehow
-        current_power = HARDWARE.get_current_power_draw()
+        current_power, self.draw_source = park_power_draw()
+        self.draw_w = current_power
+        if self.draw_source != self._draw_source_logged:
+          self._draw_source_logged = self.draw_source
+          cloudlog.event("vbsm park draw source", source=self.draw_source, watts=round(current_power, 2))
 
         # Do the integration
         self._perform_integration(now, current_power)
@@ -121,13 +193,37 @@ class PowerMonitoring:
     offroad_time = (now - offroad_timestamp)
     low_voltage_shutdown = (self.car_voltage_mV < (VBATT_PAUSE_CHARGING * 1e3) and
                             offroad_time > VOLTAGE_SHUTDOWN_MIN_OFFROAD_TIME_S)
-    should_shutdown |= self.max_time_offroad_exceeded(offroad_time)
+    # VBSM_PARK: the same decision as upstream, evaluated term by term so the
+    # reason survives to the shutdown record -- until now a park that ended
+    # early could not be told apart as timer, voltage or budget.
+    sync = sync_active()  # VBSM_PARK: footage pull in progress -> budget/timer suspended, voltage kept
+    timer = self.max_time_offroad_exceeded(offroad_time) and not sync
+    budget = self.car_battery_capacity_uWh <= 0 and not sync
+    disable_power_down = self.params.get_bool("DisablePowerDown")
+    force = self.params.get_bool("ForcePowerDown")
+    min_on_ok = started_seen or (now > MIN_ON_TIME_S)
+    should_shutdown |= timer
     should_shutdown |= low_voltage_shutdown
-    should_shutdown |= (self.car_battery_capacity_uWh <= 0)
+    should_shutdown |= budget
     should_shutdown &= not ignition
-    should_shutdown &= (not self.params.get_bool("DisablePowerDown"))
+    should_shutdown &= (not disable_power_down)
     should_shutdown &= in_car
     should_shutdown &= offroad_time > DELAY_SHUTDOWN_TIME_S
-    should_shutdown |= self.params.get_bool("ForcePowerDown")
-    should_shutdown &= started_seen or (now > MIN_ON_TIME_S)
+    should_shutdown |= force
+    should_shutdown &= min_on_ok
+    reasons = [name for name, hit in (("force", force), ("budget", budget), ("voltage", low_voltage_shutdown), ("timer", timer)) if hit]
+    self.last_eval = {
+      "decision": bool(should_shutdown), "reason": "+".join(reasons) if reasons else "none",
+      "timer": bool(timer), "voltage": bool(low_voltage_shutdown), "budget": bool(budget), "force": bool(force), "sync_active": bool(sync),
+      "ignition": bool(ignition), "in_car": bool(in_car), "disable_power_down": bool(disable_power_down),
+      "delay_ok": bool(offroad_time > DELAY_SHUTDOWN_TIME_S), "min_on_ok": bool(min_on_ok), "started_seen": bool(started_seen),
+      "offroad_s": round(offroad_time, 1), "monotonic_s": round(now, 1),
+      "capacity_wh": round(self.car_battery_capacity_uWh / 1e6, 3), "used_wh": round(self.power_used_uWh / 1e6, 3),
+      "budget_wh": round(self.budget_uWh / 1e6, 1), "draw_w": round(self.draw_w, 2), "draw_source": self.draw_source,
+      "lpf_mV": int(self.car_voltage_mV), "instant_mV": int(self.car_voltage_instant_mV),
+    }
     return should_shutdown
+
+  def shutdown_record(self) -> dict:
+    """VBSM_PARK: the last should_shutdown() evaluation, for the persistent record."""
+    return dict(self.last_eval)

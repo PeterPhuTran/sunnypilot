@@ -12,12 +12,60 @@ from openpilot.system.ui.widgets.label import UnifiedLabel, gui_label
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos, TextAlignment, TextAlignmentVertical
 from openpilot.selfdrive.ui.ui_state import ui_state, ChestnutState
 from openpilot.common.version import RELEASE_BRANCHES
+from openpilot.sunnypilot.models.helpers import get_selected_bundle
+from openpilot.sunnypilot.models.model_name import DEFAULT_MODEL, DEFAULT_BIG_MODEL
+import openpilot.cereal.messaging as messaging
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 
 HEAD_BUTTON_FONT_SIZE = 40
 HOME_PADDING = 8
 ALERTS_ZONE_WIDTH = 180
 
 NetworkType = log.DeviceState.NetworkType
+
+
+class VoltageLabel(Widget):
+  # VBSM_HUD: parked 12V battery readout ("12.2V") in the home footer, right
+  # of the chestnut icon. Reads pandad's peripheralState (published offroad;
+  # the same source the power monitor uses) on its own tiny SubMaster, polled
+  # at 2 Hz -- the UI's shared SubMaster does not carry this service. Renders
+  # only while the home screen is already awake, so it adds no screen-on time
+  # and no measurable power.
+  POLL_S = 0.5
+
+  def __init__(self):
+    super().__init__()
+    self._sm = messaging.SubMaster(["peripheralState"])
+    self._font = gui_app.font(FontWeight.MEDIUM)
+    self._font_size = 30
+    self._volts: float | None = None
+    self._last_poll = 0.0
+    # fixed-width rect sized for the widest plausible text keeps the footer
+    # layout from jittering as digits change
+    w = measure_text_cached(self._font, "88.8V", self._font_size).x
+    self.set_rect(rl.Rectangle(0, 0, float(int(w) + 4), 48.0))
+    self.set_enabled(False)
+
+  def _update_state(self):
+    now = time.monotonic()
+    if now - self._last_poll < self.POLL_S:
+      return
+    self._last_poll = now
+    self._sm.update(0)
+    if self._sm.recv_frame["peripheralState"] > 0:
+      v = self._sm["peripheralState"].voltage / 1000.0
+      self._volts = v if 5.0 < v < 20.0 else None
+    # NOTE: never set_visible(False) here -- HBoxLayout stops rendering (and
+    # therefore updating) invisible children, so the widget could never come
+    # back. With no data it stays visible and just draws nothing.
+
+  def _render(self, _):
+    if self._volts is None:
+      return
+    text = f"{self._volts:.1f}V"
+    size = measure_text_cached(self._font, text, self._font_size)
+    pos = rl.Vector2(self._rect.x, self._rect.y + (self._rect.height - size.y) / 2)
+    rl.draw_text_ex(self._font, text, pos, self._font_size, 0, rl.Color(255, 255, 255, 220))
 
 NETWORK_TYPES = {
   NetworkType.none: "Offline",
@@ -157,6 +205,7 @@ class MiciHomeLayout(Widget):
       self._chestnut_icon,
       self._chestnut_loading_icon,
       self._chestnut_failed_icon,
+      VoltageLabel(),  # VBSM_HUD: parked battery voltage, right of the chestnut icon
       self._body_icon,
       self._mic_icon,
     ], spacing=18)
@@ -167,6 +216,10 @@ class MiciHomeLayout(Widget):
     self._date_label = UnifiedLabel("", font_size=36, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
     self._branch_label = UnifiedLabel("", font_size=36, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, scroll=True)
     self._version_commit_label = UnifiedLabel("", font_size=36, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
+    # VBSM_HUD: the two driving-model slots, drawn beside the commit hash
+    self._model_label = UnifiedLabel("", font_size=30, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
+    self._model_text: str = ""
+    self._model_poll: float = 0.0
 
   def _update_state(self):
     if self.is_pressed and not self._is_pressed_prev:
@@ -175,6 +228,13 @@ class MiciHomeLayout(Widget):
       self._mouse_down_t = None
       self._did_long_press = False
     self._is_pressed_prev = self.is_pressed
+
+    # VBSM_HUD: the model names only change when the user picks a model, and
+    # each read touches the filesystem, so poll at 1 Hz rather than per frame
+    now = time.monotonic()
+    if now - self._model_poll > 1.0:
+      self._model_poll = now
+      self._model_text = self._read_model_names()
 
     if self._mouse_down_t is not None:
       if time.monotonic() - self._mouse_down_t > 0.5:
@@ -203,6 +263,24 @@ class MiciHomeLayout(Widget):
       elif self._on_settings_click:
         self._on_settings_click()
     self._did_long_press = False
+
+  def _read_model_names(self) -> str:
+    # VBSM_HUD: name both driving-model slots -- the SoC model, plus the big
+    # GPU model when the chestnut is attached. internalName is the short
+    # catalog name (<= 8 chars); displayName runs to 56 and will not fit here.
+    def slot(source: str, fallback: str) -> str:
+      try:
+        bundle = get_selected_bundle(ui_state.params, source)
+      except Exception:
+        bundle = None
+      return (bundle.internalName if bundle else fallback).lower()
+
+    text = slot("qcom", DEFAULT_MODEL)
+    if ui_state.chestnut_present:
+      # ASCII only: the font atlas is built from chr(32..126) plus translation
+      # glyphs, so a middle dot renders as "?" on this screen
+      text += " / " + slot("chestnut", DEFAULT_BIG_MODEL)
+    return text
 
   def _get_version_text(self) -> tuple[str, str, str, str] | None:
     version = ui_state.params.get("Version")
@@ -250,6 +328,16 @@ class MiciHomeLayout(Widget):
         self._version_commit_label.set_text(self._version_text[2])
         self._version_commit_label.set_position(version_pos.x, version_pos.y + self._date_label.font_size + 7)
         self._version_commit_label.render()
+
+      # VBSM_HUD: active driving models share the 2nd line -- right of the
+      # commit hash, or taking the line itself on a release branch (which has
+      # no commit). text_width is only valid after the label has rendered.
+      if self._model_text:
+        model_x = version_pos.x + (0 if release_branch else self._version_commit_label.text_width + 12)
+        self._model_label.set_max_width(self.rect.x + self.rect.width - model_x - HOME_PADDING)
+        self._model_label.set_text(self._model_text)
+        self._model_label.set_position(model_x, version_pos.y + self._date_label.font_size + 10)
+        self._model_label.render()
 
     # ***** Center-aligned bottom section icons *****
     usb_connected = ui_state.usb_connected

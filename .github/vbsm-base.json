@@ -1,0 +1,27 @@
+{
+  "base": "952484c1ab071a1ce1ac5bc1578e8579deb2dd66",
+  "files": [
+    "VBSM.md",
+    "CHESTNUT.md",
+    "MODS.md",
+    "openpilot/sunnypilot/vision_bsm.py",
+    "openpilot/sunnypilot/ui_watchdog.py",
+    "openpilot/system/manager/process.py",
+    "openpilot/system/manager/process_config.py",
+    "openpilot/selfdrive/car/card.py",
+    "openpilot/selfdrive/selfdrived/selfdrived.py",
+    "openpilot/selfdrive/ui/mici/layouts/settings/toggles.py",
+    "openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py",
+    "openpilot/system/athena/athenad.py",
+    "openpilot/sunnypilot/modeld_v2/modeld.py",
+    "openpilot/selfdrive/ui/mici/onroad/hud_renderer.py",
+    "openpilot/system/hardware/hardwared.py",
+    "openpilot/sunnypilot/chestnut_power.py",
+    "openpilot/sunnypilot/models/fetcher.py",
+    "openpilot/sunnypilot/mads/mads.py",
+    "openpilot/selfdrive/ui/mici/layouts/home.py",
+    "openpilot/selfdrive/pandad/pandad.py",
+    "openpilot/sunnypilot/parkwatchd.py",
+    "openpilot/system/hardware/power_monitoring.py"
+  ]
+}
