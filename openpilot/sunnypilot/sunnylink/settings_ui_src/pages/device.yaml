@@ -68,7 +68,7 @@ sections:
     title: GPU Power Limit
     description: Caps the chestnut GPU's package power (PPT) before the driving model loads. Use it when the enclosure runs
       from a 12V accessory outlet, whose wiring sags under the GPU's stock boost transients and can reset the USB link or hang
-      the model mid-drive. The driving model needs well under 60W. Stock leaves the GPU's own limit untouched. Takes effect at
+      the model mid-drive. Current driving models run within 60W. Stock leaves the GPU's own limit untouched. Takes effect at
       the next model load (ignition on).
     options:
     - value: 0
@@ -85,10 +85,6 @@ sections:
       label: 80W
     - value: 100
       label: 100W
-    - value: 120
-      label: 120W
-    - value: 150
-      label: 150W
     visibility:
     - type: capability
       field: device_type

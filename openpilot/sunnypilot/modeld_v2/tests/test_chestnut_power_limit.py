@@ -4,17 +4,9 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
 import openpilot.sunnypilot.modeld_v2.chestnut_power_limit as chestnut_power_limit
-
-
-class FakeParams:
-  def __init__(self, value):
-    self.value = value
-
-  def get(self, key, return_default=False):
-    assert key == "ChestnutPowerLimit"
-    return self.value
 
 
 class FakeSmuMod:
@@ -23,7 +15,7 @@ class FakeSmuMod:
 
 
 class FakeSmu:
-  def __init__(self, limit=150):
+  def __init__(self, limit=160):
     self.smu_mod = FakeSmuMod
     self.limit = limit
     self.calls = []
@@ -46,16 +38,20 @@ class FakeDevice:
 
 
 class TestChestnutPowerLimit(OpenpilotTestCase):
+  def setup_method(self):
+    self.params = Params()
+
   def test_default_is_stock(self):
-    assert chestnut_power_limit.get_power_limit(FakeParams(0)) == 0
-    assert chestnut_power_limit.get_power_limit(FakeParams(None)) == 0
+    assert chestnut_power_limit.get_power_limit(self.params) == 0
 
   def test_clamped_to_range(self):
     for raw, expected in ((80, 80), (10, chestnut_power_limit.POWER_LIMIT_MIN_W), (500, chestnut_power_limit.POWER_LIMIT_MAX_W), (-5, 0)):
-      assert chestnut_power_limit.get_power_limit(FakeParams(raw)) == expected
+      self.params.put("ChestnutPowerLimit", raw)
+      assert chestnut_power_limit.get_power_limit(self.params) == expected
 
-  def test_garbage_is_stock(self):
-    assert chestnut_power_limit.get_power_limit(FakeParams("abc")) == 0
+  def test_garbage_is_stock(self, monkeypatch):
+    monkeypatch.setattr(self.params, "get", lambda key, return_default=False: "abc")
+    assert chestnut_power_limit.get_power_limit(self.params) == 0
 
   def test_apply_sets_and_reads_back(self, monkeypatch):
     smu = FakeSmu()
