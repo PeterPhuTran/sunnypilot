@@ -22,6 +22,7 @@
     "openpilot/selfdrive/ui/mici/layouts/home.py",
     "openpilot/selfdrive/pandad/pandad.py",
     "openpilot/sunnypilot/parkwatchd.py",
-    "openpilot/system/hardware/power_monitoring.py"
+    "openpilot/system/hardware/power_monitoring.py",
+    "openpilot/selfdrive/locationd/locationd.py"
   ]
 }

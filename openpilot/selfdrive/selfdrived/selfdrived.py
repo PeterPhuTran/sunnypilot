@@ -61,6 +61,10 @@ TurnDirection = custom.ModelDataV2SP.TurnDirection
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 
 
+# VBSM_GPU_ALERTS: seconds after a load ends during which modelV2 gaps are the swap, not a failure
+BIG_MODEL_WARMUP_SEC = 5.
+
+
 class SelfdriveD(CruiseHelper):
   def __init__(self, CP=None, CP_SP=None):
     self.params = Params()
@@ -208,16 +212,25 @@ class SelfdriveD(CruiseHelper):
       self.startup_event = None
 
     loading = self.params.get_bool("ChestnutLoading")
+    big_active = self.params.get("ChestnutActive")
     if self.big_model_loading and not loading:
       self.big_model_ready_t = time.monotonic()
-      self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
+      # VBSM_GPU_ALERTS: "ready" only for a load that succeeded -- the loading
+      # flag drops on failure too, which flashed "Big Model Ready" two seconds
+      # after a real "Big Model Failed" (2026-09-13)
+      if big_active is True:
+        self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
     self.big_model_loading = loading
     if self.big_model_loading:
       self.events.add(EventName.bigModelLoading)
 
-    big_active = self.params.get("ChestnutActive")
     chestnut_present = self.sm['deviceState'].chestnutPresent
-    model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2']
+    # VBSM_GPU_ALERTS: modeld marks the big model active ~2 s before its first
+    # frame (it still loads the small model in between), so "active but no
+    # modelV2" inside the settling window is the load finishing, not a failure
+    # -- it raised a false "Big Model Failed" banner on 2026-09-13
+    big_model_settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + BIG_MODEL_WARMUP_SEC
+    model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2'] and not big_model_settling
     big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
     if big_failed and not self.big_model_failed:
       self.events.add(EventName.bigModelFailed)
@@ -484,8 +497,7 @@ class SelfdriveD(CruiseHelper):
     # generic catch-all. ideally, a more specific event should be added above instead
     has_disable_events = self.events.contains(ET.NO_ENTRY) and (self.events.contains(ET.SOFT_DISABLE) or self.events.contains(ET.IMMEDIATE_DISABLE))
     no_system_errors = (not has_disable_events) or (len(self.events) == num_events)
-    warmup_sec = 5.
-    big_model_settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + warmup_sec
+    big_model_settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + BIG_MODEL_WARMUP_SEC
     if not self.sm.all_checks() and no_system_errors and not big_model_settling:  # the load holds modelV2 and friends back on purpose
       if not self.sm.all_alive():
         self.events.add(EventName.commIssue)

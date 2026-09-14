@@ -132,3 +132,13 @@ contention up to 5 times 2 s apart before falling back (`VBSM_GPU_LOCK_RETRY`).
 filter boot records by their `created` window, not wall time; the rlog's `logMessage` keeps the full
 traceback when the swaglog files are noisy. `chestnutState.pcieLtssm/powerLimitW/powerDrawW` are only
 populated once modeld owns the AMD device — zeros before that are an artifact, not a dead link.
+
+**Follow-up (same day).** Why the driver stayed locked out after the fallback: the watchdog kick fired
+10 s after cruise was armed and threw the working SoC model away for a 35 s reload ("Big Model Loading /
+openpilot Unavailable"); two false alerts fired at the swap; and locationd, starved of camera odometry
+during the gap, rejected a 2 s burst of gyro samples whose unbounded counter then took ~10 minutes to
+decay — every engage refused with "locationd Temporary Error". Fixes: the kick now waits for cruise
+main off or Park; the alerts are gated on a real success and the settling window; the locationd counter
+is capped so recovery is bounded to ~30 s. A truly driveable reload (publish the SoC model while the big
+one loads) was evaluated and rejected for now: both models run their warp on the SoC GPU through
+tinygrad, which is not thread-safe, and a swap while engaged would trip the model-lagging soft disable.
