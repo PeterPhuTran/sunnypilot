@@ -197,7 +197,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   iterations before `DoShutdown` fires — kills the race where a shutdown latched in the same
   sampling window as an ignition rise and turned a departure into a double boot.
 
-## Managed files (19) and markers
+## Managed files (23) and markers
 
 | File | Mods | Markers |
 |---|---|---|
@@ -218,6 +218,11 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
 | `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap + fallback | `VBSM_GPU_FALLBACK`, `VBSM_GPU_PPT` |
 | `openpilot/system/hardware/hardwared.py` | §4 idle power, §6 shutdown debounce | `VBSM_GPU_IDLE` |
+| `MODS.md` | see the section named in the marker |  |
+| `openpilot/selfdrive/pandad/pandad.py` | see the section named in the marker |  |
+| `openpilot/sunnypilot/parkwatchd.py` | see the section named in the marker |  |
+| `openpilot/system/hardware/power_monitoring.py` | see the section named in the marker |  |
+| `openpilot/selfdrive/locationd/locationd.py` | see the section named in the marker | `VBSM_LOC_CAP` |
 
 Retired: `VBSM_COMPAT` (a modeld_v2 unpacking shim, superseded when upstream fixed the API
 properly); `VBSM_GPU_HUD` (a ui_state compiled-gate patch for bundle installs, superseded by
@@ -244,3 +249,7 @@ left the managed set with it).
   updates; clean with `find -user root` if updates fail on `git clean`.
 - The device RTC resets on offline boots: every boot's first minutes log into the same stale
   window, and crash files written pre-NTP carry stale names *and* mtimes.
+- **Committing managed files through the Git Data API**: tree entries carry the file mode and the API does not
+  inherit it; hardcoding `100644` stripped the executable bit from `modeld.py` on 2026-09-14 (manager exit
+  code 126, two drives with no model). Take each path's mode from `git ls-tree <parent> -- <path>`
+  (`pending/reapply_fixes_with_modes.py`) and verify exec bits plus a running modeld after every deploy.

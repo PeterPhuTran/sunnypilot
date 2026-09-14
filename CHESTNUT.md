@@ -142,3 +142,22 @@ main off or Park; the alerts are gated on a real success and the settling window
 is capped so recovery is bounded to ~30 s. A truly driveable reload (publish the SoC model while the big
 one loads) was evaluated and rejected for now: both models run their warp on the SoC GPU through
 tinygrad, which is not thread-safe, and a swap while engaged would trip the model-lagging soft disable.
+
+## Executable bit lost in an API commit (issue 9, 2026-09-14)
+
+**Symptom.** Two drives with no driving model at all: pulsing chestnut icon, "Posenet Speed Invalid / Speed
+Error: nan m/s", "Process Not Running: modeld_tinygrad". Nothing to do with the GPU.
+
+**Cause.** The lock-retry and fallback commits were written through the GitHub Git Data API with mode
+100644 for every file. `modeld.py` is 100755 in the tree and the `modeld_tinygrad` launcher execs it
+directly, so the manager logged "died with exitcode 126" (cannot execute) five times per drive and parked
+the process under the VBSM_RESTART per-drive cap. selfdrived.py and locationd.py lost the bit too but are
+imported, not exec'd.
+
+**Fix.** `chmod +x` on the running tree over comma prime's SSH proxy (`ssh.comma.ai`) during the drive; the
+manager's restart budget resets on the next ignition edge. On the branch: a rollback to the known-good tree,
+then the same fixes re-committed with every path's mode read from the parent tree.
+
+**Rules that came out of it.** Read modes with `git ls-tree <parent> -- <path>` for every API commit; after a
+deploy verify the exec bits with `ls -l` and that modeld_tinygrad is actually running, not just that the file
+compiles. Manager exit code 126 means "not executable" and 127 "not found"; neither is a Python error.
