@@ -113,6 +113,29 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   because a device that never came up has not shown it can run on this rail.
   Note the deliberate asymmetry: rail voltage is used to *permit a retry*, never to *pre-emptively
   veto* — as a veto it was refuted (route af ran 37 min with 869 samples below 12.5 V).
+- **Lock-contention retry** (`VBSM_GPU_LOCK_RETRY`, `modeld_v2/modeld.py`): tinygrad guards the USB
+  GPU with an exclusive flock (`/tmp/am_usb:<bus>-<dev>.lock`). On 2026-09-13 a cold boot's first
+  big-model attempt died 7 ms in on that lock ("Failed to acquire lock file am_usb:4-2.lock",
+  wrapped in tinygrad's "No interface for AMD:0" ExceptionGroup) and the fork fell straight to the
+  SoC model until the watchdog kick 2.5 min later, which loaded fine. Lock contention is transient
+  and never a brownout, so the loader now retries it up to 5 times 2 s apart (well inside the 60 s
+  loader budget) before giving up; every other failure keeps the one-attempt policy. Detection and
+  the `fuser` holder capture read the full traceback text — the old `str(e)` check never saw the
+  lock message inside the ExceptionGroup, which is why the 2026-09-13 holder went unrecorded.
+- **Kick only when the driver is not about to engage** (`VBSM_GPU_KICK_ARMED`, `ui_watchdog.py`): the
+  standstill/disengaged kick now also requires cruise main OFF or the car in Park. A kick throws a
+  working SoC model away for a ~35 s no-model reload; on 2026-09-13 it fired 10 s after the driver armed
+  cruise, refused two engages and starved locationd (see below). A boot-in-Park kick is invisible.
+- **Truthful big-model alerts** (`VBSM_GPU_ALERTS`, `selfdrived.py`): "Big Model Ready" only fires when
+  `ChestnutActive` is True at the end of loading (it also fired 2 s after a real failure), and "active
+  but no modelV2" is ignored inside the 5 s settling window (modeld marks the big model active ~2 s
+  before its first published frame, which raised a false "Big Model Failed" banner). `BIG_MODEL_WARMUP_SEC`
+  replaces the local `warmup_sec`.
+- **Bounded locationd lockout** (`VBSM_LOC_CAP`, `locationd.py`, NEW managed file): the invalid-input
+  counters are capped at limit+1. Unbounded, one 2 s burst of rejected gyro samples (the gyro/camera
+  yaw-rate cross-check has nothing to compare against during a camera-odometry gap) took ~10 minutes to
+  decay, during which every engage was refused with "locationd Temporary Error". Recovery after a fault
+  now ends within ~30 s; a persistent fault stays flagged. Upstream-worthy.
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
   `ChestnutActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything

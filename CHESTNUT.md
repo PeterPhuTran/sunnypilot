@@ -109,3 +109,36 @@ The mici HUD's eGPU icon, once un-gated for bundle installs: **pulsing** = loadi
 Rewiring (a fused battery tap) would remove the power ceiling entirely and is the "correct"
 hardware fix. The 80 W cap made it unnecessary for this use case: the model needs a fraction of
 that budget, so the outlet install — the whole point of a plug-in eGPU — stands.
+
+## Cold-boot lock contention (issue 8, 2026-09-13)
+
+**Symptom.** "Big Model Failed / Restart the car to retry" seconds into the first drive after a cold
+boot; the drive ran on the SoC model for ~2.5 min until the watchdog's standstill kick reloaded the
+eGPU, which then ran the rest of the drive clean. The driver's unplug/replug of the enclosure came
+after that drive had ended and changed nothing; the next start loaded first try like every warm start.
+
+**Cause.** The first attempt failed 7 ms after "loading model": tinygrad could not take its exclusive
+flock on the USB GPU (`Failed to acquire lock file am_usb:4-2.lock`), i.e. another process had the
+device open at that instant. The enclosure was healthy the whole time (13.7 V, 1.5 A idle). The error
+arrives wrapped in tinygrad's `ExceptionGroup: No interface for AMD:0 is available` — the first two
+sub-errors (no `/dev/kfd`, no PCI bus) are always true on a comma four; the lock error is the real one.
+
+**What was wrong in the fork.** The lock-holder capture keyed on `str(e)` of the outer group, which
+never contains the lock text, so `fuser` never ran and the holder went unrecorded. Fixed: detection
+reads the full traceback text, the capture runs on every contention, and the loader retries lock
+contention up to 5 times 2 s apart before falling back (`VBSM_GPU_LOCK_RETRY`).
+
+**Reading the logs.** The first minutes of a boot log with the stale Jul-28 clock until NTP syncs, so
+filter boot records by their `created` window, not wall time; the rlog's `logMessage` keeps the full
+traceback when the swaglog files are noisy. `chestnutState.pcieLtssm/powerLimitW/powerDrawW` are only
+populated once modeld owns the AMD device — zeros before that are an artifact, not a dead link.
+
+**Follow-up (same day).** Why the driver stayed locked out after the fallback: the watchdog kick fired
+10 s after cruise was armed and threw the working SoC model away for a 35 s reload ("Big Model Loading /
+openpilot Unavailable"); two false alerts fired at the swap; and locationd, starved of camera odometry
+during the gap, rejected a 2 s burst of gyro samples whose unbounded counter then took ~10 minutes to
+decay — every engage refused with "locationd Temporary Error". Fixes: the kick now waits for cruise
+main off or Park; the alerts are gated on a real success and the settling window; the locationd counter
+is capped so recovery is bounded to ~30 s. A truly driveable reload (publish the SoC model while the big
+one loads) was evaluated and rejected for now: both models run their warp on the SoC GPU through
+tinygrad, which is not thread-safe, and a swap while engaged would trip the model-lagging soft disable.
