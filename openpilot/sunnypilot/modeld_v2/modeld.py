@@ -390,53 +390,25 @@ def main(demo=False):
     # VBSM_GPU_FALLBACK: load into a separate name so a late-completing or
     # wedged loader thread can never clobber state after the timeout fires
     big_model = None
-    # VBSM_GPU_LOCK_RETRY: tinygrad guards the USB GPU with an exclusive flock
-    # (/tmp/am_usb:<bus>-<dev>.lock). At a cold boot another process can hold it
-    # for a moment (2026-09-13: the first attempt died 7 ms in on the lock, the
-    # watchdog's retry 2.5 min later loaded fine). Lock contention is transient
-    # and never a brownout, so it gets a short retry ladder instead of the
-    # straight fall to the SoC model; every other failure keeps the one-attempt
-    # policy. tinygrad wraps the lock error in an ExceptionGroup, so detection
-    # and the holder capture look at the full traceback text, not str(e).
-    GPU_LOCK_RETRIES = 5
-    GPU_LOCK_RETRY_S = 2.0
-
-    def _is_lock_contention(e: BaseException) -> bool:
-      import traceback
-      txt = "".join(traceback.format_exception(e))
-      return "acquire lock" in txt or "am_usb" in txt
-
-    def _log_lock_holder(attempt: int) -> None:
-      # capture the holder while it still exists
-      try:
-        import glob as _glob
-        import subprocess as _sp
-        for lk in _glob.glob("/tmp/am_usb:*.lock"):
-          r = _sp.run(["fuser", "-v", lk], capture_output=True, text=True, timeout=5)
-          cloudlog.event("eGPU lock holder", lock=lk, attempt=attempt, fuser=(r.stdout + r.stderr)[:500], error=True)
-      except Exception:
-        pass
-
     def load_big():
       nonlocal big_model
-      for attempt in range(1, GPU_LOCK_RETRIES + 1):
-        try:
-          apply_ppt_cap()
-          m = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
-          m.warmup()
-          big_model = m
-          if attempt > 1:
-            cloudlog.event("eGPU load succeeded after lock retry", attempts=attempt, error=False)
-          return
-        except Exception as e:
-          if _is_lock_contention(e):
-            _log_lock_holder(attempt)
-            if attempt < GPU_LOCK_RETRIES:
-              cloudlog.warning(f"eGPU lock busy, retry {attempt}/{GPU_LOCK_RETRIES - 1} in {GPU_LOCK_RETRY_S:.0f}s")
-              time.sleep(GPU_LOCK_RETRY_S)
-              continue
-          cloudlog.exception("chestnut load failed")
-          return
+      try:
+        apply_ppt_cap()
+        m = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
+        m.warmup()
+        big_model = m
+      except Exception as e:
+        # a lock-flavored failure means another process held the tinygrad
+        # USB-GPU device lock; capture the holder while it still exists
+        if "acquire lock" in str(e) or "am_usb" in str(e):
+          try:
+            import glob as _glob, subprocess as _sp
+            for lk in _glob.glob("/tmp/am_usb:*.lock"):
+              r = _sp.run(["fuser", "-v", lk], capture_output=True, text=True, timeout=5)
+              cloudlog.event("eGPU lock holder", lock=lk, fuser=(r.stdout + r.stderr)[:500], error=True)
+          except Exception:
+            pass
+        cloudlog.exception("chestnut load failed")
     loader = threading.Thread(target=load_big, daemon=True)
     loader.start()
     loader.join(BIG_MODEL_TIMEOUT)

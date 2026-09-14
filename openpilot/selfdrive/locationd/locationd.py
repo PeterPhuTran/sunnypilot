@@ -284,14 +284,6 @@ def main():
   input_invalid_limit = {s: round(INPUT_INVALID_LIMIT * (SERVICE_LIST[s].frequency / 20.)) for s in critcal_services}
   input_invalid_threshold = {s: input_invalid_limit[s] - 0.5 for s in critcal_services}
   input_invalid_decay = {s: calculate_invalid_input_decay(input_invalid_limit[s], INPUT_INVALID_RECOVERY, SERVICE_LIST[s].frequency) for s in critcal_services}
-  # VBSM_LOC_CAP: the counters were unbounded, so one burst of rejected samples
-  # (184 gyro samples in 2 s on 2026-09-13, when a 35 s camera-odometry gap
-  # starved the gyro/camera yaw-rate cross-check) took ~10 minutes of clean
-  # data to decay below the threshold, and openpilot refused every engage with
-  # "locationd Temporary Error" meanwhile. Capping at limit+1 keeps a persistent
-  # fault flagged (each bad sample re-pins the cap) but bounds recovery after
-  # the fault ends to the designed INPUT_INVALID_RECOVERY window.
-  input_invalid_cap = {s: input_invalid_limit[s] + 1 for s in critcal_services}
 
   initial_pose_data = params.get("LocationFilterInitialState")
   if initial_pose_data is not None:
@@ -326,10 +318,10 @@ def main():
 
           if res == HandleLogResult.TIMING_INVALID:
             cloudlog.warning(f"Observation {which} ignored due to failed timing check")
-            observation_input_invalid[which] = min(observation_input_invalid[which] + 1, input_invalid_cap[which])
+            observation_input_invalid[which] += 1
           elif res == HandleLogResult.INPUT_INVALID:
             cloudlog.warning(f"Observation {which} ignored due to failed sanity check")
-            observation_input_invalid[which] = min(observation_input_invalid[which] + 1, input_invalid_cap[which])
+            observation_input_invalid[which] += 1
           elif res == HandleLogResult.SUCCESS:
             observation_input_invalid[which] *= input_invalid_decay[which]
     else:

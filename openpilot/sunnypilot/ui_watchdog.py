@@ -344,15 +344,6 @@ class GpuKick:
       return
     if sm['carState'].vEgo > GPU_VEGO_MAX or sm['selfdriveState'].enabled:
       return
-    # VBSM_GPU_KICK_ARMED: a kick throws a working SoC model away for a ~35 s
-    # no-model reload. 2026-09-13 did that to a driver who had just armed
-    # cruise: two refused engages ("Big Model Loading"), then locationd lost
-    # its camera odometry during the gap and locked engagement out for the
-    # rest of the drive. Reload only while the driver is not about to engage:
-    # cruise main off, or the car in Park (a boot-in-Park kick is invisible).
-    cs = sm['carState']
-    if cs.cruiseState.available and str(cs.gearShifter) != 'park':
-      return
 
     # clear the veto only here, with the car stopped and disengaged and the kick
     # about to fire, so an eligible-but-ungated retry can never leave the GPU
