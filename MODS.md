@@ -201,14 +201,14 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 
 | File | Mods | Markers |
 |---|---|---|
-| `VBSM.md`, `CHESTNUT.md` | documentation | — |
+| `VBSM.md`, `CHESTNUT.md`, `MODS.md` | documentation | — |
 | `openpilot/sunnypilot/vision_bsm.py` | §1 (additive file) | — |
-| `openpilot/sunnypilot/ui_watchdog.py` | §3, §4 (additive file) | `VBSM_WATCHDOG`, `VBSM_GPU_KICK` |
+| `openpilot/sunnypilot/ui_watchdog.py` | §3, §4 (additive file) | `VBSM_WATCHDOG`, `VBSM_RESTART`, `VBSM_GPU_KICK`, `VBSM_GPU_KICK_ARMED`, `VBSM_GPU_RETRY` |
 | `openpilot/sunnypilot/chestnut_power.py` | §4 (additive file) | `VBSM_GPU_IDLE` |
 | `openpilot/system/manager/process.py` | §3 | `VBSM_RESTART` |
 | `openpilot/system/manager/process_config.py` | §1, §3 process entries | — |
 | `openpilot/selfdrive/car/card.py` | §1 | — |
-| `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §5 personality re-read + LKAS toggle | `VBSM`, `VBSM_HUD`, `VBSM_EXP_TOGGLE` |
+| `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §4 big-model alerts, §5 personality re-read + LKAS toggle | `VBSM_CHIME_HOLD`, `VBSM_CONFIG`, `VBSM_GPU_ALERTS`, `VBSM_HUD`, `VBSM_EXP_TOGGLE`, `VBSM_LKAS_REPURPOSED` |
 | `openpilot/sunnypilot/mads/mads.py` | §5 LKAS button freed for the toggle | `VBSM_EXP_TOGGLE` |
 | `openpilot/sunnypilot/models/fetcher.py` | §6 manifest storm fix | `VBSM_QUIET` |
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1 settings | `BigConfigControl` |
@@ -216,13 +216,12 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
-| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap + fallback | `VBSM_GPU_FALLBACK`, `VBSM_GPU_PPT` |
-| `openpilot/system/hardware/hardwared.py` | §4 idle power, §6 shutdown debounce | `VBSM_GPU_IDLE` |
-| `MODS.md` | see the section named in the marker |  |
-| `openpilot/selfdrive/pandad/pandad.py` | see the section named in the marker |  |
-| `openpilot/sunnypilot/parkwatchd.py` | see the section named in the marker |  |
-| `openpilot/system/hardware/power_monitoring.py` | see the section named in the marker |  |
-| `openpilot/selfdrive/locationd/locationd.py` | see the section named in the marker | `VBSM_LOC_CAP` |
+| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, lock retry | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_LOCK_RETRY` |
+| `openpilot/system/hardware/hardwared.py` | §2b park, §4 idle power, §6 shutdown debounce | `VBSM_GPU_IDLE`, `VBSM_PARK` |
+| `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events | `VBSM_PARKWATCH` |
+| `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
+| `openpilot/system/hardware/power_monitoring.py` | §2b parked energy budget | `VBSM_PARK` |
+| `openpilot/selfdrive/locationd/locationd.py` | §4 bounded lockout after a camera-odometry gap | `VBSM_LOC_CAP` |
 
 Retired: `VBSM_COMPAT` (a modeld_v2 unpacking shim, superseded when upstream fixed the API
 properly); `VBSM_GPU_HUD` (a ui_state compiled-gate patch for bundle installs, superseded by
