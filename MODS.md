@@ -113,6 +113,15 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   because a device that never came up has not shown it can run on this rail.
   Note the deliberate asymmetry: rail voltage is used to *permit a retry*, never to *pre-emptively
   veto* — as a veto it was refuted (route af ran 37 min with 869 samples below 12.5 V).
+- **Lock-contention retry** (`VBSM_GPU_LOCK_RETRY`, `modeld_v2/modeld.py`): tinygrad guards the USB
+  GPU with an exclusive flock (`/tmp/am_usb:<bus>-<dev>.lock`). On 2026-09-13 a cold boot's first
+  big-model attempt died 7 ms in on that lock ("Failed to acquire lock file am_usb:4-2.lock",
+  wrapped in tinygrad's "No interface for AMD:0" ExceptionGroup) and the fork fell straight to the
+  SoC model until the watchdog kick 2.5 min later, which loaded fine. Lock contention is transient
+  and never a brownout, so the loader now retries it up to 5 times 2 s apart (well inside the 60 s
+  loader budget) before giving up; every other failure keeps the one-attempt policy. Detection and
+  the `fuser` holder capture read the full traceback text — the old `str(e)` check never saw the
+  lock message inside the ExceptionGroup, which is why the 2026-09-13 holder went unrecorded.
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
   `ChestnutActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything
