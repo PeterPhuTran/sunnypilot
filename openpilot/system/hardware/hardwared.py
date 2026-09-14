@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import fcntl
+import json
+import datetime
 import os
 import queue
 import struct
@@ -10,7 +12,7 @@ import time
 from collections import OrderedDict, namedtuple
 
 import openpilot.cereal.messaging as messaging
-from openpilot.cereal import log
+from openpilot.cereal import log, custom
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.utils import strip_deprecated_keys
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -25,7 +27,8 @@ from openpilot.common.linux import LinuxSystemStats
 from openpilot.system.loggerd.config import get_available_percent
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.system.statsd import statlog
-from openpilot.system.hardware.power_monitoring import PowerMonitoring
+from openpilot.sunnypilot.models.helpers import get_active_model_runner
+from openpilot.system.hardware.power_monitoring import PowerMonitoring, PARK_SHUTDOWN_LOG
 from openpilot.system.hardware.fan_controller import FanController
 from openpilot.system.hardware.chestnut.status import ChestnutStatus
 from openpilot.common.version import terms_version, training_version, get_build_metadata, terms_version_sp
@@ -50,6 +53,11 @@ class Chestnut:
     self.last_attempt = 0.
     self.flashed = False
     self.mismatch = False
+    self.rails_state: str | None = None
+    self.offroad_since: float | None = None
+    self.power_thread: threading.Thread | None = None
+    self.power_attempts = 0
+    self.last_power = 0.
 
   @property
   def failed(self) -> bool:
@@ -61,7 +69,71 @@ class Chestnut:
     cloudlog.event("chestnut flash done", returncode=ret.returncode, output=ret.stdout[-1000:], error=ret.returncode != 0)
     self.flashed = ret.returncode == 0
 
+  # VBSM_GPU_IDLE: cut the GPU rails while parked. The enclosure holds 12V on
+  # some car-off transitions and idles at ~25-40W straight off the small hybrid
+  # 12V battery (measured; resting voltage sagged to 11.7V with five
+  # low-voltage shutdowns during one bench week). The F3 rail switch is
+  # hardware-validated in both directions on fw ed4e39b7: off collapses draw
+  # 2A -> 1mA, on restores with the PCIe link retraining to L0 first try.
+  # OFF only after sustained offroad (manager has long stopped modeld, nothing
+  # holds the device); ON strictly on the offroad->onroad edge so a hardwared
+  # restart mid-drive never touches the bus while modeld owns the GPU. Both
+  # commands are idempotent; modeld's own retry+veto ladder is the backstop if
+  # the ON edge ever loses a race. Opt out: touch /data/vbsm_no_gpu_idle_off.
+  IDLE_CUT_S = 120.
+  POWER_RETRY_S = 15.
+  MAX_POWER_ATTEMPTS = 4
+
+  def _power(self, enable: bool) -> None:
+    cmd = "on" if enable else "off"
+    # -B: a root python writing __pycache__ into the tree breaks the updater's
+    # git clean as user comma, silently blocking ALL updates (bit us once)
+    ret = subprocess.run(["sudo", sys.executable, "-B", os.path.join(BASEDIR, "openpilot/sunnypilot/chestnut_power.py"), cmd],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=30)
+    ok = ret.returncode == 0
+    cloudlog.event("chestnut gpu rails", cmd=cmd, success=ok, output=ret.stdout[-200:], error=not ok)
+    if ok:
+      self.rails_state = cmd
+
+  def _update_rails(self, offroad: bool, present: bool) -> None:
+    now = time.monotonic()
+    if not present or os.path.exists("/data/vbsm_no_gpu_idle_off"):
+      self.rails_state = None
+      self.offroad_since = None
+      return
+    if self.power_thread is not None and self.power_thread.is_alive():
+      return
+
+    if offroad:
+      if self.offroad_since is None:
+        self.offroad_since = now
+        self.power_attempts = 0
+      want = "off"
+      ready = now - self.offroad_since >= self.IDLE_CUT_S
+    else:
+      if self.offroad_since is not None:
+        self.power_attempts = 0
+      self.offroad_since = None
+      want = "on"
+      # edge-only: rails_state None at startup mid-drive means "leave it alone"
+      ready = self.rails_state == "off"
+
+    if not ready or self.rails_state == want:
+      return
+    if self.power_attempts >= self.MAX_POWER_ATTEMPTS or now - self.last_power < self.POWER_RETRY_S:
+      return
+    self.power_attempts += 1
+    self.last_power = now
+    self.power_thread = threading.Thread(target=self._power, args=(want == "on",), daemon=True)
+    self.power_thread.start()
+
   def update(self, offroad: bool, usb_state: list[dict]) -> None:
+    # VBSM_GPU_IDLE: the rail switch keys on the real device only (not the
+    # bootloader ids) -- upstream dropped the bare id tuples in favour of this
+    # helper, so the presence test goes through it too
+    present = any(is_chestnut_usb_id(d["vendorId"], d["productId"]) for d in usb_state)
+    self._update_rails(offroad, present)
+
     self.mismatch = any(is_chestnut_usb_id(d["vendorId"], d["productId"], include_bootloader=True) and
                         d["product"] != CHESTNUT_USB_PRODUCT for d in usb_state)
     if not self.mismatch:
@@ -106,6 +178,30 @@ OFFROAD_DANGER_TEMP = 85 if HARDWARE.get_device_type() == "mici" else 75
 
 prev_offroad_states: dict[str, tuple[bool, str | None]] = {}
 
+
+
+def _record_park_shutdown(power_monitor, off_ts: float | None) -> None:
+  """VBSM_PARK: one JSON line per shutdown decision -- which rule fired
+  (timer / voltage / budget / force), the balance and voltages at that moment,
+  and both clocks (the wall clock can be stale-from-boot; the monotonic one is
+  not). Never allowed to block the shutdown itself. Bounded to the last 300."""
+  try:
+    rec = power_monitor.shutdown_record()
+    rec.update({"wall_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                "uptime_s": round(time.monotonic(), 1), "offroad_since_mono": round(off_ts, 1) if off_ts else None})
+    lines = []
+    try:
+      with open(PARK_SHUTDOWN_LOG) as f:
+        lines = f.readlines()[-299:]
+    except OSError:
+      pass
+    lines.append(json.dumps(rec, separators=(",", ":")) + "\n")
+    with open(PARK_SHUTDOWN_LOG + ".tmp", "w") as f:
+      f.writelines(lines)
+    os.replace(PARK_SHUTDOWN_LOG + ".tmp", PARK_SHUTDOWN_LOG)
+    cloudlog.event("vbsm park shutdown", **{k: rec[k] for k in ("reason", "offroad_s", "capacity_wh", "used_wh", "lpf_mV")})
+  except Exception:
+    cloudlog.exception("vbsm park shutdown record failed")
 
 
 def set_offroad_alert_if_changed(offroad_alert: str, show_alert: bool, extra_text: str | None=None):
@@ -229,6 +325,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   should_start_prev = False
   in_car = False
   engaged_prev = False
+  shutdown_ticks = 0
   pwrsave = False
   offroad_cycle_count = 0
 
@@ -309,9 +406,18 @@ def hardware_thread(end_event, hw_queue) -> None:
     chestnut.update(started_ts is None, last_hw_state.usb_state)
     chestnut_state = sm["chestnutState"]
     chestnut_valid = sm.alive["chestnutState"] and sm.valid["chestnutState"]
+    # VBSM_GPU_IDLE-adjacent: Offroad_ChestnutUncompiled keys on the STOCK big
+    # model's compiled pkl, which never exists for a tinygrad bundle in the
+    # chestnut slot and never needs to. Upstream's own UI already treats
+    # runner==tinygrad as compiled (selfdrive/ui/sunnypilot/ui_state.py) but
+    # status.py does not, so bundle users would carry the alert forever.
+    def _chestnut_alert(name: str, show: bool, extra_text: str | None = None) -> None:
+      if name == "Offroad_ChestnutUncompiled" and show and           int(get_active_model_runner(params)) == int(custom.ModelManagerSP.Runner.tinygrad):
+        show = False
+      set_offroad_alert_if_changed(name, show, extra_text)
     chestnut_status.update(started_ts is None, branch, last_hw_state.usb_state, chestnut.failed,
                            params.get_bool("ChestnutLoading"), params.get("ChestnutActive"),
-                           chestnut_state if chestnut_valid else None, set_offroad_alert_if_changed)
+                           chestnut_state if chestnut_valid else None, _chestnut_alert)
     # this subset is only used for offroad
     temp_sources = [
       msg.deviceState.memoryTempC,
@@ -448,9 +554,18 @@ def hardware_thread(end_event, hw_queue) -> None:
     msg.deviceState.somPowerDrawW = som_power_draw
 
     # Check if we need to shut down
+    # VBSM_GPU_IDLE-adjacent: require the decision to hold for 2 consecutive
+    # iterations. Observed once: the shutdown latched in the same sampling
+    # window as an ignition rise, turning a normal departure into a
+    # stale-clock cold boot ("logo, reboot, then clean start").
     if power_monitor.should_shutdown(onroad_conditions["ignition"], in_car, off_ts, started_seen):
-      cloudlog.warning(f"shutting device down, offroad since {off_ts}")
-      params.put_bool("DoShutdown", True, block=True)
+      shutdown_ticks += 1
+      if shutdown_ticks >= 2:
+        cloudlog.warning(f"shutting device down, offroad since {off_ts}")
+        _record_park_shutdown(power_monitor, off_ts)
+        params.put_bool("DoShutdown", True, block=True)
+    else:
+      shutdown_ticks = 0
 
     msg.deviceState.started = started_ts is not None and not offroad_mode
     msg.deviceState.startedMonoTime = int(1e9*(started_ts or 0))

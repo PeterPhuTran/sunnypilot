@@ -76,12 +76,157 @@ def check_panda_support(panda_serials: list[str]) -> list[str]:
   return []
 
 
+# ---------------------------------------------------------------- parkwatch
+# VBSM_PARKWATCH: the C++ pandad puts the panda into power save the instant
+# ignition goes away, and power save calls enable_can_transceivers(false). That
+# leaves the device physically deaf to the ~5s body-CAN wake bursts a parked
+# Toyota emits when it is locked or unlocked -- measured on this car 2026-08-30:
+# the bus is silent between events, wakes for 5.0-5.8s on each lock/unlock/door,
+# and every burst re-announces DOOR_LOCKS (0x638).
+#
+# pandad ships as a committed binary and this device has no capnp headers, so
+# the source cannot be patched into effect. Instead we stand in for it: on the
+# ignition-off edge we stop the C++ child and run a small Python loop that holds
+# the transceivers on and republishes `can`, handing the panda straight back the
+# moment ignition returns.
+#
+# Deliberately publishes NO pandaStates. hardwared forces ignition False when
+# pandaStates goes stale (see DISCONNECT_TIMEOUT in hardwared.py), so a silent
+# window is the *safe* failure mode: the worst case is that the device stays
+# offroad until the C++ pandad is back, a couple of seconds after ignition.
+# Publishing a pandaStates ourselves would risk asserting a wrong ignition for
+# the whole window, which is the one outcome that actually matters.
+
+PARKWATCH_CONF = "/data/parkwatch_seconds"
+PARKWATCH_MAX_S = 2400
+
+# set by pandad's signal handler so a manager shutdown cuts the window short
+_PW = {"exit": False}
+
+
+def _parkwatch_window_s() -> int:
+  try:
+    with open(PARKWATCH_CONF) as f:
+      return max(0, min(int(f.read().strip() or 0), PARKWATCH_MAX_S))
+  except (OSError, ValueError):
+    return 0
+
+
+def _parkwatch_run(window_s: int) -> None:
+  """Own the panda while parked, republishing `can` so parkwatchd sees bursts."""
+  from openpilot.cereal import messaging
+  from opendbc.car.structs import CarParams
+
+  pm = messaging.PubMaster(["can"])
+  p = None
+  t_end = time.monotonic() + window_s
+  try:
+    for _ in range(10):
+      try:
+        # disable_checks=True (the default) already clears power save and
+        # disables the panda's heartbeat timeout
+        p = Panda()
+        break
+      except Exception:
+        time.sleep(1)
+    if p is None:
+      cloudlog.error("parkwatch: could not claim panda, handing back")
+      return
+
+    p.set_heartbeat_disabled()
+    p.set_power_save(0)
+    # noOutput keeps the harness relay closed -- the same electrical state the
+    # car sits in while parked normally, stock camera connected
+    p.set_safety_mode(CarParams.SafetyModel.noOutput)
+    cloudlog.event("parkwatch window start", window_s=window_s)
+
+    last_health = 0.0
+    while time.monotonic() < t_end and not _PW["exit"]:
+      now = time.monotonic()
+      if now - last_health > 0.2:
+        last_health = now
+        h = p.health()
+        if h["ignition_line"] or h["ignition_can"]:
+          cloudlog.event("parkwatch window end", reason="ignition")
+          return
+        if h["power_save_enabled"]:
+          p.set_power_save(0)
+
+      msgs = p.can_recv()
+      if msgs:
+        evt = messaging.new_message("can", len(msgs))
+        evt.valid = True
+        for i, m in enumerate(msgs):
+          addr, dat, src = m[0], m[-2], m[-1]
+          evt.can[i].address = addr
+          evt.can[i].dat = bytes(dat)
+          evt.can[i].src = src
+        pm.send("can", evt)
+      else:
+        time.sleep(0.02)
+    cloudlog.event("parkwatch window end", reason="exit" if _PW["exit"] else "timeout")
+  except Exception:
+    cloudlog.exception("parkwatch: window failed, handing panda back")
+  finally:
+    try:
+      if p is not None:
+        p.set_power_save(1)
+        p.close()
+    except Exception:
+      cloudlog.exception("parkwatch: panda cleanup failed")
+
+
+def _supervise(process) -> None:
+  """Wait for the C++ pandad, but take the panda over on the ignition-off edge.
+
+  Requires an observed True->False transition, so relaunching while already
+  parked (which is exactly what happens when a window ends) cannot re-trigger:
+  one window per drive.
+  """
+  from openpilot.cereal import messaging
+
+  window_s = _parkwatch_window_s()
+  if window_s <= 0:
+    process.wait()
+    return
+
+  sm = messaging.SubMaster(["pandaStates"])
+  seen_ignition = False
+  while True:
+    if process.poll() is not None:
+      return
+    sm.update(500)
+    if not sm.updated["pandaStates"] or len(sm["pandaStates"]) == 0:
+      continue
+
+    ps = sm["pandaStates"][0]
+    if bool(ps.ignitionLine) or bool(ps.ignitionCan):
+      seen_ignition = True
+    elif seen_ignition:
+      # re-read at the edge: the window can be changed (or the feature turned
+      # off) without waiting for a pandad restart
+      window_s = _parkwatch_window_s()
+      if window_s <= 0:
+        process.wait()
+        return
+      cloudlog.event("parkwatch handoff", window_s=window_s)
+      process.send_signal(signal.SIGINT)
+      try:
+        process.wait(timeout=10)
+      except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+      _parkwatch_run(window_s)
+      return  # outer loop relaunches the real pandad
+
+
 def main() -> None:
   # signal pandad to close the relay and exit
   def signal_handler(signum, frame):
     cloudlog.info(f"Caught signal {signum}, exiting")
     nonlocal do_exit
     do_exit = True
+    _PW["exit"] = True
     if process is not None:
       process.send_signal(signal.SIGINT)
 
@@ -130,7 +275,7 @@ def main() -> None:
         # run real pandad
         os.environ['MANAGER_DAEMON'] = 'pandad'
         process = subprocess.Popen(["./pandad"], cwd=os.path.join(BASEDIR, "openpilot/selfdrive/pandad"))
-        process.wait()
+        _supervise(process)
     # TODO: wrap all panda exceptions in a base panda exception
     except (usb1.USBErrorNoDevice, usb1.USBErrorPipe):
       # a panda was disconnected while setting everything up. let's try again
