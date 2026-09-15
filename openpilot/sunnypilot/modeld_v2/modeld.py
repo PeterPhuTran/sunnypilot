@@ -337,11 +337,15 @@ class ModelState(ModelStateBase):
 # writes the PCIe power bit at most once and only with 12 V present, and waits,
 # bounded, for L0. A dead outlet or an absent bridge fails fast without a strike; a
 # link that never trains with 12 V present skips the open (nothing to leak) and takes
-# the SoC fallback -- the ui_watchdog kick stays the safety net. The wait ends by pid
-# age 22 s so 22 + 60 (loader budget) + ~3 (small model) stays under ui_watchdog's
-# 90 s load deadline (both measured from pid age, imports included).
+# the SoC fallback -- the ui_watchdog kick stays the safety net. The wait ends 22 s
+# after main() starts, so 22 + 60 (loader budget) + ~3 (small model) stays under
+# ui_watchdog's 90 s load deadline: the watchdog matches ".modeld" in the cmdline,
+# which only appears at setproctitle() a few ms into main(), and polls every 2 s, so
+# its clock starts at or after ours. Imports (4-11 s warm, longer cold) come before
+# main() and must not shrink the link budget (they did in e8b7e968, which counted
+# from process start).
 CHESTNUT_READY_TIMEOUT_S = 20.0
-CHESTNUT_READY_END_BY_S = 22.0
+CHESTNUT_READY_END_BY_S = 22.0   # after main() entry, see above
 CHESTNUT_READY_POLL_S = 0.5
 CHESTNUT_F3_TIMEOUT_MS = 10000   # tinygrad's own timeout for the PCIe power write
 CHESTNUT_F3_RESEND_S = 10.0      # re-send F3=1 only if the LTSSM is still in Detect this long after the last write
@@ -349,6 +353,7 @@ CHESTNUT_POWERED_MV = 5000       # helpers.CHESTNUT_POWERED_VOLTAGE
 CHESTNUT_PCIE_L0 = 0x78
 CHESTNUT_LOCK_DIR = "/tmp"
 _last_f3 = float("-inf")
+_f3_writes = 0
 
 
 def proc_start_monotonic() -> float:
@@ -363,6 +368,9 @@ def proc_start_monotonic() -> float:
     return time.monotonic() - age_s
   except Exception:
     return time.monotonic()
+
+
+PROC_START = proc_start_monotonic()
 
 
 def chestnut_lock_fds() -> list[int]:
@@ -426,18 +434,22 @@ def chestnut_raw() -> tuple[int, int, int] | None:
 
 def chestnut_f3_on() -> bool:
   """ONE PCIe power-on write (0xF3=1) with tinygrad's timeout; own fd; False on any exception."""
-  global _last_f3
+  global _last_f3, _f3_writes
   import fcntl
   from openpilot.system.hardware.chestnut.flash import Ctrl, USBDEVFS_CONTROL, find_chestnut, open_device
   try:
     path, _, _ = find_chestnut()
     if not path:
       return False
+  except Exception:
+    return False
+  _last_f3 = time.monotonic()   # an attempt, successful or not: a failed write must not re-arm an immediate resend
+  _f3_writes += 1
+  try:
     fd = open_device(path)
   except Exception:
     return False
   try:
-    _last_f3 = time.monotonic()
     fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0x40, 0xF3, 1, 0, 0, CHESTNUT_F3_TIMEOUT_MS, None))
     return True
   except Exception:
@@ -450,14 +462,15 @@ def chestnut_fields(raw) -> dict:
   return {"supply_mv": raw[0], "supply_ma": raw[1], "ltssm": f"0x{raw[2]:02x}"} if raw else {"supply_mv": None, "supply_ma": None, "ltssm": None}
 
 
-def wait_chestnut_ready(t_start: float) -> str:
-  """'ready' | 'timeout' | 'no_12v' | 'absent' | 'probe_error'. Never raises. Read-first: F3=1 only with 12 V and the link down."""
+def wait_chestnut_ready(t_main: float) -> str:
+  """'ready' | 'timeout' | 'no_12v' | 'absent' | 'probe_error'. Never raises. Read-first: F3=1 only with 12 V and the link
+  down; the preflight's write counts (f3_total), so a cold boot normally shows f3_writes=0 here and f3_total=1."""
   t0 = time.monotonic()
   reads = f3 = misses = unpowered = 0
   raw = None
   reason = "timeout"
   try:
-    deadline = min(t0 + CHESTNUT_READY_TIMEOUT_S, t_start + CHESTNUT_READY_END_BY_S)
+    deadline = min(t0 + CHESTNUT_READY_TIMEOUT_S, t_main + CHESTNUT_READY_END_BY_S)
     deadline = max(deadline, t0 + 2.0)
     while True:
       raw = chestnut_raw()
@@ -488,8 +501,8 @@ def wait_chestnut_ready(t_start: float) -> str:
   except Exception:
     cloudlog.exception("chestnut link probe error")
     return "probe_error"
-  fields = dict(reason=reason, reads=reads, f3_writes=f3, wait_s=round(time.monotonic() - t0, 1),
-                pid_age_s=round(time.monotonic() - t_start, 1), **chestnut_fields(raw))
+  fields = dict(reason=reason, reads=reads, f3_writes=f3, f3_total=_f3_writes, wait_s=round(time.monotonic() - t0, 1),
+                main_age_s=round(time.monotonic() - t_main, 1), pid_age_s=round(time.monotonic() - PROC_START, 1), **chestnut_fields(raw))
   if reason == "ready":
     cloudlog.event("chestnut link ready", error=False, **fields)
   else:
@@ -498,7 +511,7 @@ def wait_chestnut_ready(t_start: float) -> str:
 
 
 def main(demo=False):
-  t_start = proc_start_monotonic()
+  t_main = time.monotonic()   # ui_watchdog's clock starts at the setproctitle() just below (see VBSM_GPU_READY)
   cloudlog.warning("modeld init")
 
   sentry.set_tag("daemon", PROCESS_NAME)
@@ -527,10 +540,12 @@ def main(demo=False):
     try:
       from tinygrad.device import Device
       raw = chestnut_raw()
-      cloudlog.event("chestnut preflight", dev=os.environ.get("DEV"), amd_opened=("AMD" in Device._opened_devices),
-                     lock_fds=len(chestnut_lock_fds()), pid_age_s=round(time.monotonic() - t_start, 1), error=False, **chestnut_fields(raw))
+      f3_written = None
       if raw is not None and raw[0] >= CHESTNUT_POWERED_MV and raw[2] != CHESTNUT_PCIE_L0:
-        chestnut_f3_on()
+        f3_written = chestnut_f3_on()
+      cloudlog.event("chestnut preflight", dev=os.environ.get("DEV"), amd_opened=("AMD" in Device._opened_devices),
+                     lock_fds=len(chestnut_lock_fds()), pid_age_s=round(time.monotonic() - PROC_START, 1), f3_written=f3_written,
+                     ltssm_after=(f"0x{r[2]:02x}" if f3_written and (r := chestnut_raw()) else None), error=False, **chestnut_fields(raw))
     except Exception:
       cloudlog.exception("chestnut preflight failed")
 
@@ -608,6 +623,7 @@ def main(demo=False):
 
     def load_big():
       nonlocal big_model
+      cloudlog.bind(daemon=PROCESS_NAME)   # the daemon tag is thread-local; without this the loader's lines carry none
       for attempt in range(1, GPU_LOCK_RETRIES + 1):
         fds_before = chestnut_lock_fds()
         t_attempt = time.monotonic()
@@ -640,7 +656,7 @@ def main(demo=False):
     loader = threading.Thread(target=load_big, daemon=True)
     # VBSM_GPU_READY: probe in the main thread so the 60 s loader budget still covers
     # the load alone; an unstarted loader reads as "finished, no model"
-    ready_reason = wait_chestnut_ready(t_start)
+    ready_reason = wait_chestnut_ready(t_main)
     if ready_reason in ("ready", "probe_error"):
       loader.start()
       loader.join(BIG_MODEL_TIMEOUT)

@@ -128,15 +128,21 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   status`; own fd, no tinygrad, no lock). With 12 V present and the link down it writes the PCIe power bit (0xF3=1)
   once, right after the `ChestnutLoading` param so link training overlaps the vision-stream wait, re-sends it only if
   the LTSSM is still in Detect 10 s later, and polls at 2 Hz until L0 (0x78) or the budget ends: 20 s, and in any
-  case by pid age 22 s, so probe + the 60 s loader budget + the SoC load stay inside ui_watchdog's 90 s deadline.
+  case 22 s after `main()` entry, so probe + the 60 s loader budget + the SoC load stay inside ui_watchdog's 90 s
+  deadline (the watchdog matches `.modeld` in the cmdline, which only appears at `setproctitle()` inside `main()`, and
+  polls every 2 s, so its clock starts at or after modeld's; e8b7e968 counted from process start and let a slow
+  import shrink the link budget).
   Outcomes: `ready` opens; `no_12v` (three reads under 5 V, a dead outlet) and `absent` (six failed reads) skip the
   open without a strike toward the boot veto, so the kick may retry later; `timeout` (12 V present, link never
   trained) skips the open and counts a strike; `probe_error` opens anyway. Events: `chestnut preflight` (state at
-  start: DEV, opened devices, lock fds, supply, LTSSM), `chestnut link ready` / `chestnut link not ready` (reason,
-  reads, F3 writes, wait, pid age, supply, LTSSM), `eGPU load skipped; link not ready`, and `open_ms` on
+  start: DEV, opened devices, lock fds, supply, LTSSM, whether the power bit was written and the LTSSM right after),
+  `chestnut link ready` / `chestnut link not ready` (reason, reads, F3 writes in the wait and in total, wait, age since
+  main and since exec, supply, LTSSM), `eGPU load skipped; link not ready`, and `open_ms` on
   `chestnut ppt limit` (duration of the first open). The first revision (e0c253de: 1 Hz `flash.link_up()` polling)
   wrote 0xF3=1 on every probe, live link included, and its 20 s could overrun the watchdog deadline; it was replaced
-  before its first drive.
+  before its first drive. First drive on e8b7e968 (2026-09-14 20:08 and 20:23 PT): both starts warm (hardwared's
+  rails-on had trained the link), preflight LTSSM 0x78, ready on the first read, open 4.4 s / 1.9 s, big model from the
+  first process in 26 s / 23 s, 100 % big frames, 0 % drops; the cold-boot link-down path is still unobserved.
 - **Lock-contention retry, revised** (`VBSM_GPU_LOCK_RETRY`, `modeld_v2/modeld.py`): every failed open logs
   `eGPU open failed` with each sub-exception's type@file:line, whether it failed inside tinygrad's flock, the lock
   fds this process held before and after, and the elapsed time. One retry (2 s later) is attempted only when the

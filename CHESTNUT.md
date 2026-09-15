@@ -184,9 +184,12 @@ probe (verified: importing the module opens nothing).
 imported. Before the first open, read the bridge's supply voltage and LTSSM over usbdevfs (the read-only control
 transfers `chestnut_power.py status` uses; own fd, no tinygrad, no lock). With 12 V present and the link down, write
 0xF3=1 once, right after the `ChestnutLoading` param so training overlaps the vision-stream wait, re-send only if the
-LTSSM is still in Detect (0x00/0x01) 10 s later, and poll at 2 Hz until L0 (0x78) or the budget ends: 20 s, and by
-pid age 22 s at the latest, so probe + the 60 s loader budget + the SoC load stay inside ui_watchdog's 90 s deadline
-(the pid age comes from `/proc/self/stat`, never the wall clock, which jumps at the boot-time NTP sync). `no_12v`
+LTSSM is still in Detect (0x00/0x01) 10 s later, and poll at 2 Hz until L0 (0x78) or the budget ends: 20 s, and
+22 s after `main()` entry at the latest, so probe + the 60 s loader budget + the SoC load stay inside ui_watchdog's
+90 s deadline. The watchdog finds modeld by the `.modeld` proctitle, which only exists from `setproctitle()` inside
+`main()`, and polls every 2 s, so its clock starts at or after modeld's own; the first cut (e8b7e968) counted from
+process start (`/proc/self/stat`) and a slow import (4.4 s and 10.8 s on two warm starts) ate the link budget for no
+reason. Ages since exec and since `main()` are both logged; never the wall clock, which jumps at the boot-time NTP sync. `no_12v`
 (dead outlet) and `absent` skip the open without a strike, so the kick can retry once the outlet is live; `timeout`
 skips the open and counts a strike; a probe bug (`probe_error`) opens anyway. Retry an open only when the failure was
 raised inside tinygrad's `flock_acquire` while the process held no lock fd beforehand (an external holder), after
@@ -202,6 +205,10 @@ flock still leaves an unlocked fd behind.
 open in a throwaway process fails at usb.py:143 with one leaked fd and classifies as not retryable; a second open in
 that process fails at the flock on its own fd and is refused; with an external holder of `/tmp/am_usb:4-2.lock` the
 first open fails at the flock with no prior fd, the retry passes the flock once the holder is gone, and `sudo fuser`
-names the holder. The 12 V paths (`ready` with one F3 write, the first open's `open_ms`, `timeout`) can only be
-observed at the next ignition: expect, from the first modeld pid, `chestnut preflight ... ltssm=0x00`, `chestnut
-link ready reason=ready f3_writes=1 wait_s=X`, `chestnut ppt limit ... open_ms`, `models loaded in ~21s`.
+names the holder. First drive on e8b7e968 (2026-09-14 20:08 and 20:23 PT,
+routes 00000100 and 00000101): both starts were warm, hardwared's rails-on at the onroad edge had trained the link 3 s
+before the preflight (LTSSM 0x78, no write, ready on the first read), open 4434 ms then 1949 ms, big model from the
+first process in 26.0 s / 23.1 s, `bigModelReady` once per start, 100 % big frames and 0 % dropped frames over 38
+segments. The cold-boot link-down path (preflight LTSSM != 0x78 with 12 V, one F3 write, polling) is still
+unobserved: expect, from the first modeld pid, `chestnut preflight ... ltssm=0x00 f3_written=true`, `chestnut link
+ready reason=ready f3_writes=0 f3_total=1 wait_s=X`, `chestnut ppt limit ... open_ms`, `models loaded in ~25s`.
