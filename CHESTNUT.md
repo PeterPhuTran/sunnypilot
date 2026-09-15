@@ -180,12 +180,28 @@ open loses the same link race, so by the time `load_big()` runs the process is a
 2026-09-13 failure hit the lock 7 ms in with no other holder. Pinning `DEV=QCOM` before tinygrad is imported removes the
 probe (verified: importing the module opens nothing).
 
-**Fix.** Probe readiness before the first open with `flash.link_up()`, which powers PCIe on and reports the link without
-tinygrad (verified to run as the comma user), bounded to 20 s in the main thread so the 60 s loader budget still covers
-the load; never open when the probe times out; retry only on an external lock holder (no leaked fd); log every failed
-open with the real sub-exceptions and the leaked-fd count.
+**Fix (revision 2, same day; the first revision e0c253de never drove).** Pin `DEV=QCOM` before tinygrad is
+imported. Before the first open, read the bridge's supply voltage and LTSSM over usbdevfs (the read-only control
+transfers `chestnut_power.py status` uses; own fd, no tinygrad, no lock). With 12 V present and the link down, write
+0xF3=1 once, right after the `ChestnutLoading` param so training overlaps the vision-stream wait, re-send only if the
+LTSSM is still in Detect (0x00/0x01) 10 s later, and poll at 2 Hz until L0 (0x78) or the budget ends: 20 s, and by
+pid age 22 s at the latest, so probe + the 60 s loader budget + the SoC load stay inside ui_watchdog's 90 s deadline
+(the pid age comes from `/proc/self/stat`, never the wall clock, which jumps at the boot-time NTP sync). `no_12v`
+(dead outlet) and `absent` skip the open without a strike, so the kick can retry once the outlet is live; `timeout`
+skips the open and counts a strike; a probe bug (`probe_error`) opens anyway. Retry an open only when the failure was
+raised inside tinygrad's `flock_acquire` while the process held no lock fd beforehand (an external holder), after
+closing the unlocked fd tinygrad leaves behind; never after any other failure. Every failed open logs the real
+sub-exceptions with file:line, the flock classification and the fd counts; the first open's duration is logged as
+`open_ms`. The first revision polled `flash.link_up()`, which writes 0xF3=1 on every probe (live link included) and
+whose 20 s could overrun the watchdog deadline; its retry rule ("no leaked fd") could never fire because a refused
+flock still leaves an unlocked fd behind.
 
-**Bench.** With the car off the enclosure has no 12 V, so the probe times out (`chestnut link not ready`, ~8 probes) and
-no lock fd is leaked; a forced open shows one leaked fd and the LTSSM sub-exception, and is classified as not retryable.
-The success path can only be observed at the next ignition: expect `chestnut link ready probes=N wait_s=X` followed by
-`chestnut ppt limit` and `models loaded in ~21s` from the first modeld process.
+**Bench (car off, rails off, offroad checked before every step).** Importing the module opens nothing and leaves
+`DEV=QCOM` and no lock fd (pid age 7 s after imports). The raw read shows 72 mV / LTSSM 0x00 (unpowered links read
+0x00 or 0x01), and the wait returns `no_12v` after three reads in 1.0 s with zero F3 writes and no lock fd. A forced
+open in a throwaway process fails at usb.py:143 with one leaked fd and classifies as not retryable; a second open in
+that process fails at the flock on its own fd and is refused; with an external holder of `/tmp/am_usb:4-2.lock` the
+first open fails at the flock with no prior fd, the retry passes the flock once the holder is gone, and `sudo fuser`
+names the holder. The 12 V paths (`ready` with one F3 write, the first open's `open_ms`, `timeout`) can only be
+observed at the next ignition: expect, from the first modeld pid, `chestnut preflight ... ltssm=0x00`, `chestnut
+link ready reason=ready f3_writes=1 wait_s=X`, `chestnut ppt limit ... open_ms`, `models loaded in ~21s`.

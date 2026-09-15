@@ -123,16 +123,31 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   firmware boots with PCIe off, and tinygrad's AMD open powers it on and checks the link once, with no wait. At a cold
   boot the link is often still training, so the first open fails -- and, verified on-device 2026-09-14, that failure
   leaks both tinygrad's lock fd and the libusb claim inside the process, so no later open in that process can ever
-  succeed ("Failed to acquire lock", then "Resource busy"). modeld therefore polls `flash.link_up()` (usbdevfs control
-  transfers as the comma user: 0xF3=1, then LTSSM; no tinygrad, no lock) for up to 20 s, 1 s apart, in the main thread
-  before starting the loader; on timeout it does not open at all and takes the SoC fallback (the kick stays the safety
-  net). Log events: `chestnut link ready` / `chestnut link not ready` with probe count and wait.
-- **Lock-contention retry, revised** (`VBSM_GPU_LOCK_RETRY`, `modeld_v2/modeld.py`): every failed open now logs
-  `eGPU open failed` with each sub-exception's type@file:line and the number of lock fds this process holds. A retry is
-  attempted only when the lock text is present AND the process holds no lock fd (an external holder, the unexplained
-  2026-09-13 case); a leaked fd means an in-process failure and is never retried. The holder capture runs `sudo fuser
-  -v` so root-owned holders are visible. The 2026-09-13 ladder (retry on any lock text) could never recover: the
-  failing process was blocking on its own leaked descriptor.
+  succeed ("Failed to acquire lock", then "Resource busy"). modeld therefore reads the bridge's supply voltage and
+  LTSSM straight over usbdevfs before the first open (the same read-only control transfers as `chestnut_power.py
+  status`; own fd, no tinygrad, no lock). With 12 V present and the link down it writes the PCIe power bit (0xF3=1)
+  once, right after the `ChestnutLoading` param so link training overlaps the vision-stream wait, re-sends it only if
+  the LTSSM is still in Detect 10 s later, and polls at 2 Hz until L0 (0x78) or the budget ends: 20 s, and in any
+  case by pid age 22 s, so probe + the 60 s loader budget + the SoC load stay inside ui_watchdog's 90 s deadline.
+  Outcomes: `ready` opens; `no_12v` (three reads under 5 V, a dead outlet) and `absent` (six failed reads) skip the
+  open without a strike toward the boot veto, so the kick may retry later; `timeout` (12 V present, link never
+  trained) skips the open and counts a strike; `probe_error` opens anyway. Events: `chestnut preflight` (state at
+  start: DEV, opened devices, lock fds, supply, LTSSM), `chestnut link ready` / `chestnut link not ready` (reason,
+  reads, F3 writes, wait, pid age, supply, LTSSM), `eGPU load skipped; link not ready`, and `open_ms` on
+  `chestnut ppt limit` (duration of the first open). The first revision (e0c253de: 1 Hz `flash.link_up()` polling)
+  wrote 0xF3=1 on every probe, live link included, and its 20 s could overrun the watchdog deadline; it was replaced
+  before its first drive.
+- **Lock-contention retry, revised** (`VBSM_GPU_LOCK_RETRY`, `modeld_v2/modeld.py`): every failed open logs
+  `eGPU open failed` with each sub-exception's type@file:line, whether it failed inside tinygrad's flock, the lock
+  fds this process held before and after, and the elapsed time. One retry (2 s later) is attempted only when the
+  failure was raised inside `flock_acquire` itself AND the process held no lock fd beforehand -- an external holder,
+  the unexplained 2026-09-13 case; the unlocked fd tinygrad leaves behind is closed first. Any failure after the
+  flock leaks the flock and the libusb claim and is never retried. The holder capture runs `sudo fuser -v` so
+  root-owned holders are visible. Bench 2026-09-14 (car off, rails off): a failed open classifies as not retryable
+  with one leaked fd; a second open in that process fails at the flock on its own fd and is refused; with an
+  external holder the retry passes the flock once the holder is gone. The 2026-09-13 ladder (retry on any lock text)
+  could never recover: the failing process was blocking on its own leaked descriptor. The e0c253de rule ("retry if no
+  leaked fd") could never fire either: a flock refusal still leaves an unlocked fd behind.
 - **Kick only when the driver is not about to engage** (`VBSM_GPU_KICK_ARMED`, `ui_watchdog.py`): the
   standstill/disengaged kick now also requires cruise main OFF or the car in Park. A kick throws a
   working SoC model away for a ~35 s no-model reload; on 2026-09-13 it fired 10 s after the driver armed
