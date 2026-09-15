@@ -9,9 +9,19 @@ See the LICENSE.md file in the root directory for more details.
 from collections.abc import Callable
 import os
 os.environ['GMMU'] = '0'
+# VBSM_GPU_READY: tinygrad resolves Device.DEFAULT by probing every backend in order
+# (AMD before QCOM) the first time anything asks for it, and modeld_v2's import chain
+# asks at import time (compile_modeld.py declares `device: str = Device.DEFAULT` as a
+# default argument). On a cold boot that probe opens the AMD device before the PCIe
+# link is up, fails, and leaks tinygrad's lock fd and the libusb claim, after which
+# this process can never open the eGPU (verified on-device 2026-09-14). Pinning DEV
+# makes DEFAULT resolve without probing; every tensor in modeld_v2 names its device
+# explicitly, and the eGPU is opened deliberately in load_big().
+os.environ.setdefault("DEV", "QCOM")
 import numpy as np
 import threading
 import time
+import traceback
 from setproctitle import setproctitle
 from tinygrad.tensor import Tensor
 
@@ -316,6 +326,66 @@ class ModelState(ModelStateBase):
     return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature), desiredAcceleration=float(desired_accel), shouldStop=bool(stop))
 
 
+# VBSM_GPU_READY: the enclosure's custom firmware boots with PCIe off, and tinygrad's
+# AMD open powers it on and checks the link ONCE (tinygrad usb.py: set_pcie_power then
+# a single LTSSM read). At a cold boot the link is often still training, the open
+# fails, and -- verified on-device 2026-09-14 -- that failure leaks both the tinygrad
+# lock fd and the libusb claim inside this process, so no later open in the same
+# process can ever succeed ("Failed to acquire lock", then "Resource busy"). So the
+# FIRST open has to succeed: flash.link_up() (usbdevfs control transfers as the comma
+# user: 0xF3=1, then LTSSM) powers PCIe on and reports link training without touching
+# tinygrad or its lock. Poll it, bounded, before opening; if the link never comes up,
+# do not open at all (nothing to leak) and take the SoC fallback -- the ui_watchdog
+# kick stays the safety net.
+CHESTNUT_READY_TIMEOUT_S = 20.0
+CHESTNUT_READY_POLL_S = 1.0
+CHESTNUT_LOCK_DIR = "/tmp"
+
+
+def chestnut_lock_fds() -> list[int]:
+  """fds of this process open on tinygrad's am_usb:*.lock files -- a leaked one means an in-process open failed"""
+  out = []
+  for f in os.listdir("/proc/self/fd"):
+    try:
+      path = os.readlink(f"/proc/self/fd/{f}")
+    except OSError:
+      continue
+    if os.path.dirname(path) == CHESTNUT_LOCK_DIR and os.path.basename(path).startswith("am_usb:") and path.endswith(".lock"):
+      out.append(int(f))
+  return out
+
+
+def exc_summary(e: BaseException) -> str:
+  """one line per (sub-)exception: type@file:line: message -- tinygrad wraps the real error in an ExceptionGroup"""
+  parts = []
+  for sub in getattr(e, "exceptions", [e]):
+    tb = traceback.extract_tb(sub.__traceback__)
+    loc = f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else "?"
+    parts.append(f"{type(sub).__name__}@{loc}: {str(sub)[:120]}")
+  return " | ".join(parts)[:600]
+
+
+def wait_chestnut_ready(timeout_s: float = CHESTNUT_READY_TIMEOUT_S, poll_s: float = CHESTNUT_READY_POLL_S) -> bool:
+  from openpilot.system.hardware.chestnut.flash import link_up
+  t0 = time.monotonic()
+  probes = 0
+  while True:
+    probes += 1
+    try:
+      up = link_up()
+    except Exception as e:
+      up = False
+      cloudlog.warning(f"chestnut link probe error: {e}")
+    waited = round(time.monotonic() - t0, 1)
+    if up:
+      cloudlog.event("chestnut link ready", probes=probes, wait_s=waited, error=False)
+      return True
+    if waited >= timeout_s:
+      cloudlog.event("chestnut link not ready", probes=probes, wait_s=waited, error=True)
+      return False
+    time.sleep(poll_s)
+
+
 def main(demo=False):
   cloudlog.warning("modeld init")
 
@@ -390,29 +460,24 @@ def main(demo=False):
     # VBSM_GPU_FALLBACK: load into a separate name so a late-completing or
     # wedged loader thread can never clobber state after the timeout fires
     big_model = None
-    # VBSM_GPU_LOCK_RETRY: tinygrad guards the USB GPU with an exclusive flock
-    # (/tmp/am_usb:<bus>-<dev>.lock). At a cold boot another process can hold it
-    # for a moment (2026-09-13: the first attempt died 7 ms in on the lock, the
-    # watchdog's retry 2.5 min later loaded fine). Lock contention is transient
-    # and never a brownout, so it gets a short retry ladder instead of the
-    # straight fall to the SoC model; every other failure keeps the one-attempt
-    # policy. tinygrad wraps the lock error in an ExceptionGroup, so detection
-    # and the holder capture look at the full traceback text, not str(e).
+    # VBSM_GPU_LOCK_RETRY (revised 2026-09-14): an in-process retry is only
+    # meaningful when this process holds NO lock fd after the failure, i.e. an
+    # external holder (the unexplained 2026-09-13 case). A leaked fd is the
+    # in-process signature described at wait_chestnut_ready(): never retry it.
     GPU_LOCK_RETRIES = 5
     GPU_LOCK_RETRY_S = 2.0
 
     def _is_lock_contention(e: BaseException) -> bool:
-      import traceback
       txt = "".join(traceback.format_exception(e))
       return "acquire lock" in txt or "am_usb" in txt
 
     def _log_lock_holder(attempt: int) -> None:
-      # capture the holder while it still exists
+      # root-visible: an unprivileged fuser cannot see a root process's fds
       try:
         import glob as _glob
         import subprocess as _sp
-        for lk in _glob.glob("/tmp/am_usb:*.lock"):
-          r = _sp.run(["fuser", "-v", lk], capture_output=True, text=True, timeout=5)
+        for lk in _glob.glob(f"{CHESTNUT_LOCK_DIR}/am_usb:*.lock"):
+          r = _sp.run(["sudo", "fuser", "-v", lk], capture_output=True, text=True, timeout=5)
           cloudlog.event("eGPU lock holder", lock=lk, attempt=attempt, fuser=(r.stdout + r.stderr)[:500], error=True)
       except Exception:
         pass
@@ -429,17 +494,22 @@ def main(demo=False):
             cloudlog.event("eGPU load succeeded after lock retry", attempts=attempt, error=False)
           return
         except Exception as e:
+          leaked = chestnut_lock_fds()
+          cloudlog.event("eGPU open failed", attempt=attempt, leaked_lock_fds=len(leaked), summary=exc_summary(e), error=True)
           if _is_lock_contention(e):
             _log_lock_holder(attempt)
-            if attempt < GPU_LOCK_RETRIES:
-              cloudlog.warning(f"eGPU lock busy, retry {attempt}/{GPU_LOCK_RETRIES - 1} in {GPU_LOCK_RETRY_S:.0f}s")
+            if not leaked and attempt < GPU_LOCK_RETRIES:
+              cloudlog.warning(f"eGPU lock held elsewhere, retry {attempt}/{GPU_LOCK_RETRIES - 1} in {GPU_LOCK_RETRY_S:.0f}s")
               time.sleep(GPU_LOCK_RETRY_S)
               continue
           cloudlog.exception("chestnut load failed")
           return
     loader = threading.Thread(target=load_big, daemon=True)
-    loader.start()
-    loader.join(BIG_MODEL_TIMEOUT)
+    # VBSM_GPU_READY: probe in the main thread so the 60 s loader budget still
+    # covers the load alone; an unstarted loader reads as "finished, no model"
+    if wait_chestnut_ready():
+      loader.start()
+      loader.join(BIG_MODEL_TIMEOUT)
     model = big_model
     if model is None:
       # VBSM_GPU_FALLBACK: count the failure so a persistently failing load

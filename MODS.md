@@ -113,15 +113,26 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   because a device that never came up has not shown it can run on this rail.
   Note the deliberate asymmetry: rail voltage is used to *permit a retry*, never to *pre-emptively
   veto* — as a veto it was refuted (route af ran 37 min with 869 samples below 12.5 V).
-- **Lock-contention retry** (`VBSM_GPU_LOCK_RETRY`, `modeld_v2/modeld.py`): tinygrad guards the USB
-  GPU with an exclusive flock (`/tmp/am_usb:<bus>-<dev>.lock`). On 2026-09-13 a cold boot's first
-  big-model attempt died 7 ms in on that lock ("Failed to acquire lock file am_usb:4-2.lock",
-  wrapped in tinygrad's "No interface for AMD:0" ExceptionGroup) and the fork fell straight to the
-  SoC model until the watchdog kick 2.5 min later, which loaded fine. Lock contention is transient
-  and never a brownout, so the loader now retries it up to 5 times 2 s apart (well inside the 60 s
-  loader budget) before giving up; every other failure keeps the one-attempt policy. Detection and
-  the `fuser` holder capture read the full traceback text — the old `str(e)` check never saw the
-  lock message inside the ExceptionGroup, which is why the 2026-09-13 holder went unrecorded.
+- **No device probe at import** (`VBSM_GPU_READY`, `modeld_v2/modeld.py`): upstream's `compile_modeld.py` declares
+  `device: str = Device.DEFAULT` as a default argument, so importing modeld_v2 makes tinygrad probe every backend
+  (AMD first) before `main()` runs. On a cold boot that probe opens the AMD device before the PCIe link is up, fails
+  silently, and leaks the lock fd and the libusb claim -- the 2026-09-13 "lock error 7 ms in, no other holder"
+  case. modeld now pins `DEV=QCOM` before tinygrad is imported (verified: importing the module opens nothing);
+  every tensor in modeld_v2 names its device explicitly and the eGPU is opened deliberately in `load_big()`.
+- **Link readiness before the first open** (`VBSM_GPU_READY`, `modeld_v2/modeld.py`): the enclosure's custom
+  firmware boots with PCIe off, and tinygrad's AMD open powers it on and checks the link once, with no wait. At a cold
+  boot the link is often still training, so the first open fails -- and, verified on-device 2026-09-14, that failure
+  leaks both tinygrad's lock fd and the libusb claim inside the process, so no later open in that process can ever
+  succeed ("Failed to acquire lock", then "Resource busy"). modeld therefore polls `flash.link_up()` (usbdevfs control
+  transfers as the comma user: 0xF3=1, then LTSSM; no tinygrad, no lock) for up to 20 s, 1 s apart, in the main thread
+  before starting the loader; on timeout it does not open at all and takes the SoC fallback (the kick stays the safety
+  net). Log events: `chestnut link ready` / `chestnut link not ready` with probe count and wait.
+- **Lock-contention retry, revised** (`VBSM_GPU_LOCK_RETRY`, `modeld_v2/modeld.py`): every failed open now logs
+  `eGPU open failed` with each sub-exception's type@file:line and the number of lock fds this process holds. A retry is
+  attempted only when the lock text is present AND the process holds no lock fd (an external holder, the unexplained
+  2026-09-13 case); a leaked fd means an in-process failure and is never retried. The holder capture runs `sudo fuser
+  -v` so root-owned holders are visible. The 2026-09-13 ladder (retry on any lock text) could never recover: the
+  failing process was blocking on its own leaked descriptor.
 - **Kick only when the driver is not about to engage** (`VBSM_GPU_KICK_ARMED`, `ui_watchdog.py`): the
   standstill/disengaged kick now also requires cruise main OFF or the car in Park. A kick throws a
   working SoC model away for a ~35 s no-model reload; on 2026-09-13 it fired 10 s after the driver armed

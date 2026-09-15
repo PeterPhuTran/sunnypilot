@@ -161,3 +161,31 @@ then the same fixes re-committed with every path's mode read from the parent tre
 **Rules that came out of it.** Read modes with `git ls-tree <parent> -- <path>` for every API commit; after a
 deploy verify the exec bits with `ls -l` and that modeld_tinygrad is actually running, not just that the file
 compiles. Manager exit code 126 means "not executable" and 127 "not found"; neither is a Python error.
+
+## Cold boot: PCIe link not up, and why retries could not help (issue 10, 2026-09-14)
+
+**Symptom.** After a cold boot the first modeld process ran the small model and the driver restarted the car to get the
+big one (the watchdog kick had also fired, 70 s after the failure). Warm starts were fine.
+
+**Cause, proven on the device.** tinygrad's AMD open takes its lock, powers PCIe on (0xF3=1, the custom firmware boots
+with it off) and reads the LTSSM once: "PCIe link not up (LTSSM=0x00), custom firmware not ready" if training is not
+finished. That failure leaves the lock fd open in the process (dropping the exception and `gc.collect()` do not free it)
+and the libusb interface claimed, so every later open in the same process fails: first at the lock, and after closing the
+leaked fd, with `libusb_set_configuration: Resource busy`. The 09-13 retry ladder therefore burned five attempts against
+the process's own descriptor; `fuser` listed only modeld itself. A fresh process (kick or restart) finds the link up.
+
+**Second cause, same day.** Importing modeld_v2 already touches the AMD device: `compile_modeld.py` evaluates
+`Device.DEFAULT` in a default argument, and tinygrad's default-device probe tries AMD first. At a cold boot that import-time
+open loses the same link race, so by the time `load_big()` runs the process is already poisoned -- which is why the
+2026-09-13 failure hit the lock 7 ms in with no other holder. Pinning `DEV=QCOM` before tinygrad is imported removes the
+probe (verified: importing the module opens nothing).
+
+**Fix.** Probe readiness before the first open with `flash.link_up()`, which powers PCIe on and reports the link without
+tinygrad (verified to run as the comma user), bounded to 20 s in the main thread so the 60 s loader budget still covers
+the load; never open when the probe times out; retry only on an external lock holder (no leaked fd); log every failed
+open with the real sub-exceptions and the leaked-fd count.
+
+**Bench.** With the car off the enclosure has no 12 V, so the probe times out (`chestnut link not ready`, ~8 probes) and
+no lock fd is leaked; a forced open shows one leaked fd and the LTSSM sub-exception, and is classified as not retryable.
+The success path can only be observed at the next ignition: expect `chestnut link ready probes=N wait_s=X` followed by
+`chestnut ppt limit` and `models loaded in ~21s` from the first modeld process.
