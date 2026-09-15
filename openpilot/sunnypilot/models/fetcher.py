@@ -48,10 +48,16 @@ class ModelParser:
         manifest_path = os.path.join(model_dir, f"{artifact.fileName}.chunkmanifest")
         num_chunks = str(len(artifact.chunks))
 
-        if not os.path.exists(manifest_path) or open(manifest_path).read().strip() != num_chunks:
+        # VBSM_QUIET: two catalog entries can share a fileName with different
+        # chunk counts, making the write-if-changed guard flip this file twice
+        # per second forever (93% of all log volume, ~2h log retention, flash
+        # wear). A manifest is only meaningful when the chunk files exist
+        # locally, so write it only for downloaded artifacts -- and quietly.
+        first_chunk = os.path.join(model_dir, f"{artifact.fileName}.chunk01of{len(artifact.chunks):02d}")
+        if os.path.exists(first_chunk) and (not os.path.exists(manifest_path) or open(manifest_path).read().strip() != num_chunks):
           with open(manifest_path, "w") as f:
             f.write(num_chunks)
-          cloudlog.info(f"Wrote chunk manifest for {artifact.fileName}: {num_chunks} chunks")
+          cloudlog.debug(f"Wrote chunk manifest for {artifact.fileName}: {num_chunks} chunks")
       except Exception as e:
         cloudlog.warning(f"Failed to write chunk manifest for {artifact.fileName}: {e}")
 

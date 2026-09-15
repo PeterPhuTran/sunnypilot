@@ -9,9 +9,19 @@ See the LICENSE.md file in the root directory for more details.
 from collections.abc import Callable
 import os
 os.environ['GMMU'] = '0'
+# VBSM_GPU_READY: tinygrad resolves Device.DEFAULT by probing every backend in order
+# (AMD before QCOM) the first time anything asks for it, and modeld_v2's import chain
+# asks at import time (compile_modeld.py declares `device: str = Device.DEFAULT` as a
+# default argument). On a cold boot that probe opens the AMD device before the PCIe
+# link is up, fails, and leaks tinygrad's lock fd and the libusb claim, after which
+# this process can never open the eGPU (verified on-device 2026-09-14). Pinning DEV
+# makes DEFAULT resolve without probing; every tensor in modeld_v2 names its device
+# explicitly, and the eGPU is opened deliberately in load_big().
+os.environ.setdefault("DEV", "QCOM")
 import numpy as np
 import threading
 import time
+import traceback
 from setproctitle import setproctitle
 from tinygrad.tensor import Tensor
 
@@ -316,7 +326,192 @@ class ModelState(ModelStateBase):
     return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature), desiredAcceleration=float(desired_accel), shouldStop=bool(stop))
 
 
+# VBSM_GPU_READY: the enclosure's custom firmware boots with PCIe off, and tinygrad's
+# AMD open powers it on and checks the link ONCE (tinygrad usb.py: set_pcie_power then
+# a single LTSSM read). At a cold boot the link is often still training, the open
+# fails, and -- verified on-device 2026-09-14 -- that failure leaks both the tinygrad
+# lock fd and the libusb claim inside this process, so no later open in the same
+# process can ever succeed ("Failed to acquire lock", then "Resource busy"). So the
+# FIRST open has to succeed. Before opening, modeld reads the bridge's supply and
+# LTSSM registers straight over usbdevfs (read-only, own fd, no tinygrad, no lock),
+# writes the PCIe power bit at most once and only with 12 V present, and waits,
+# bounded, for L0. A dead outlet or an absent bridge fails fast without a strike; a
+# link that never trains with 12 V present skips the open (nothing to leak) and takes
+# the SoC fallback -- the ui_watchdog kick stays the safety net. The wait ends 22 s
+# after main() starts, so 22 + 60 (loader budget) + ~3 (small model) stays under
+# ui_watchdog's 90 s load deadline: the watchdog matches ".modeld" in the cmdline,
+# which only appears at setproctitle() a few ms into main(), and polls every 2 s, so
+# its clock starts at or after ours. Imports (4-11 s warm, longer cold) come before
+# main() and must not shrink the link budget (they did in e8b7e968, which counted
+# from process start).
+CHESTNUT_READY_TIMEOUT_S = 20.0
+CHESTNUT_READY_END_BY_S = 22.0   # after main() entry, see above
+CHESTNUT_READY_POLL_S = 0.5
+CHESTNUT_F3_TIMEOUT_MS = 10000   # tinygrad's own timeout for the PCIe power write
+CHESTNUT_F3_RESEND_S = 10.0      # re-send F3=1 only if the LTSSM is still in Detect this long after the last write
+CHESTNUT_POWERED_MV = 5000       # helpers.CHESTNUT_POWERED_VOLTAGE
+CHESTNUT_PCIE_L0 = 0x78
+CHESTNUT_LOCK_DIR = "/tmp"
+_last_f3 = float("-inf")
+_f3_writes = 0
+
+
+def proc_start_monotonic() -> float:
+  """time.monotonic() at which this process started (from /proc/self/stat), so the probe budget is measured the
+  way ui_watchdog measures its 90 s load deadline: from pid age, imports included. Never the wall clock: it jumps
+  at the boot-time NTP sync."""
+  try:
+    with open("/proc/self/stat") as f:
+      st = f.read()
+    ticks = int(st[st.rindex(")") + 2:].split()[19])   # field 22, starttime in clock ticks since boot
+    age_s = time.clock_gettime(time.CLOCK_BOOTTIME) - ticks / os.sysconf("SC_CLK_TCK")
+    return time.monotonic() - age_s
+  except Exception:
+    return time.monotonic()
+
+
+PROC_START = proc_start_monotonic()
+
+
+def chestnut_lock_fds() -> list[int]:
+  """fds of this process open on tinygrad's am_usb:*.lock files -- a leaked one means an in-process open failed"""
+  out = []
+  for f in os.listdir("/proc/self/fd"):
+    try:
+      path = os.readlink(f"/proc/self/fd/{f}")
+    except OSError:
+      continue
+    if os.path.dirname(path) == CHESTNUT_LOCK_DIR and os.path.basename(path).startswith("am_usb:") and path.endswith(".lock"):
+      out.append(int(f))
+  return out
+
+
+def exc_summary(e: BaseException) -> str:
+  """one line per (sub-)exception: type@file:line: message -- tinygrad wraps the real error in an ExceptionGroup"""
+  parts = []
+  for sub in getattr(e, "exceptions", [e]):
+    tb = traceback.extract_tb(sub.__traceback__)
+    loc = f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else "?"
+    parts.append(f"{type(sub).__name__}@{loc}: {str(sub)[:120]}")
+  return " | ".join(parts)[:600]
+
+
+def failed_at_flock(e: BaseException) -> bool:
+  """True only if a sub-exception was raised inside tinygrad's flock_acquire (the flock itself, nothing after it)"""
+  for sub in getattr(e, "exceptions", [e]):
+    tb = traceback.extract_tb(sub.__traceback__)
+    if tb and tb[-1].name == "flock_acquire" and "Failed to acquire lock" in str(sub):
+      return True
+  return False
+
+
+def chestnut_raw() -> tuple[int, int, int] | None:
+  """READ-ONLY (supply_mv, supply_ma, ltssm) from the bridge over usbdevfs EP0 (same reads as chestnut_power.py);
+  own fd, closed in finally; None on any exception. No F3 write, no tinygrad, no flock."""
+  import ctypes
+  import fcntl
+  import struct
+  from openpilot.system.hardware.chestnut.flash import Ctrl, USBDEVFS_CONTROL, find_chestnut, open_device
+  try:
+    path, _, _ = find_chestnut()
+    if not path:
+      return None
+    fd = open_device(path)
+  except Exception:
+    return None
+  try:
+    buf = (ctypes.c_ubyte * 5)()
+    fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0xC0, 0xC0, 0, 0, 5, 2000, ctypes.cast(buf, ctypes.c_void_p)))
+    lt = (ctypes.c_ubyte * 1)()
+    fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0xC0, 0xE4, 0xB450, 0, 1, 2000, ctypes.cast(lt, ctypes.c_void_p)))
+    v, i = struct.unpack("<Hh", bytes(buf)[:4])
+    return int(v), int(i), int(lt[0])
+  except Exception:
+    return None
+  finally:
+    os.close(fd)
+
+
+def chestnut_f3_on() -> bool:
+  """ONE PCIe power-on write (0xF3=1) with tinygrad's timeout; own fd; False on any exception."""
+  global _last_f3, _f3_writes
+  import fcntl
+  from openpilot.system.hardware.chestnut.flash import Ctrl, USBDEVFS_CONTROL, find_chestnut, open_device
+  try:
+    path, _, _ = find_chestnut()
+    if not path:
+      return False
+  except Exception:
+    return False
+  _last_f3 = time.monotonic()   # an attempt, successful or not: a failed write must not re-arm an immediate resend
+  _f3_writes += 1
+  try:
+    fd = open_device(path)
+  except Exception:
+    return False
+  try:
+    fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0x40, 0xF3, 1, 0, 0, CHESTNUT_F3_TIMEOUT_MS, None))
+    return True
+  except Exception:
+    return False
+  finally:
+    os.close(fd)
+
+
+def chestnut_fields(raw) -> dict:
+  return {"supply_mv": raw[0], "supply_ma": raw[1], "ltssm": f"0x{raw[2]:02x}"} if raw else {"supply_mv": None, "supply_ma": None, "ltssm": None}
+
+
+def wait_chestnut_ready(t_main: float) -> str:
+  """'ready' | 'timeout' | 'no_12v' | 'absent' | 'probe_error'. Never raises. Read-first: F3=1 only with 12 V and the link
+  down; the preflight's write counts (f3_total), so a cold boot normally shows f3_writes=0 here and f3_total=1."""
+  t0 = time.monotonic()
+  reads = f3 = misses = unpowered = 0
+  raw = None
+  reason = "timeout"
+  try:
+    deadline = min(t0 + CHESTNUT_READY_TIMEOUT_S, t_main + CHESTNUT_READY_END_BY_S)
+    deadline = max(deadline, t0 + 2.0)
+    while True:
+      raw = chestnut_raw()
+      reads += 1
+      if raw is None:
+        misses += 1
+        if misses >= 6:
+          reason = "absent"
+          break
+      else:
+        mv, _, lt = raw
+        if lt == CHESTNUT_PCIE_L0:
+          reason = "ready"
+          break
+        unpowered = unpowered + 1 if mv < CHESTNUT_POWERED_MV else 0
+        if unpowered >= 3:
+          reason = "no_12v"
+          break
+        never_written = _last_f3 == float("-inf")
+        in_detect = lt in (0x00, 0x01)   # an unpowered link reads 0x00 or 0x01 (bench 2026-09-14)
+        if mv >= CHESTNUT_POWERED_MV and (never_written or (in_detect and time.monotonic() - _last_f3 >= CHESTNUT_F3_RESEND_S)):
+          f3 += 1
+          chestnut_f3_on()
+      if time.monotonic() >= deadline:
+        reason = "timeout"
+        break
+      time.sleep(CHESTNUT_READY_POLL_S)
+  except Exception:
+    cloudlog.exception("chestnut link probe error")
+    return "probe_error"
+  fields = dict(reason=reason, reads=reads, f3_writes=f3, f3_total=_f3_writes, wait_s=round(time.monotonic() - t0, 1),
+                main_age_s=round(time.monotonic() - t_main, 1), pid_age_s=round(time.monotonic() - PROC_START, 1), **chestnut_fields(raw))
+  if reason == "ready":
+    cloudlog.event("chestnut link ready", error=False, **fields)
+  else:
+    cloudlog.event("chestnut link not ready", error=True, **fields)
+  return reason
+
+
 def main(demo=False):
+  t_main = time.monotonic()   # ui_watchdog's clock starts at the setproctitle() just below (see VBSM_GPU_READY)
   cloudlog.warning("modeld init")
 
   sentry.set_tag("daemon", PROCESS_NAME)
@@ -325,12 +520,34 @@ def main(demo=False):
   config_realtime_process(7, 54)
 
   CHESTNUT = chestnut_present()
+  # VBSM_GPU_FALLBACK: set when an eGPU load fails twice or an eGPU-active
+  # modeld dies (accessory-outlet power limits); tmpfs clears it each boot.
+  # With the veto the SoC path runs, and the per-hardware bundle slots make
+  # ModelState(chestnut=False) select the Qualcomm slot on its own.
+  if CHESTNUT and os.path.exists('/dev/shm/vbsm_usbgpu_veto'):
+    cloudlog.event("eGPU vetoed earlier this boot; running SoC fallback", error=True)
+    CHESTNUT = False
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
   params = Params()
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
+  if CHESTNUT:
+    # VBSM_GPU_READY preflight: record the bridge state this process starts from and, with
+    # 12 V present and the link down, send the single PCIe power-on now so link training
+    # overlaps the vision-stream wait below. Read-first: a warm start writes nothing.
+    try:
+      from tinygrad.device import Device
+      raw = chestnut_raw()
+      f3_written = None
+      if raw is not None and raw[0] >= CHESTNUT_POWERED_MV and raw[2] != CHESTNUT_PCIE_L0:
+        f3_written = chestnut_f3_on()
+      cloudlog.event("chestnut preflight", dev=os.environ.get("DEV"), amd_opened=("AMD" in Device._opened_devices),
+                     lock_fds=len(chestnut_lock_fds()), pid_age_s=round(time.monotonic() - PROC_START, 1), f3_written=f3_written,
+                     ltssm_after=(f"0x{r[2]:02x}" if f3_written and (r := chestnut_raw()) else None), error=False, **chestnut_fields(raw))
+    except Exception:
+      cloudlog.exception("chestnut preflight failed")
 
   # visionipc clients
   while True:
@@ -360,24 +577,139 @@ def main(demo=False):
 
   model = None
   if CHESTNUT:
+    def apply_ppt_cap():
+      # VBSM_GPU_PPT: cap package power BEFORE the 1.7GB transfer -- the
+      # accessory-outlet 12V path (~0.45 ohm measured) browns out at stock
+      # boost transients, during load as well as inference. 80W ~ 6A fits.
+      # Tune via /data/vbsm_gpu_ppt_w (watts; 0 disables), clamp 40..220.
+      limit_w = 80
+      try:
+        with open("/data/vbsm_gpu_ppt_w") as f:
+          limit_w = int(f.read().strip())
+      except (OSError, ValueError):
+        pass
+      if limit_w <= 0:
+        return
+      limit_w = max(40, min(220, limit_w))
+      from tinygrad.device import Device
+      t_open = time.monotonic()
+      smu = Device["AMD"].iface.dev_impl.smu
+      open_ms = int((time.monotonic() - t_open) * 1000)
+      smu._send_msg(smu.smu_mod.PPSMC_MSG_SetPptLimit, limit_w, timeout=100)
+      applied = smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
+      cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), open_ms=open_ms, error=False)
+
+    # VBSM_GPU_FALLBACK: load into a separate name so a late-completing or
+    # wedged loader thread can never clobber state after the timeout fires
     big_model = None
+    # VBSM_GPU_LOCK_RETRY (revised 2026-09-14): retry only a failure raised inside
+    # tinygrad's flock itself while this process held no lock fd beforehand -- with the
+    # DEV pin that means an external holder (the unexplained 2026-09-13 case). Any
+    # failure after the flock leaks the flock and the libusb claim and is never
+    # retried (verified: "Resource busy" on every later open in the process).
+    GPU_LOCK_RETRIES = 2
+    GPU_LOCK_RETRY_S = 2.0
+
+    def _log_lock_holder(attempt: int) -> None:
+      # root-visible: an unprivileged fuser cannot see a root process's fds
+      try:
+        import glob as _glob
+        import subprocess as _sp
+        for lk in _glob.glob(f"{CHESTNUT_LOCK_DIR}/am_usb:*.lock"):
+          r = _sp.run(["sudo", "fuser", "-v", lk], capture_output=True, text=True, timeout=5)
+          cloudlog.event("eGPU lock holder", lock=lk, attempt=attempt, fuser=(r.stdout + r.stderr)[:500], error=True)
+      except Exception:
+        pass
+
     def load_big():
       nonlocal big_model
-      try:
-        m = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
-        m.warmup()
-        big_model = m
-      except Exception:
-        cloudlog.exception("chestnut load failed")
+      cloudlog.bind(daemon=PROCESS_NAME)   # the daemon tag is thread-local; without this the loader's lines carry none
+      for attempt in range(1, GPU_LOCK_RETRIES + 1):
+        fds_before = chestnut_lock_fds()
+        t_attempt = time.monotonic()
+        try:
+          apply_ppt_cap()
+          m = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
+          m.warmup()
+          big_model = m
+          if attempt > 1:
+            cloudlog.event("eGPU load succeeded after lock retry", attempts=attempt, error=False)
+          return
+        except Exception as e:
+          fds_after = chestnut_lock_fds()
+          at_flock = failed_at_flock(e)
+          cloudlog.event("eGPU open failed", attempt=attempt, at_flock=at_flock, lock_fds_before=len(fds_before), lock_fds_after=len(fds_after),
+                         elapsed_ms=int((time.monotonic() - t_attempt) * 1000), summary=exc_summary(e), error=True)
+          if at_flock:
+            _log_lock_holder(attempt)
+            if not fds_before and attempt < GPU_LOCK_RETRIES:
+              for fd in set(fds_after) - set(fds_before):   # opened before the flock, hold nothing, no libusb handle yet
+                try:
+                  os.close(fd)
+                except OSError:
+                  pass
+              cloudlog.warning(f"eGPU lock held elsewhere, retry {attempt}/{GPU_LOCK_RETRIES - 1} in {GPU_LOCK_RETRY_S:.0f}s")
+              time.sleep(GPU_LOCK_RETRY_S)
+              continue
+          cloudlog.exception("chestnut load failed")
+          return
     loader = threading.Thread(target=load_big, daemon=True)
-    loader.start()
-    loader.join(BIG_MODEL_TIMEOUT)
+    # VBSM_GPU_READY: probe in the main thread so the 60 s loader budget still covers
+    # the load alone; an unstarted loader reads as "finished, no model"
+    ready_reason = wait_chestnut_ready(t_main)
+    if ready_reason in ("ready", "probe_error"):
+      loader.start()
+      loader.join(BIG_MODEL_TIMEOUT)
+    else:
+      cloudlog.event("eGPU load skipped; link not ready", reason=ready_reason, error=True)   # nothing opened: no lock, no claim
     model = big_model
-    if model is None:
+    if model is None and ready_reason in ("no_12v", "absent"):
+      # nothing was attempted: no strike toward the boot-scoped veto; the kick may retry later
+      params.put_bool("ChestnutModelError", True)
+    elif model is None:
+      # VBSM_GPU_FALLBACK: count the failure so a persistently failing load
+      # cannot be retried forever by ui_watchdog's GPU kick -- the second
+      # failure this boot vetoes the eGPU. A loader still alive here is wedged
+      # inside a C call (field-verified: it ignored SIGINT and needed SIGKILL);
+      # nothing in this process is safe behind it, so replace the process. A
+      # loader that finished and failed cleanly falls through to upstream's
+      # in-process small-model path: no restart, no manager budget spent.
+      fails = 1
+      try:
+        with open('/dev/shm/vbsm_gpu_load_fails') as f:
+          fails = int(f.read().strip()) + 1
+      except (OSError, ValueError):
+        pass
+      try:
+        with open('/dev/shm/vbsm_gpu_load_fails', 'w') as f:
+          f.write(str(fails))
+      except OSError:
+        pass
+      if fails >= 2:
+        try:
+          with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
+            f.write("load")
+        except OSError:
+          pass
+      if loader.is_alive():
+        cloudlog.event("eGPU load wedged; exiting for respawn", error=True, attempt=fails, vetoed=bool(fails >= 2))
+        # Params.put is write+rename, so these survive os._exit: selfdrived's
+        # bigModelFailed input stays deterministic across the respawn window
+        params.put_bool("ChestnutModelError", True)
+        params.put_bool("ChestnutActive", False)
+        time.sleep(0.2)
+        os._exit(1)
+      cloudlog.event("eGPU load failed; running SoC model in-process", error=True, attempt=fails, vetoed=bool(fails >= 2))
       params.put_bool("ChestnutModelError", True)
     params.put_bool("ChestnutActive", model is not None)
     if model is not None:
       params.remove("ChestnutModelError")
+      # a good load clears the ladder: the counter was never reset on success,
+      # so a stale count could turn the next transient into a boot-long veto
+      try:
+        os.remove('/dev/shm/vbsm_gpu_load_fails')
+      except OSError:
+        pass
 
   small_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False) if model is None or CHESTNUT else None
   if model is None:
@@ -516,10 +848,36 @@ def main(demo=False):
       send_chestnut = (chestnut_state is not None and
                        run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
       model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
-    except Exception:
+    except Exception as e:
       if not params.get_bool("ChestnutActive"):
         raise
-      cloudlog.exception("chestnut failed, falling back to small")
+      # VBSM_GPU_FALLBACK: upstream swaps to the already-loaded small model
+      # in-process -- no restart and no no-model window, which retires the
+      # fork's exit-for-respawn path (30.7s of no model on 2026-09-01). The
+      # fork's veto bookkeeping stays: ui_watchdog scopes the veto to the
+      # drive, retries the eGPU once the rail recovers, and any later respawn
+      # must not re-attempt a browned-out GPU. The payload records what raised
+      # because run() spans BOTH devices (warp on QCOM, policy on AMD): a USB
+      # bulk I/O error from a bad cable was diagnosed from exactly this string.
+      hangs = 1
+      try:
+        with open('/dev/shm/vbsm_gpu_hangs') as f:
+          hangs = int(f.read().strip()) + 1
+      except (OSError, ValueError):
+        pass
+      try:
+        with open('/dev/shm/vbsm_gpu_hangs', 'w') as f:
+          f.write(str(hangs))
+      except OSError:
+        pass
+      vetoed = True
+      try:
+        with open('/dev/shm/vbsm_usbgpu_veto', 'w') as f:
+          f.write(f"hang {type(e).__name__}: {e}"[:200])
+      except OSError as ve:
+        vetoed = False
+        cloudlog.error(f"eGPU veto write failed, a respawn may retry the GPU: {ve}")
+      cloudlog.exception(f"chestnut failed, falling back to small (vetoed={vetoed}, strike {hangs})")
       params.put_bool("ChestnutModelError", True)
       params.put_bool("ChestnutActive", False)
       assert small_model is not None
