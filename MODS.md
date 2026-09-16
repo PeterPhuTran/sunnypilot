@@ -176,8 +176,11 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   finished drawing, but the driver still got the warning mid-drive. Message validity now carries the same
   kind of buffer the sanity counters already had: a bad cycle counts a whole step, a good cycle gives back
   half, and the inputs are called bad at 3. Three consecutive bad messages still fault 100 ms after the
-  first, a 50/50 flapping stream faults within 400 ms, and one good message clears it. Replayed against the
-  2026-09-15 route: the one episode the old rule produced disappears, and nothing else in the drive changes.
+  first, a 50/50 flapping stream faults within 400 ms, and one good message clears it. The counter starts AT the
+  limit, so a service that has never arrived still reads as bad from the first cycle and startup is unchanged --
+  starting it at zero reported `inputsOK` true for the first two frames of a segment, which openpilot's process
+  replay caught on the upstream PR. Replayed against the 2026-09-15 route: the startup episode is cycle-for-cycle
+  identical to the old rule (18 cycles both ways) and the one spurious episode disappears.
   Upstream-worthy, and distinct from `VBSM_LOC_CAP`, which only touches the counter branch.
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and

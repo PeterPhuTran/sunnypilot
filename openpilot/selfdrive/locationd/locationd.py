@@ -305,7 +305,7 @@ def main():
   # trips instead of oscillating under the limit forever.
   VALIDITY_INVALID_LIMIT = 3
   VALIDITY_RECOVERY_STEP = 0.5
-  msgs_invalid = 0.
+  msgs_invalid = VALIDITY_INVALID_LIMIT   # inputs start bad: a service that has never arrived is not valid
 
   initial_pose_data = params.get("LocationFilterInitialState")
   if initial_pose_data is not None:
