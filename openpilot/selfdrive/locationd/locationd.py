@@ -292,6 +292,20 @@ def main():
   # fault flagged (each bad sample re-pins the cap) but bounds recovery after
   # the fault ends to the designed INPUT_INVALID_RECOVERY window.
   input_invalid_cap = {s: input_invalid_limit[s] + 1 for s in critcal_services}
+  # VBSM_LOC_VALID: sm.all_valid() has no hysteresis at all, so a SINGLE message
+  # flagged invalid -- 50 ms of a 20 Hz stream -- drops inputsOK and puts a
+  # full-screen "TAKE CONTROL IMMEDIATELY / locationd Temporary Error" on the
+  # screen for its whole 2 s. On 2026-09-15 one camera frame desync marked one
+  # cameraOdometry message invalid; inputsOK was false for 60 ms and the state
+  # machine was back in ENABLED before the alert finished drawing. The sanity
+  # counters above already have a threshold and a decay; give message validity a
+  # comparable buffer: three bad cycles to fault (100 ms after the first at the
+  # cameraOdometry rate), one good cycle to clear. Bad counts a whole step and good
+  # only half a step back, so a stream that is invalid every other message still
+  # trips instead of oscillating under the limit forever.
+  VALIDITY_INVALID_LIMIT = 3
+  VALIDITY_RECOVERY_STEP = 0.5
+  msgs_invalid = 0.
 
   initial_pose_data = params.get("LocationFilterInitialState")
   if initial_pose_data is not None:
@@ -337,7 +351,9 @@ def main():
 
     if sm.updated["cameraOdometry"]:
       critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critcal_services)
-      inputs_valid = sm.all_valid() and critical_service_inputs_valid
+      # VBSM_LOC_VALID
+      msgs_invalid = min(msgs_invalid + 1, VALIDITY_INVALID_LIMIT) if not sm.all_valid() else max(msgs_invalid - VALIDITY_RECOVERY_STEP, 0)
+      inputs_valid = msgs_invalid < VALIDITY_INVALID_LIMIT and critical_service_inputs_valid
       sensors_valid = sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
 
       msg = estimator.get_msg(sensors_valid, inputs_valid, filter_initialized)

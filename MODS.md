@@ -168,6 +168,17 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   yaw-rate cross-check has nothing to compare against during a camera-odometry gap) took ~10 minutes to
   decay, during which every engage was refused with "locationd Temporary Error". Recovery after a fault
   now ends within ~30 s; a persistent fault stays flagged. Upstream-worthy.
+- **Buffered message validity** (`VBSM_LOC_VALID`, `locationd.py`): `inputs_valid` also depends on
+  `sm.all_valid()`, which had no hysteresis at all, so ONE message flagged invalid out of a 20 Hz stream
+  dropped `inputsOK` and put a full-screen "TAKE CONTROL IMMEDIATELY / locationd Temporary Error" on the
+  screen for its full 2 s. On 2026-09-15 a single camera frame desync marked one `cameraOdometry` message
+  invalid; `inputsOK` was false for 60 ms and the state machine was back in ENABLED before the alert
+  finished drawing, but the driver still got the warning mid-drive. Message validity now carries the same
+  kind of buffer the sanity counters already had: a bad cycle counts a whole step, a good cycle gives back
+  half, and the inputs are called bad at 3. Three consecutive bad messages still fault 100 ms after the
+  first, a 50/50 flapping stream faults within 400 ms, and one good message clears it. Replayed against the
+  2026-09-15 route: the one episode the old rule produced disappears, and nothing else in the drive changes.
+  Upstream-worthy, and distinct from `VBSM_LOC_CAP`, which only touches the counter branch.
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
   `ChestnutActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything
@@ -253,7 +264,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events | `VBSM_PARKWATCH` |
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
 | `openpilot/system/hardware/power_monitoring.py` | §2b parked energy budget | `VBSM_PARK` |
-| `openpilot/selfdrive/locationd/locationd.py` | §4 bounded lockout after a camera-odometry gap | `VBSM_LOC_CAP` |
+| `openpilot/selfdrive/locationd/locationd.py` | §4 bounded lockout, buffered message validity | `VBSM_LOC_CAP`, `VBSM_LOC_VALID` |
 
 Retired: `VBSM_COMPAT` (a modeld_v2 unpacking shim, superseded when upstream fixed the API
 properly); `VBSM_GPU_HUD` (a ui_state compiled-gate patch for bundle installs, superseded by
