@@ -3,11 +3,11 @@ import pyray as rl
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.cereal.visionipc import VisionStreamType
-from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
+from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus, ChestnutState
 from openpilot.selfdrive.ui.mici.onroad import SIDE_PANEL_WIDTH
 from openpilot.selfdrive.ui.mici.onroad.alert_renderer import AlertRenderer
 from openpilot.selfdrive.ui.mici.onroad.driver_state import DriverStateRenderer
-from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer
+from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer, GPU_KICK_REQUEST_FILE, CHESTNUT_HOLD_REBOOT_S
 from openpilot.selfdrive.ui.mici.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.mici.onroad.confidence_ball import ConfidenceBall
 from openpilot.selfdrive.ui.mici.onroad.cameraview import CameraView
@@ -54,6 +54,38 @@ ROAD_CAM_MIN_SPEED = 10  # m/s (25 mph)
 CAM_Y_OFFSET = 20
 
 
+def chestnut_touch_action(hud, pos, hold_s: float, moved_px: float) -> str:
+  """VBSM_GPU_HUD_TAP: decide and perform the chestnut-icon gesture. Returns what was done: 'reboot' (held
+  CHESTNUT_HOLD_REBOOT_S on the icon in any state), 'request' / 'cancel' (tap on the orange icon toggles
+  ui_watchdog's retry marker), or '' (not on the icon, a swipe, or a tap on a non-failed icon). Never raises:
+  an exception in a touch handler takes the whole UI down."""
+  try:
+    if hud is None or moved_px >= 20:
+      return ''
+    rect = hud.chestnut_icon_rect
+    if rect.width <= 0 or not rl.check_collision_point_rec(pos, rect):
+      return ''
+    if hold_s >= CHESTNUT_HOLD_REBOOT_S:
+      cloudlog.warning(f"VBSM_GPU_HUD_TAP: reboot requested from the HUD (held {hold_s:.1f}s, chestnut {ui_state.chestnut_state.name})")
+      ui_state.params.put_bool("DoReboot", True)
+      return 'reboot'
+    if ui_state.chestnut_state not in (ChestnutState.UNCOMPILED, ChestnutState.FAILED):
+      return ''
+    if os.path.exists(GPU_KICK_REQUEST_FILE):
+      os.remove(GPU_KICK_REQUEST_FILE)
+      cloudlog.warning("VBSM_GPU_HUD_TAP: eGPU retry request cancelled from the HUD")
+      hud.chestnut_requested = False
+      return 'cancel'
+    with open(GPU_KICK_REQUEST_FILE, 'w') as f:
+      f.write(f"hud {int(time.time())}")
+    cloudlog.warning("VBSM_GPU_HUD_TAP: eGPU retry requested from the HUD; ui_watchdog kicks at the next disengaged standstill")
+    hud.chestnut_requested = True
+    return 'request'
+  except Exception:
+    cloudlog.exception("VBSM_GPU_HUD_TAP: chestnut touch handler failed")
+    return ''
+
+
 class BookmarkIcon(Widget):
   PEEK_THRESHOLD = 50  # If icon peeks out this much, snap it fully visible
   FULL_VISIBLE_OFFSET = 200  # How far onscreen when fully visible
@@ -73,6 +105,7 @@ class BookmarkIcon(Widget):
     self._is_swiping = False
     self._is_swiping_left: bool = False
     self._triggered_time: float = 0.0
+    self._press_time: float = 0.0      # VBSM_GPU_HUD_TAP: hold duration for the reboot gesture
 
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""
@@ -113,6 +146,11 @@ class BookmarkIcon(Widget):
       self._is_swiping = True
       self._is_swiping_left = False
       self._state = BookmarkState.DRAGGING
+      # VBSM_GPU_HUD_TAP: start the hold clock; the HUD grows the icon while a finger rests on it
+      self._press_time = rl.get_time()
+      hud = getattr(self, "hud_renderer", None)
+      if hud is not None and hud.chestnut_icon_rect.width > 0 and rl.check_collision_point_rec(mouse_event.pos, hud.chestnut_icon_rect):
+        hud.chestnut_hold_since = self._press_time
 
     elif mouse_event.left_down and self._is_swiping:
       self._swipe_current_x = mouse_event.pos.x
@@ -130,6 +168,11 @@ class BookmarkIcon(Widget):
       # self._hud_renderer here crashed the whole UI on any tap: BookmarkIcon
       # never had that attribute.)
       hud = getattr(self, "hud_renderer", None)
+      # VBSM_GPU_HUD_TAP: tap / hold on the chestnut icon (see chestnut_touch_action)
+      if hud is not None:
+        hud.chestnut_hold_since = None
+        if self._is_swiping:
+          chestnut_touch_action(hud, mouse_event.pos, rl.get_time() - self._press_time, abs(self._swipe_start_x - self._swipe_current_x))
       if hud is not None and self._is_swiping and abs(self._swipe_start_x - self._swipe_current_x) < 20:
         chip = hud.profile_chip_rect
         if chip.width > 0 and rl.check_collision_point_rec(mouse_event.pos, chip):

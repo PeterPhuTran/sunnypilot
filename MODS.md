@@ -170,11 +170,21 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   every kick in the first two minutes of uptime -- exactly what a cold boot into onroad offers. 2026-09-16: 40 s
   standstill from route second 9, cruise main off, every other gate open, no kick; the driver rebooted. Now `None`
   until the first kick.
-- **Driver-requested retry** (`VBSM_GPU_KICK_REQUEST`, `ui_watchdog.py`): `/dev/shm/vbsm_gpu_kick_request`
-  (touched over ssh by the Pi relay, see `docs/how-to/phone-gpu-retry.md` on the Pi, or by hand) asks for the kick
-  at the next standstill with openpilot disengaged, without the cruise-main gate and without waiting for the ready
-  marker (the fresh process re-probes and writes the power bit itself). Requests older than 10 min are discarded,
-  never queued. Vetoes and the two-kicks-per-drive budget still apply; a reboot stays the last resort.
+- **Driver-requested retry** (`VBSM_GPU_KICK_REQUEST`, `ui_watchdog.py`): `/dev/shm/vbsm_gpu_kick_request` asks
+  for the kick at the next standstill with openpilot disengaged, without the cruise-main gate and without waiting
+  for the ready marker (the fresh process re-probes and writes the power bit itself). Requests older than 10 min
+  are discarded, never queued. Vetoes and the two-kicks-per-drive budget still apply; a reboot stays the last resort.
+- **Chestnut icon gestures** (`VBSM_GPU_HUD_TAP`, `hud_renderer.py` + `augmented_road_view.py`): everything the
+  driver needs is on the device. The orange (failed) chestnut icon stays on screen while disengaged -- the only
+  time a retry can fire -- and fades when engaged as before so the dmoji gets the slot back. Tap it: the retry
+  marker above is written and the icon pulses slowly until ui_watchdog consumes it; tap again to cancel. Hold it
+  for 2 s (the icon grows while the finger rests on it) and let go: `DoReboot`, the same param the settings page
+  sets, so the manager reboots even onroad. The gesture is decided in one function (`chestnut_touch_action`,
+  returns `reboot` / `request` / `cancel` / `''`) that swallows every exception, because an exception in the
+  road-view touch handler takes the whole UI down. Taps on a green or loading icon do nothing; a swipe is never a
+  tap. Bench (device, headless, 2026-09-16): tap on orange writes then cancels the marker, off-icon / swipe /
+  green taps do nothing, 1.5 s hold does nothing, 2.1 s hold sets DoReboot in any state, an icon that is not drawn
+  has no target, a broken state object is swallowed.
 - **Kick only when the driver is not about to engage** (`VBSM_GPU_KICK_ARMED`, `ui_watchdog.py`): the
   standstill/disengaged kick now also requires cruise main OFF or the car in Park. A kick throws a
   working SoC model away for a ~35 s no-model reload; on 2026-09-13 it fired 10 s after the driver armed
@@ -279,8 +289,8 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/sunnypilot/mads/mads.py` | §5 LKAS button freed for the toggle | `VBSM_EXP_TOGGLE` |
 | `openpilot/sunnypilot/models/fetcher.py` | §6 manifest storm fix | `VBSM_QUIET` |
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1 settings | `BigConfigControl` |
-| `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap | `BSM_STATE_PATH`, `VBSM_HUD` |
-| `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD` |
+| `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap | `BSM_STATE_PATH`, `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
+| `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
 | `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE` |

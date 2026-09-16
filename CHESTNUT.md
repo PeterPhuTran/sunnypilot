@@ -237,8 +237,8 @@ was moving, then cruise main was on. The 09-13 and 09-14 kicks worked because th
 listed but silent keeps the full 20 s budget and ends as `unreadable` (no strike). After any skip modeld keeps reading
 the bridge at 1 Hz from a daemon thread, writes the PCIe power bit under the preflight's rule at most three times, and
 marks `/dev/shm/vbsm_gpu_link_ready` once 12 V and L0 are seen; the automatic kick waits for that marker whenever the
-skip marker exists. A driver request file (`/dev/shm/vbsm_gpu_kick_request`, touched by the Pi relay from the phone)
-bypasses the cruise-main gate and the ready wait at the next disengaged standstill. Bench (car off, bridge at 1.5 V):
+skip marker exists. A driver request file (`/dev/shm/vbsm_gpu_kick_request`, written by a tap on the orange chestnut icon in the
+HUD; a 2 s hold on the icon reboots) bypasses the cruise-main gate and the ready wait at the next disengaged standstill. Bench (car off, bridge at 1.5 V):
 import opens nothing; real probe `no_12v` in 1.0 s; forced silent bridge `unreadable` after 41 reads / 20.0 s; missing
 bridge `absent` after 6 reads / 2.5 s; late probe in Detect writes one F3 and the wait marker, reaches L0 and writes
 the ready marker then exits, stays quiet and marker-free unpowered and on the real car-off bridge; watchdog gate with

@@ -1,4 +1,5 @@
 import math
+import os
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
@@ -22,6 +23,13 @@ SET_SPEED_PERSISTENCE = 2.5  # seconds
 # VBSM_HUD: how long the chestnut status icon lingers after a state change
 # before yielding the bottom-right slot to the driver-monitoring face
 CHESTNUT_PERSISTENCE = 6.0  # seconds
+# VBSM_GPU_HUD_TAP: the orange (failed) chestnut icon is a tap target. Tap = ask ui_watchdog to
+# restart modeld onto the eGPU at the next disengaged standstill (tap again = cancel); hold for
+# CHESTNUT_HOLD_REBOOT_S = reboot the device. Everything lives on the device: the request is a
+# tmpfs marker ui_watchdog consumes, the reboot is the same DoReboot param the settings page sets.
+GPU_KICK_REQUEST_FILE = "/dev/shm/vbsm_gpu_kick_request"   # same path as ui_watchdog.py
+CHESTNUT_HOLD_REBOOT_S = 2.0
+CHESTNUT_TAP_PAD = 24   # px around the icon that still counts as a tap
 
 
 @dataclass(frozen=True)
@@ -119,6 +127,12 @@ class HudRenderer(Widget):
     self._engaged: bool = False
     self._cruise_resumable: bool = False
     self._chestnut_fade_time: float = 0
+    # VBSM_GPU_HUD_TAP: tap target (zero rect while the icon is not drawn), the pending-request
+    # flag (rechecked every 0.5 s), and the hold start the touch handler sets for the press feedback
+    self.chestnut_icon_rect = rl.Rectangle(0, 0, 0, 0)
+    self.chestnut_requested: bool = False
+    self._chestnut_request_checked: float = 0.0
+    self.chestnut_hold_since: float | None = None
 
     self._can_draw_top_icons = True
     self._show_wheel_critical = False
@@ -227,31 +241,49 @@ class HudRenderer(Widget):
     if ui_state.sm.recv_frame['selfdriveState'] < ui_state.started_frame:
       return
 
+    now = rl.get_time()
+    if now - self._chestnut_request_checked > 0.5:
+      self._chestnut_request_checked = now
+      self.chestnut_requested = os.path.exists(GPU_KICK_REQUEST_FILE)
     loading = ui_state.chestnut_state == ChestnutState.LOADING
+    failed = ui_state.chestnut_state in (ChestnutState.UNCOMPILED, ChestnutState.FAILED)
     if loading:
       icon = self._txt_chestnut
-      opacity = 0.35 + 0.65 * (0.5 - 0.5 * math.cos(rl.get_time() * 6.0))
-    elif ui_state.chestnut_state in (ChestnutState.UNCOMPILED, ChestnutState.FAILED):
+      opacity = 0.35 + 0.65 * (0.5 - 0.5 * math.cos(now * 6.0))
+    elif failed:
       icon = self._txt_chestnut_orange
-      opacity = 1.0
+      # VBSM_GPU_HUD_TAP: a queued retry pulses slowly so the driver knows the tap registered
+      opacity = 0.45 + 0.55 * (0.5 - 0.5 * math.cos(now * 3.0)) if self.chestnut_requested else 1.0
     elif ui_state.chestnut_state == ChestnutState.ACTIVE:
       icon = self._txt_chestnut_green
       opacity = 1.0
     else:
+      self.chestnut_icon_rect = rl.Rectangle(0, 0, 0, 0)
       return
 
     if icon is not self._chestnut_icon:
-      self._chestnut_fade_time = rl.get_time()
+      self._chestnut_fade_time = now
       self._chestnut_icon = icon
-    # VBSM_HUD: linger longer than the set-speed fade so the state is readable
-    visible = loading or rl.get_time() - self._chestnut_fade_time < CHESTNUT_PERSISTENCE
+    # VBSM_HUD: linger longer than the set-speed fade so the state is readable.
+    # VBSM_GPU_HUD_TAP: the failed state stays visible while disengaged -- that is the only time a
+    # retry can fire, and the tap target has to be on screen. Engaged, it fades as before so the
+    # dmoji gets the slot back (chestnut_icon_visible() gates it).
+    visible = loading or (failed and not self._engaged) or now - self._chestnut_fade_time < CHESTNUT_PERSISTENCE
     alpha = self._chestnut_alpha_filter.update(visible)
     if alpha < 1e-2:
+      self.chestnut_icon_rect = rl.Rectangle(0, 0, 0, 0)
       return
 
     pos = rl.Vector2(rect.x + rect.width - 10 - icon.width,
                      rect.y + rect.height - 14 - (self._txt_wheel.height + icon.height) / 2)
-    rl.draw_texture_ex(icon, pos, 0.0, 1.0, rl.Color(255, 255, 255, int(255 * opacity * alpha)))
+    self.chestnut_icon_rect = rl.Rectangle(pos.x - CHESTNUT_TAP_PAD, pos.y - CHESTNUT_TAP_PAD,
+                                           icon.width + 2 * CHESTNUT_TAP_PAD, icon.height + 2 * CHESTNUT_TAP_PAD)
+    scale = 1.0
+    if self.chestnut_hold_since is not None:
+      # press feedback: the icon grows toward the reboot threshold, then holds
+      scale = 1.0 + 0.4 * min(1.0, (now - self.chestnut_hold_since) / CHESTNUT_HOLD_REBOOT_S)
+      pos = rl.Vector2(pos.x - icon.width * (scale - 1.0), pos.y - icon.height * (scale - 1.0))
+    rl.draw_texture_ex(icon, pos, 0.0, scale, rl.Color(255, 255, 255, int(255 * opacity * alpha)))
 
   def _draw_steering_wheel(self, rect: rl.Rectangle) -> None:
     wheel_txt = self._txt_wheel_critical if self._show_wheel_critical else self._txt_wheel
