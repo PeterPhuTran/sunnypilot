@@ -73,6 +73,16 @@ GPU_KICK_COOLDOWN_S = 120.0
 MAX_GPU_KICKS = 2        # per drive; a modeld that then dies on AMD is the
                          # manager restart policy's problem, not a kick loop
 GPU_VEGO_MAX = 0.5       # m/s — only ever kick at a standstill
+# VBSM_GPU_KICK_REQUEST: the driver asked for an eGPU retry (touched by the Pi relay over
+# ssh, or by hand). Honoured at the same standstill/disengaged point, without the
+# cruise-main gate; discarded once stale so it can never fire minutes later by surprise.
+GPU_KICK_REQUEST_FILE = "/dev/shm/vbsm_gpu_kick_request"
+GPU_KICK_REQUEST_MAX_AGE_S = 600.0
+# VBSM_GPU_LATE: modeld skipped the eGPU (dead outlet / bridge absent or unreadable / link
+# never trained) and keeps probing the bridge from a thread; it writes the ready marker
+# once it has seen 12 V and PCIe L0. Both are tmpfs, written fresh by every modeld process.
+GPU_LINK_WAIT_FILE = "/dev/shm/vbsm_gpu_link_wait"
+GPU_LINK_READY_FILE = "/dev/shm/vbsm_gpu_link_ready"
 
 
 def find_proc(match, exclude=()):
@@ -148,7 +158,7 @@ class GpuKick:
     self.modeld_seen = None  # (pid, monotonic first seen)
     self.gpu_was_active = False
     self.kicks = 0
-    self.last_kick = 0.0
+    self.last_kick = None       # monotonic; None until the first kick (see the cooldown note)
     self.rail_ok_since = None   # monotonic since the rail entered the charging band
     self.retry_used = False     # one mid-drive eGPU retry per drive
     self.veto_seen = False      # edge-detect a fresh veto to restart the hold window
@@ -190,6 +200,23 @@ class GpuKick:
         return f.read(4) == "hang"
     except OSError:
       return False
+
+  def _kick_requested(self, now):
+    """A driver request file younger than GPU_KICK_REQUEST_MAX_AGE_S. Older ones are
+    deleted and logged, never queued: a request made while moving should fire at
+    the next stop, not at some stop ten minutes later."""
+    try:
+      age = time.time() - os.path.getmtime(GPU_KICK_REQUEST_FILE)
+    except OSError:
+      return False
+    if age > GPU_KICK_REQUEST_MAX_AGE_S:
+      try:
+        os.remove(GPU_KICK_REQUEST_FILE)
+      except OSError:
+        pass
+      cloudlog.warning(f"ui_watchdog: stale eGPU retry request ({age:.0f}s old) discarded")
+      return False
+    return True
 
   def _hang_strikes(self):
     try:
@@ -294,7 +321,12 @@ class GpuKick:
 
     if now - self.gpu_since < GPU_STABLE_S or now - self.modeld_seen[1] < MODELD_SETTLE_S:
       return
-    if self.kicks >= MAX_GPU_KICKS or now - self.last_kick < GPU_KICK_COOLDOWN_S:
+    # `now` is time.monotonic(), which starts near zero at boot. With last_kick
+    # initialised to 0.0 the cooldown read as "kicked at boot" and refused every
+    # kick in the first 120 s of uptime -- exactly the window a cold boot into
+    # onroad offers (2026-09-16: 40 s standstill from route second 9, cruise main
+    # off, all other gates open, no kick; the driver rebooted instead).
+    if self.kicks >= MAX_GPU_KICKS or (self.last_kick is not None and now - self.last_kick < GPU_KICK_COOLDOWN_S):
       return
     # VBSM_GPU_RETRY: a mid-run hang vetoes the eGPU for the drive, but the
     # brownout behind it is transient -- the rail returns to the charging band
@@ -351,7 +383,16 @@ class GpuKick:
     # rest of the drive. Reload only while the driver is not about to engage:
     # cruise main off, or the car in Park (a boot-in-Park kick is invisible).
     cs = sm['carState']
-    if cs.cruiseState.available and str(cs.gearShifter) != 'park':
+    requested = self._kick_requested(now)
+    if not requested and cs.cruiseState.available and str(cs.gearShifter) != 'park':
+      return
+    # VBSM_GPU_LATE: modeld skipped the eGPU because the outlet was dead or the
+    # bridge never answered / never trained (2026-09-16: bridge enumerated but
+    # unreadable for the first ~30 s of a cold boot). A kick before its late probe
+    # has seen 12 V and L0 would only buy another skip: 30 s without a model for
+    # nothing. A driver's request goes ahead regardless -- the fresh process
+    # re-probes and writes the PCIe power bit itself if the link is in Detect.
+    if not requested and os.path.exists(GPU_LINK_WAIT_FILE) and not os.path.exists(GPU_LINK_READY_FILE):
       return
 
     # clear the veto only here, with the car stopped and disengaged and the kick
@@ -369,10 +410,17 @@ class GpuKick:
       cloudlog.warning(f"ui_watchdog: rail held {volt}mV for "
                        f"{now - self.rail_ok_since:.0f}s; spending this drive's one eGPU retry")
 
+    if requested:
+      try:
+        os.remove(GPU_KICK_REQUEST_FILE)
+      except OSError:
+        pass
     self.kicks += 1
     self.last_kick = now
     cloudlog.error(f"ui_watchdog: gpu present but modeld pid {pid} booted without it; "
-                   f"kicking for AMD reload ({self.kicks}/{MAX_GPU_KICKS})")
+                   f"kicking for AMD reload ({self.kicks}/{MAX_GPU_KICKS}, "
+                   f"{'driver request' if requested else 'auto'}, link_wait={os.path.exists(GPU_LINK_WAIT_FILE)}, "
+                   f"link_ready={os.path.exists(GPU_LINK_READY_FILE)})")
     try:
       os.kill(pid, signal.SIGKILL)
     except OSError as e:

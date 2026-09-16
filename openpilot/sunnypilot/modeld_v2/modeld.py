@@ -352,6 +352,12 @@ CHESTNUT_F3_RESEND_S = 10.0      # re-send F3=1 only if the LTSSM is still in De
 CHESTNUT_POWERED_MV = 5000       # helpers.CHESTNUT_POWERED_VOLTAGE
 CHESTNUT_PCIE_L0 = 0x78
 CHESTNUT_LOCK_DIR = "/tmp"
+# VBSM_GPU_LATE: after a skipped eGPU the bridge is re-read from a thread at 1 Hz until it shows 12 V and L0;
+# ui_watchdog gates its automatic kick on the ready marker so a kick never buys a second skip.
+CHESTNUT_LINK_WAIT_FILE = "/dev/shm/vbsm_gpu_link_wait"
+CHESTNUT_LINK_READY_FILE = "/dev/shm/vbsm_gpu_link_ready"
+CHESTNUT_LATE_PROBE_S = 1.0
+CHESTNUT_LATE_F3_MAX = 3         # PCIe power-on writes the late probe may spend (same resend rule as the preflight)
 _last_f3 = float("-inf")
 _f3_writes = 0
 
@@ -432,6 +438,16 @@ def chestnut_raw() -> tuple[int, int, int] | None:
     os.close(fd)
 
 
+def chestnut_enumerated() -> bool:
+  """sysfs lists the bridge (VID:PID and product string): the presence test hardwared and the watchdog use. On
+  2026-09-16 the bridge was enumerated at SuperSpeed from boot but answered no control transfer for ~30 s."""
+  try:
+    from openpilot.system.hardware.chestnut.flash import find_chestnut
+    return find_chestnut()[0] is not None
+  except Exception:
+    return False
+
+
 def chestnut_f3_on() -> bool:
   """ONE PCIe power-on write (0xF3=1) with tinygrad's timeout; own fd; False on any exception."""
   global _last_f3, _f3_writes
@@ -458,15 +474,63 @@ def chestnut_f3_on() -> bool:
     os.close(fd)
 
 
+def chestnut_late_probe(skip_reason: str) -> None:
+  """VBSM_GPU_LATE: after the eGPU was skipped, keep reading the bridge at 1 Hz (read-only usbdevfs, own fd; fcntl.ioctl
+  releases the GIL, so this daemon thread cannot stall the SoC model). With 12 V and the link in Detect, write the PCIe
+  power bit under the preflight's resend rule, at most CHESTNUT_LATE_F3_MAX times. Once 12 V and L0 are seen, write the
+  ready marker for ui_watchdog's kick and stop. Never raises; never touches tinygrad."""
+  cloudlog.bind(daemon=PROCESS_NAME)
+  t0 = time.monotonic()
+  reads = f3 = 0
+  powered_logged = False
+  try:
+    with open(CHESTNUT_LINK_WAIT_FILE, "w") as f:
+      f.write(f"{skip_reason} {int(time.time())}")
+  except OSError:
+    pass
+  while True:
+    try:
+      time.sleep(CHESTNUT_LATE_PROBE_S)
+      raw = chestnut_raw()
+      reads += 1
+      if raw is None:
+        continue
+      mv, _, lt = raw
+      if mv >= CHESTNUT_POWERED_MV and not powered_logged:
+        powered_logged = True
+        cloudlog.event("chestnut late probe sees 12v", skip_reason=skip_reason, reads=reads, wait_s=round(time.monotonic() - t0, 1),
+                       **chestnut_fields(raw))
+      if mv >= CHESTNUT_POWERED_MV and lt == CHESTNUT_PCIE_L0:
+        try:
+          with open(CHESTNUT_LINK_READY_FILE, "w") as f:
+            f.write(f"{skip_reason} {int(time.time())}")
+        except OSError:
+          pass
+        cloudlog.event("chestnut link ready late", skip_reason=skip_reason, reads=reads, f3_writes=f3, f3_total=_f3_writes,
+                       wait_s=round(time.monotonic() - t0, 1), **chestnut_fields(raw))
+        return
+      if (mv >= CHESTNUT_POWERED_MV and lt in (0x00, 0x01) and f3 < CHESTNUT_LATE_F3_MAX
+          and time.monotonic() - _last_f3 >= CHESTNUT_F3_RESEND_S):
+        f3 += 1
+        ok = chestnut_f3_on()
+        cloudlog.event("chestnut late f3", skip_reason=skip_reason, written=ok, f3_writes=f3, f3_total=_f3_writes,
+                       wait_s=round(time.monotonic() - t0, 1), **chestnut_fields(raw))
+    except Exception:
+      cloudlog.exception("chestnut late probe error")
+      return
+
+
 def chestnut_fields(raw) -> dict:
   return {"supply_mv": raw[0], "supply_ma": raw[1], "ltssm": f"0x{raw[2]:02x}"} if raw else {"supply_mv": None, "supply_ma": None, "ltssm": None}
 
 
 def wait_chestnut_ready(t_main: float) -> str:
-  """'ready' | 'timeout' | 'no_12v' | 'absent' | 'probe_error'. Never raises. Read-first: F3=1 only with 12 V and the link
-  down; the preflight's write counts (f3_total), so a cold boot normally shows f3_writes=0 here and f3_total=1."""
+  """'ready' | 'timeout' | 'no_12v' | 'absent' | 'unreadable' | 'probe_error'. Never raises. Read-first: F3=1 only with
+  12 V and the link down; the preflight's write counts (f3_total), so a cold boot normally shows f3_writes=0 here and
+  f3_total=1. 'absent' = six reads with no bridge in sysfs; 'unreadable' = the bridge is enumerated but answered no
+  read by the deadline (2026-09-16 cold boot: enumerated at 5000 Mb/s from boot, silent for ~30 s)."""
   t0 = time.monotonic()
-  reads = f3 = misses = unpowered = 0
+  reads = f3 = misses = unpowered = unreadable = 0
   raw = None
   reason = "timeout"
   try:
@@ -476,10 +540,13 @@ def wait_chestnut_ready(t_main: float) -> str:
       raw = chestnut_raw()
       reads += 1
       if raw is None:
-        misses += 1
-        if misses >= 6:
-          reason = "absent"
-          break
+        if chestnut_enumerated():
+          unreadable += 1   # present on the bus, not answering: keep the whole budget, it may wake up
+        else:
+          misses += 1
+          if misses >= 6:
+            reason = "absent"
+            break
       else:
         mv, _, lt = raw
         if lt == CHESTNUT_PCIE_L0:
@@ -495,13 +562,13 @@ def wait_chestnut_ready(t_main: float) -> str:
           f3 += 1
           chestnut_f3_on()
       if time.monotonic() >= deadline:
-        reason = "timeout"
+        reason = "unreadable" if raw is None and unreadable else "timeout"
         break
       time.sleep(CHESTNUT_READY_POLL_S)
   except Exception:
     cloudlog.exception("chestnut link probe error")
     return "probe_error"
-  fields = dict(reason=reason, reads=reads, f3_writes=f3, f3_total=_f3_writes, wait_s=round(time.monotonic() - t0, 1),
+  fields = dict(reason=reason, reads=reads, unreadable=unreadable, f3_writes=f3, f3_total=_f3_writes, wait_s=round(time.monotonic() - t0, 1),
                 main_age_s=round(time.monotonic() - t_main, 1), pid_age_s=round(time.monotonic() - PROC_START, 1), **chestnut_fields(raw))
   if reason == "ready":
     cloudlog.event("chestnut link ready", error=False, **fields)
@@ -533,6 +600,11 @@ def main(demo=False):
   params = Params()
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
+  for stale in (CHESTNUT_LINK_WAIT_FILE, CHESTNUT_LINK_READY_FILE):   # VBSM_GPU_LATE: every process decides afresh
+    try:
+      os.remove(stale)
+    except OSError:
+      pass
   if CHESTNUT:
     # VBSM_GPU_READY preflight: record the bridge state this process starts from and, with
     # 12 V present and the link down, send the single PCIe power-on now so link training
@@ -663,7 +735,10 @@ def main(demo=False):
     else:
       cloudlog.event("eGPU load skipped; link not ready", reason=ready_reason, error=True)   # nothing opened: no lock, no claim
     model = big_model
-    if model is None and ready_reason in ("no_12v", "absent"):
+    if model is None and ready_reason in ("no_12v", "absent", "unreadable", "timeout"):
+      # VBSM_GPU_LATE: keep watching the bridge; ui_watchdog kicks only once it reports 12 V + L0
+      threading.Thread(target=chestnut_late_probe, args=(ready_reason,), daemon=True).start()
+    if model is None and ready_reason in ("no_12v", "absent", "unreadable"):
       # nothing was attempted: no strike toward the boot-scoped veto; the kick may retry later
       params.put_bool("ChestnutModelError", True)
     elif model is None:

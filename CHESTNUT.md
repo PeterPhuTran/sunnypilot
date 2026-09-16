@@ -212,3 +212,41 @@ first process in 26.0 s / 23.1 s, `bigModelReady` once per start, 100 % big fram
 segments. The cold-boot link-down path (preflight LTSSM != 0x78 with 12 V, one F3 write, polling) is still
 unobserved: expect, from the first modeld pid, `chestnut preflight ... ltssm=0x00 f3_written=true`, `chestnut link
 ready reason=ready f3_writes=0 f3_total=1 wait_s=X`, `chestnut ppt limit ... open_ms`, `models loaded in ~25s`.
+
+## Silent bridge at a cold boot, and a kick that could not fire (issue 11, 2026-09-16)
+
+**Symptom.** Cold boot after a park-voltage shutdown, car started straight into Drive. The small model ran the whole
+short drive, the HUD showed the orange chestnut, and the driver rebooted the device from the settings screen about
+three minutes in; the next boot loaded the big model in 24 s. No crash, no hang, no lock error.
+
+**What the logs show.** `deviceState.usbState` listed the bridge at 5000 Mb/s with the pinned product string from
+the first second, so the enclosure was on the bus. modeld's preflight at pid age 8 s read nothing (`supply_mv null`),
+the probe recorded six failed reads in 2.5 s and returned `absent`, and the SoC model was up 4.5 s later. modeld's own
+INA telemetry (a separate libusb handle, 2 Hz) published 0 mV until route second 29 and 13.8 V from then on: the
+bridge answered no vendor control transfer for roughly the first 30 s and then answered normally. The journal is
+volatile, so no `dmesg` from that boot survives; whether the link would have trained without the reboot is unknown
+(`pcieLtssm` in `chestnutState` is only real once modeld owns the AMD device).
+
+**Why nothing recovered it.** The safety net for a skip is ui_watchdog's kick. The car sat at a standstill from route
+second 9 to 48 with cruise main off, openpilot disengaged, `ChestnutLoading` False, the bundle slot filled -- every
+gate open -- and no kick fired. `last_kick` was initialised to 0.0 and `now` is `time.monotonic()`, which is seconds
+since boot, so the 120 s cooldown was still "running" from a kick that never happened. By the time it expired the car
+was moving, then cruise main was on. The 09-13 and 09-14 kicks worked because the device had been up for hours.
+
+**Fix (b4356272 -> this commit).** Cooldown starts at `None`. `absent` now means "not in sysfs"; a bridge that is
+listed but silent keeps the full 20 s budget and ends as `unreadable` (no strike). After any skip modeld keeps reading
+the bridge at 1 Hz from a daemon thread, writes the PCIe power bit under the preflight's rule at most three times, and
+marks `/dev/shm/vbsm_gpu_link_ready` once 12 V and L0 are seen; the automatic kick waits for that marker whenever the
+skip marker exists. A driver request file (`/dev/shm/vbsm_gpu_kick_request`, touched by the Pi relay from the phone)
+bypasses the cruise-main gate and the ready wait at the next disengaged standstill. Bench (car off, bridge at 1.5 V):
+import opens nothing; real probe `no_12v` in 1.0 s; forced silent bridge `unreadable` after 41 reads / 20.0 s; missing
+bridge `absent` after 6 reads / 2.5 s; late probe in Detect writes one F3 and the wait marker, reaches L0 and writes
+the ready marker then exits, stays quiet and marker-free unpowered and on the real car-off bridge; watchdog gate with
+fakes: kick at uptime 30 s with cruise off, none with cruise on, kick on a request with cruise on, none with the wait
+marker alone, kick with wait + ready, stale request discarded, cooldown and two-per-drive budget unchanged, never
+while moving or engaged.
+
+**Open.** Why the bridge stays silent after enumeration on some cold boots (this is the first such boot in 13 logged
+starts on the readiness build). The late probe's events will show whether the link trains by itself, needs the F3
+write, or never comes up; `chestnut link ready late` followed by a kick and a big-model load is the good outcome.
+

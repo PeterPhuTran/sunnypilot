@@ -154,6 +154,27 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   external holder the retry passes the flock once the holder is gone. The 2026-09-13 ladder (retry on any lock text)
   could never recover: the failing process was blocking on its own leaked descriptor. The e0c253de rule ("retry if no
   leaked fd") could never fire either: a flock refusal still leaves an unlocked fd behind.
+- **Late link probe, readiness-gated kick** (`VBSM_GPU_LATE`, `modeld_v2/modeld.py` + `ui_watchdog.py`): on
+  2026-09-16 a cold boot found the bridge enumerated at 5000 Mb/s from the first second but answering no control
+  transfer for ~30 s (modeld's preflight and its own INA telemetry both read nothing until then); the probe called
+  that `absent` after six reads in 2.5 s and the drive ran on the SoC. `absent` now requires the bridge to be missing
+  from sysfs; a bridge that is listed but silent keeps the whole budget and ends as `unreadable` (no strike, like
+  `absent`). After any skip (`no_12v`, `absent`, `unreadable`, `timeout`) modeld keeps reading the bridge at 1 Hz
+  from a daemon thread (the same read-only usbdevfs transfers, own fd; `fcntl.ioctl` releases the GIL), writes the
+  PCIe power bit with the preflight's resend rule at most three times, and writes `/dev/shm/vbsm_gpu_link_ready`
+  once it has seen 12 V and L0 (events `chestnut late probe sees 12v`, `chestnut late f3`, `chestnut link ready
+  late`). `/dev/shm/vbsm_gpu_link_wait` marks the skip; every modeld process clears both at start. ui_watchdog's
+  automatic kick waits for the ready marker whenever the wait marker exists, so a kick can never buy a second skip.
+- **Kick cooldown clock** (`VBSM_GPU_KICK`, `ui_watchdog.py`): `last_kick` started at 0.0 while `now` is
+  `time.monotonic()`, which starts near zero at boot, so the 120 s cooldown read as "kicked at boot" and refused
+  every kick in the first two minutes of uptime -- exactly what a cold boot into onroad offers. 2026-09-16: 40 s
+  standstill from route second 9, cruise main off, every other gate open, no kick; the driver rebooted. Now `None`
+  until the first kick.
+- **Driver-requested retry** (`VBSM_GPU_KICK_REQUEST`, `ui_watchdog.py`): `/dev/shm/vbsm_gpu_kick_request`
+  (touched over ssh by the Pi relay, see `docs/how-to/phone-gpu-retry.md` on the Pi, or by hand) asks for the kick
+  at the next standstill with openpilot disengaged, without the cruise-main gate and without waiting for the ready
+  marker (the fresh process re-probes and writes the power bit itself). Requests older than 10 min are discarded,
+  never queued. Vetoes and the two-kicks-per-drive budget still apply; a reboot stays the last resort.
 - **Kick only when the driver is not about to engage** (`VBSM_GPU_KICK_ARMED`, `ui_watchdog.py`): the
   standstill/disengaged kick now also requires cruise main OFF or the car in Park. A kick throws a
   working SoC model away for a ~35 s no-model reload; on 2026-09-13 it fired 10 s after the driver armed
@@ -249,7 +270,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 |---|---|---|
 | `VBSM.md`, `CHESTNUT.md`, `MODS.md` | documentation | — |
 | `openpilot/sunnypilot/vision_bsm.py` | §1 (additive file) | — |
-| `openpilot/sunnypilot/ui_watchdog.py` | §3, §4 (additive file) | `VBSM_WATCHDOG`, `VBSM_RESTART`, `VBSM_GPU_KICK`, `VBSM_GPU_KICK_ARMED`, `VBSM_GPU_RETRY` |
+| `openpilot/sunnypilot/ui_watchdog.py` | §3, §4 (additive file) | `VBSM_WATCHDOG`, `VBSM_RESTART`, `VBSM_GPU_KICK`, `VBSM_GPU_KICK_ARMED`, `VBSM_GPU_RETRY`, `VBSM_GPU_LATE`, `VBSM_GPU_KICK_REQUEST` |
 | `openpilot/sunnypilot/chestnut_power.py` | §4 (additive file) | `VBSM_GPU_IDLE` |
 | `openpilot/system/manager/process.py` | §3 | `VBSM_RESTART` |
 | `openpilot/system/manager/process_config.py` | §1, §3 process entries | — |
@@ -262,7 +283,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
-| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, lock retry | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_LOCK_RETRY` |
+| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE` |
 | `openpilot/system/hardware/hardwared.py` | §2b park, §4 idle power, §6 shutdown debounce | `VBSM_GPU_IDLE`, `VBSM_PARK` |
 | `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events | `VBSM_PARKWATCH` |
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
