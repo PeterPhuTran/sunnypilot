@@ -274,7 +274,33 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   iterations before `DoShutdown` fires — kills the race where a shutdown latched in the same
   sampling window as an ignition rise and turned a departure into a double boot.
 
-## Managed files (23) and markers
+### 7. Driver-monitoring model pin — `VBSM_DM_PKL_PIN`
+- **What**: `dmonitoring_model_tinygrad.pkl.chunk01of01`, `dm_warp_1344x760_tinygrad.pkl` and
+  `dm_warp_1928x1208_tinygrad.pkl` are carried as managed *binaries*, pinned to the blobs from the
+  pre-`72da24ad` staging tree (`5c969f86`, `06740e07`, `193f9da9`).
+- **Why**: sunnypilot staging `72da24ad` (2026-09-17, master `a5f44653`) recompiled all three
+  pickles with a newer tinygrad than the `tinygrad_repo` it ships (tree `07174c66`, identical to
+  master's submodule pin `f6fc4e3f`, whose `CallInfo` has five fields). The new pickles pass six, so
+  `pickle.load` raises `TypeError: CallInfo.__init__() takes from 1 to 6 positional arguments but 7
+  were given`, `dmonitoringmodeld` dies 5/5, selfdrived raises `commIssue` on `driverMonitoringState`
+  and openpilot cannot engage. Reported upstream as sunnypilot/sunnypilot#2038. `dmonitoringmodeld.py`,
+  `helpers.py`, `file_chunker.py` and the camera transforms are unchanged between the two bases, so
+  the old blobs plus the shipped tinygrad is exactly the stack that ran clean on `a302344e`.
+- **Guard coverage**: the port's drift guard only compares *managed* paths, so a `tinygrad_repo` bump
+  alone is invisible to it. Two tripwires cover the realistic upstream fixes: the pickle blobs (any
+  recompile changes them) and `dmonitoringmodeld.py`, carried byte-identical as a managed file (the
+  open upstream sync sunnypilot/sunnypilot#2036 keeps these exact pickle bytes, bumps `tinygrad_repo`
+  to `9cd40014` and rewrites the reader for dict-format pickles — the reader change is what stops the
+  port). A silent re-break needs upstream to bump tinygrad *without* touching either, which cannot
+  fix #2038, so it is not a working fix path. Belt-and-braces follow-up on master: teach
+  `rebase-vbsm.yml` a drift-only `watch` list (`tinygrad_repo` tree id) next to `files`.
+- **Retire when**: the port stops on any of these four paths. Before dropping them from the manifest,
+  confirm the new pickles unpickle with the *shipped* `tinygrad_repo` (compare the `CallInfo`
+  arity in `tinygrad_repo/tinygrad/uop/ops.py` against the pickle, or boot a bench device) and
+  that the shipped reader matches the pickle format. Never pin the driving-model pickles the same
+  way: those come from the model catalog, not the tree.
+
+## Managed files (27) and markers
 
 | File | Mods | Markers |
 |---|---|---|
@@ -299,6 +325,8 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
 | `openpilot/system/hardware/power_monitoring.py` | §2b parked energy budget | `VBSM_PARK` |
 | `openpilot/selfdrive/locationd/locationd.py` | §4 bounded lockout, buffered message validity | `VBSM_LOC_CAP`, `VBSM_LOC_VALID` |
+| `openpilot/selfdrive/modeld/models/dmonitoring_model_tinygrad.pkl.chunk01of01`, `dm_warp_1344x760_tinygrad.pkl`, `dm_warp_1928x1208_tinygrad.pkl` | §7 pinned binaries (blobs from the pre-`72da24ad` staging tree) | `VBSM_DM_PKL_PIN` (this file only — binaries carry no marker) |
+| `openpilot/selfdrive/modeld/dmonitoringmodeld.py` | §7 tripwire only — carried byte-identical to upstream so the drift guard fires when the pickle reader changes | — |
 
 Retired: `VBSM_COMPAT` (a modeld_v2 unpacking shim, superseded when upstream fixed the API
 properly); `VBSM_GPU_HUD` (a ui_state compiled-gate patch for bundle installs, superseded by
