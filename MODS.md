@@ -51,6 +51,22 @@ two on-demand paths. Honest failures, not faked successes.
 - Sync-aware park (2026-09-11): while the home Pi is pulling footage it touches `/dev/shm/vbsm_sync_active`
   once per batch; a marker younger than 30 min suspends the budget and timer rules so a park never ends
   mid-sync. The 11.8 V rule and ForcePowerDown are untouched. The record carries `sync_active`.
+- 2026-09-19 `VBSM_PARKWATCH` handback fix (`pandad.py`): every window end used to relaunch pandad through
+  stock's crash ladder — `count` was already odd, so `recover_internal_panda()` put the panda in DFU and
+  reflashed it after every park (~10 s unmonitored, 13x in two days; on the even laps `Panda.list()` was
+  empty 10 ms after the reset pulse and the next lap recovered anyway). `_supervise()` now returns True on
+  the window path and `main()` answers with the plain reset stock does before every launch (re-inits the
+  SPI slave, wipes the window's can-speed/power-save writes; the C++ pandad's first heartbeat re-arms the
+  heartbeat check either way) plus a ≤6 s wait for the app to enumerate, no count bump; the recovery
+  ladder is reached only if nothing enumerates (or `flash_panda` raises, as in stock). `_parkwatch_run()`
+  takes the known serial (no DFU probe on the bus), returns its end reason, skips the panda writes on a
+  failed link (that was the second "cleanup failed" traceback), otherwise leaves the panda in SILENT +
+  power save (stock's parked state, so a manager-exit window end cannot leave it in noOutput at SoM
+  power-off), logs the in-window elapsed time on failure, and a failed window is retried once after a
+  reset when ≥60 s remain. A manager exit is honoured during the enumeration wait and before the relaunch.
+  Log lines: `pandad.flash_and_connect` carries `handback=true/false`; a retry logs `parkwatch retry`.
+  Acceptance: no "Panda in DFU mode found" / "Done flashing" after a `parkwatch window end`; relaunch in a
+  few seconds with `handback=true` and `count` unchanged.
 - 2026-09-08: the budget integrator was inert on the comma four (`get_current_power_draw()` reads a hwmon node that does not exist there, so 0 W). `park_power_draw()` now falls back to the SoM BMS reading (~2.7 W idle, a lower bound of the whole device), then a 3 W floor; the shutdown record carries `draw_w` / `draw_source`. First real record: 9.1 h parked, used 0.0 Wh, ended by the 11.8 V voltage rule.
 
 ### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`
