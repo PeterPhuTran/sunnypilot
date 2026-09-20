@@ -24,9 +24,15 @@ PARK_SHUTDOWN_LOG = "/data/vbsm_shutdowns.jsonl"
 # VBSM_PARK: the comma four has no /sys/class/hwmon/hwmon1/power1_input, so
 # HARDWARE.get_current_power_draw() reads 0 W there and the budget never
 # integrated (field, 2026-09-08: 9.1 h parked, used_wh 0.0, shutdown on the
-# voltage rule). Fall back to the SoM battery-management reading (a lower bound
-# of the whole device: ~2.7 W idle), then to a fixed floor.
-PARK_DRAW_FLOOR_W = 3.0
+# voltage rule). Fall back to the SoM battery-management reading, then to a
+# fixed floor. The BMS sees the SoM only: measured at the panda the whole
+# device draws 4.1-4.8 W parked (5-6 W with diagnostics) while the BMS reads
+# 2.6-3.2 W, so integrating the bare reading spent ~17 Wh per "10 Wh" park
+# (2026-09-19 review: four 3.7 h parks ran the balance to the boot floor).
+# Scale the BMS reading by the measured ratio and never go below the measured
+# whole-device idle.
+PARK_SOM_TO_DEVICE = 1.6
+PARK_DRAW_FLOOR_W = 4.5
 # VBSM_PARK: while the home Pi is actively pulling footage it touches this
 # tmpfs marker (once per batch). A fresh marker suspends the budget and timer
 # rules so a park never ends mid-sync; the 11.8 V rule and ForcePowerDown are
@@ -53,26 +59,34 @@ def park_budget_uWh() -> float:
   return float(max(PARK_BUDGET_MIN_WH, min(PARK_BUDGET_MAX_WH, wh))) * 1e6
 
 
-def park_power_draw() -> tuple[float, str]:
-  """VBSM_PARK: (watts, source) -- the platform sensor when it reads, else the
-  SoM BMS reading, else PARK_DRAW_FLOOR_W. Never below zero."""
+def park_power_draw() -> tuple[float, str, float]:
+  """VBSM_PARK: (watts integrated, source, raw sensor watts) -- the platform
+  sensor when it reads, else the SoM BMS reading scaled to the whole device,
+  else PARK_DRAW_FLOOR_W. The raw reading is kept for the shutdown record so
+  the calibration stays checkable against the sensor. Never below zero."""
   try:
     p = float(HARDWARE.get_current_power_draw() or 0.0)
   except Exception:
     p = 0.0
   if p > 0:
-    return p, "hwmon"
+    return p, "hwmon", p
   try:
     som = float(HARDWARE.get_som_power_draw() or 0.0)
   except Exception:
     som = 0.0
   if som > 0:
-    return som, "bms"
-  return PARK_DRAW_FLOOR_W, "floor"
+    return max(som * PARK_SOM_TO_DEVICE, PARK_DRAW_FLOOR_W), "bms", som
+  return PARK_DRAW_FLOOR_W, "floor", 0.0
 
 VBATT_PAUSE_CHARGING = 11.8           # Lower limit on the LPF car battery voltage
 MAX_TIME_OFFROAD_S = 30*3600
-MIN_ON_TIME_S = 3600
+# VBSM_PARK: upstream keeps a fresh device awake for an hour after boot so a new
+# install is not powered off before it is registered. Here the only offroad
+# boots are updater/deploy reboots while parked, and the hour blocked every
+# park rule each time (2026-09-16: 82 min awake at ~4.5 W on a battery that
+# then rested at 11.89 V). 600 s covers the manager and the updater's
+# post-boot cycle.
+MIN_ON_TIME_S = 600
 DELAY_SHUTDOWN_TIME_S = 300 # Wait at least DELAY_SHUTDOWN_TIME_S seconds after offroad_time to shutdown.
 VOLTAGE_SHUTDOWN_MIN_OFFROAD_TIME_S = 60
 
@@ -94,6 +108,7 @@ class PowerMonitoring:
     self.budget_uWh = park_budget_uWh()
     self.last_eval: dict = {}
     self.draw_w = 0.0
+    self.draw_raw_w = 0.0
     self.draw_source = "none"
     self._draw_source_logged: str | None = None
     if self.budget_uWh != CAR_BATTERY_CAPACITY_uWh:
@@ -144,7 +159,7 @@ class PowerMonitoring:
           self.last_measurement_time = now
       else:
         # Get current power draw somehow
-        current_power, self.draw_source = park_power_draw()
+        current_power, self.draw_source, self.draw_raw_w = park_power_draw()
         self.draw_w = current_power
         if self.draw_source != self._draw_source_logged:
           self._draw_source_logged = self.draw_source
@@ -219,7 +234,7 @@ class PowerMonitoring:
       "delay_ok": bool(offroad_time > DELAY_SHUTDOWN_TIME_S), "min_on_ok": bool(min_on_ok), "started_seen": bool(started_seen),
       "offroad_s": round(offroad_time, 1), "monotonic_s": round(now, 1),
       "capacity_wh": round(self.car_battery_capacity_uWh / 1e6, 3), "used_wh": round(self.power_used_uWh / 1e6, 3),
-      "budget_wh": round(self.budget_uWh / 1e6, 1), "draw_w": round(self.draw_w, 2), "draw_source": self.draw_source,
+      "budget_wh": round(self.budget_uWh / 1e6, 1), "draw_w": round(self.draw_w, 2), "draw_source": self.draw_source, "raw_w": round(self.draw_raw_w, 2),
       "lpf_mV": int(self.car_voltage_mV), "instant_mV": int(self.car_voltage_instant_mV),
     }
     return should_shutdown
