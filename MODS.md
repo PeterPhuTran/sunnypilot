@@ -67,6 +67,16 @@ two on-demand paths. Honest failures, not faked successes.
   Log lines: `pandad.flash_and_connect` carries `handback=true/false`; a retry logs `parkwatch retry`.
   Acceptance: no "Panda in DFU mode found" / "Done flashing" after a `parkwatch window end`; relaunch in a
   few seconds with `handback=true` and `count` unchanged.
+- 2026-09-20 (`VBSM_PARK` calibration): the BMS fallback only sees the SoM (2.6–3.2 W) while the whole
+  device draws 4.1–4.8 W at the panda, so the "10 Wh" knob was spending ~17 Wh per park (four 3.7 h parks ran
+  the balance to the boot floor in the 09-19 review). `park_power_draw()` now scales the BMS reading by
+  `PARK_SOM_TO_DEVICE = 1.6` and floors at `PARK_DRAW_FLOOR_W = 4.5`; with the knob at 10 Wh a budget-ended
+  park is ~2.2 h. `MIN_ON_TIME_S` 3600 → 600: upstream's hour is for a fresh install's registration, here it
+  blocked every park rule for an hour after each updater/deploy reboot while parked (09-16: 82 min awake).
+  The shutdown record gains `raw_w` (the unscaled sensor reading) next to the integrated `draw_w`, so the
+  calibration stays checkable. Acceptance: budget-ended parks around 2.2 h (`used_wh` ≈ 10 at `offroad_s`
+  ≈ 7,500–8,500 with `raw_w` 2.5–3.9), and a park after a parked reboot ends within the hour instead of
+  at `monotonic_s` ≈ 3,600. Old records carry the raw BMS value in `draw_w`; split any trend at this commit.
 - 2026-09-08: the budget integrator was inert on the comma four (`get_current_power_draw()` reads a hwmon node that does not exist there, so 0 W). `park_power_draw()` now falls back to the SoM BMS reading (~2.7 W idle, a lower bound of the whole device), then a 3 W floor; the shutdown record carries `draw_w` / `draw_source`. First real record: 9.1 h parked, used 0.0 Wh, ended by the 11.8 V voltage rule.
 
 ### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`, `VBSM_EXIT`
