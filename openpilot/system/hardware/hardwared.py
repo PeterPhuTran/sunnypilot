@@ -66,7 +66,7 @@ class Chestnut:
   def flash(self) -> None:
     ret = subprocess.run(["sudo", sys.executable, os.path.join(BASEDIR, "openpilot/system/hardware/chestnut/flash.py"), CHESTNUT_FW_VERSION],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
-    cloudlog.event("chestnut flash done", returncode=ret.returncode, output=ret.stdout[-1000:], error=ret.returncode != 0)
+    cloudlog.event("chestnut flash done", returncode=ret.returncode, output=ret.stdout[-1000:], **({"error": True} if ret.returncode != 0 else {}))  # VBSM_LOG_LEVEL
     self.flashed = ret.returncode == 0
 
   # VBSM_GPU_IDLE: cut the GPU rails while parked. The enclosure holds 12V on
@@ -91,7 +91,9 @@ class Chestnut:
     ret = subprocess.run(["sudo", sys.executable, "-B", os.path.join(BASEDIR, "openpilot/sunnypilot/chestnut_power.py"), cmd],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=30)
     ok = ret.returncode == 0
-    cloudlog.event("chestnut gpu rails", cmd=cmd, success=ok, output=ret.stdout[-200:], error=not ok)
+    # VBSM_LOG_LEVEL: SwagLogger.event() logs at ERROR whenever an `error` kwarg
+    # is present, whatever its value, so only pass it on failure
+    cloudlog.event("chestnut gpu rails", cmd=cmd, success=ok, output=ret.stdout[-200:], **({"error": True} if not ok else {}))
     if ok:
       self.rails_state = cmd
 

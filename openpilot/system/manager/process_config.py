@@ -184,7 +184,9 @@ procs += [
   NativeProcess("modeld_tinygrad", "openpilot/sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model)),
 
   # Backup
-  PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
+  # VBSM_EXIT: its asyncio loop blocks in rk.keep_time() and never sees SIGINT, so the manager waited the
+  # 5 s grace and SIGKILLed it at every drive start anyway; skip straight to the kill it was getting
+  PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim), sigkill=True),
 
   # Camera blind spot monitor
   PythonProcess("visionbsmd", "openpilot.sunnypilot.vision_bsm", vision_bsm, enabled=MICI),

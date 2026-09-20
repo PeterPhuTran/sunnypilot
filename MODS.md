@@ -69,7 +69,7 @@ two on-demand paths. Honest failures, not faked successes.
   few seconds with `handback=true` and `count` unchanged.
 - 2026-09-08: the budget integrator was inert on the comma four (`get_current_power_draw()` reads a hwmon node that does not exist there, so 0 W). `park_power_draw()` now falls back to the SoM BMS reading (~2.7 W idle, a lower bound of the whole device), then a 3 W floor; the shutdown record carries `draw_w` / `draw_source`. First real record: 9.1 h parked, used 0.0 Wh, ended by the 11.8 V voltage rule.
 
-### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`
+### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`, `VBSM_EXIT`
 - `process.py`: upstream's manager never restarts a process that dies mid-session — one crash means
   the process (and, for the driving model, openpilot engagement) is gone until reboot. The manager
   now reaps a dead child and rebuilds it: 5 restarts per DRIVE, 10 s apart, then it parks with its
@@ -80,6 +80,22 @@ two on-demand paths. Honest failures, not faked successes.
   A crash *loop* is still bounded within a drive by the cap and `MIN_RESTART_GAP_S`.
 - `ui_watchdog.py`: detects a UI that is alive but no longer rendering (frame-beacon based, exact
   proctitle match) and kills it for the manager to rebuild. Grew three GPU duties over time — see §4.
+- `VBSM_EXIT` (2026-09-20): two processes were SIGKILLed at every ignition edge. `modeld_v2/modeld.py`:
+  the manager's SIGINT lands mid-frame and the normal interpreter exit then walks tinygrad's USB/AMD
+  teardown (atexit + GC), which outlives the 5 s grace — so every car-off logged `sending signal 2` then
+  `sending signal 9 to modeld_tinygrad`; the `KeyboardInterrupt` handler now does `time.sleep(0.2)` +
+  `os._exit(0)` like the wedge path. Skipping the teardown is safe: the usbdevfs claim and lock die with
+  the process, hardwared cuts the rails 120 s into the park (a power cycle clears everything), and a
+  re-open inside those 120 s finds `SCRATCH_REG6` set and takes tinygrad's own full-reset path (mode1
+  reset, ~1–2 s slower `open_ms`) — the same path a ui_watchdog SIGKILL kick already produces. Two
+  known costs: the GPU is not put at DPM level 0 for those ≤120 s (slightly higher idle draw until
+  rails-off), and a SIGINT that lands inside a synchronous libusb transfer is only honoured when the
+  transfer returns, so the odd `signal 9` can still appear — expect the common case, not 100 %.
+  `process_config.py`: upstream's `backup_manager` blocks in `rk.keep_time()` inside `asyncio.run` and
+  never sees SIGINT, so it was SIGKILLed after 5 s at every drive start; it is now `sigkill=True`, the
+  same outcome without the stall (upstream fix would be `await asyncio.sleep(1.0)` in its main loop).
+  Acceptance: at car-off `modeld_tinygrad is dead with 0` and no `signal 9` for it; at drive start a
+  single `sending signal 9 to backup_manager` with no preceding `signal 2`.
 
 #### Port note — 2026-09-07 rebase onto sunnypilot `40d6afd3` (v2026.003.000)
 Upstream squashed `staging` (no common ancestor with the previous base `45515f72`), so this was a
@@ -281,7 +297,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   same source the power monitor uses). Renders only while the screen is already awake; adds no
   screen-on time and no measurable power draw.
 
-### 6. Boot & log hygiene — `VBSM_QUIET`
+### 6. Boot & log hygiene — `VBSM_QUIET`, `VBSM_LOG_LEVEL`
 - **Chunk-manifest storm fix** (`models/fetcher.py`): two catalog entries share a fileName with
   different chunk counts, flipping the same manifest twice per second forever (93 % of log volume,
   ~2 h retention). Manifests are now written only when the chunks exist locally. Reported upstream
@@ -289,6 +305,12 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 - **Shutdown debounce** (`hardwared.py`): the offroad shutdown decision must hold for 2 consecutive
   iterations before `DoShutdown` fires — kills the race where a shutdown latched in the same
   sampling window as an ignition rise and turned a departure into a double boot.
+- **`VBSM_LOG_LEVEL`** (2026-09-20): `SwagLogger.event()` (`common/logging_extra.py`) logs at ERROR
+  whenever an `error` kwarg is *present*, whatever its value. `hardwared.py` passed `error=not ok` on
+  `chestnut gpu rails` and `error=<bool>` on `chestnut flash done`; `modeld.py` passed `error=False` on
+  `chestnut link ready`, `chestnut preflight`, `chestnut ppt limit` and `eGPU load succeeded after lock
+  retry` — six success events logged as errors (an AST census of all 21 `.event(` sites carrying
+  `error=` in the managed files found exactly these six; the other 15 are genuine failures). The kwarg is now passed only on failure; the failure siblings keep `error=True`.
 
 ### 7. Driver-monitoring model pin — `VBSM_DM_PKL_PIN`
 - **What**: `dmonitoring_model_tinygrad.pkl.chunk01of01`, `dm_warp_1344x760_tinygrad.pkl` and
@@ -325,7 +347,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/sunnypilot/ui_watchdog.py` | §3, §4 (additive file) | `VBSM_WATCHDOG`, `VBSM_RESTART`, `VBSM_GPU_KICK`, `VBSM_GPU_KICK_ARMED`, `VBSM_GPU_RETRY`, `VBSM_GPU_LATE`, `VBSM_GPU_KICK_REQUEST` |
 | `openpilot/sunnypilot/chestnut_power.py` | §4 (additive file) | `VBSM_GPU_IDLE` |
 | `openpilot/system/manager/process.py` | §3 | `VBSM_RESTART` |
-| `openpilot/system/manager/process_config.py` | §1, §3 process entries | — |
+| `openpilot/system/manager/process_config.py` | §1, §3 process entries, backup_manager sigkill | `VBSM_EXIT` |
 | `openpilot/selfdrive/car/card.py` | §1 | — |
 | `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §4 big-model alerts, §5 personality re-read + LKAS toggle | `VBSM_CHIME_HOLD`, `VBSM_CONFIG`, `VBSM_GPU_ALERTS`, `VBSM_HUD`, `VBSM_EXP_TOGGLE`, `VBSM_LKAS_REPURPOSED` |
 | `openpilot/sunnypilot/mads/mads.py` | §5 LKAS button freed for the toggle | `VBSM_EXP_TOGGLE` |
@@ -335,8 +357,8 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
-| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE` |
-| `openpilot/system/hardware/hardwared.py` | §2b park, §4 idle power, §6 shutdown debounce | `VBSM_GPU_IDLE`, `VBSM_PARK` |
+| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
+| `openpilot/system/hardware/hardwared.py` | §2b park, §4 idle power, §6 shutdown debounce + rails/flash log level | `VBSM_GPU_IDLE`, `VBSM_PARK`, `VBSM_LOG_LEVEL` |
 | `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events | `VBSM_PARKWATCH` |
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
 | `openpilot/system/hardware/power_monitoring.py` | §2b parked energy budget | `VBSM_PARK` |

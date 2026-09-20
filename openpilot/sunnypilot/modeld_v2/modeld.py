@@ -571,7 +571,7 @@ def wait_chestnut_ready(t_main: float) -> str:
   fields = dict(reason=reason, reads=reads, unreadable=unreadable, f3_writes=f3, f3_total=_f3_writes, wait_s=round(time.monotonic() - t0, 1),
                 main_age_s=round(time.monotonic() - t_main, 1), pid_age_s=round(time.monotonic() - PROC_START, 1), **chestnut_fields(raw))
   if reason == "ready":
-    cloudlog.event("chestnut link ready", error=False, **fields)
+    cloudlog.event("chestnut link ready", **fields)  # VBSM_LOG_LEVEL: no error kwarg on success
   else:
     cloudlog.event("chestnut link not ready", error=True, **fields)
   return reason
@@ -617,7 +617,7 @@ def main(demo=False):
         f3_written = chestnut_f3_on()
       cloudlog.event("chestnut preflight", dev=os.environ.get("DEV"), amd_opened=("AMD" in Device._opened_devices),
                      lock_fds=len(chestnut_lock_fds()), pid_age_s=round(time.monotonic() - PROC_START, 1), f3_written=f3_written,
-                     ltssm_after=(f"0x{r[2]:02x}" if f3_written and (r := chestnut_raw()) else None), error=False, **chestnut_fields(raw))
+                     ltssm_after=(f"0x{r[2]:02x}" if f3_written and (r := chestnut_raw()) else None), **chestnut_fields(raw))  # VBSM_LOG_LEVEL
     except Exception:
       cloudlog.exception("chestnut preflight failed")
 
@@ -669,7 +669,7 @@ def main(demo=False):
       open_ms = int((time.monotonic() - t_open) * 1000)
       smu._send_msg(smu.smu_mod.PPSMC_MSG_SetPptLimit, limit_w, timeout=100)
       applied = smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
-      cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), open_ms=open_ms, error=False)
+      cloudlog.event("chestnut ppt limit", requested=limit_w, applied=int(applied), open_ms=open_ms)  # VBSM_LOG_LEVEL
 
     # VBSM_GPU_FALLBACK: load into a separate name so a late-completing or
     # wedged loader thread can never clobber state after the timeout fires
@@ -705,7 +705,7 @@ def main(demo=False):
           m.warmup()
           big_model = m
           if attempt > 1:
-            cloudlog.event("eGPU load succeeded after lock retry", attempts=attempt, error=False)
+            cloudlog.event("eGPU load succeeded after lock retry", attempts=attempt)  # VBSM_LOG_LEVEL
           return
         except Exception as e:
           fds_after = chestnut_lock_fds()
@@ -1006,6 +1006,17 @@ if __name__ == "__main__":
     main(demo=args.demo)
   except KeyboardInterrupt:
     cloudlog.warning(f"child {PROCESS_NAME} got SIGINT")
+    # VBSM_EXIT: the manager's SIGINT lands mid-frame and a normal interpreter
+    # exit then walks tinygrad's USB/AMD teardown (atexit finalize + GC frees
+    # over USB), which outlives the manager's 5 s grace, so every car-off ended
+    # in a SIGKILL. Skipping it is safe: the usbdevfs claim and lock die with
+    # the process, hardwared cuts the rails 120 s into the park (a power cycle
+    # clears everything), and a re-open before that finds SCRATCH_REG6 set and
+    # takes tinygrad's own full-reset path (mode1 reset, ~1-2 s slower open),
+    # exactly what a ui_watchdog SIGKILL kick already produces. Same exit as
+    # the wedge path above.
+    time.sleep(0.2)
+    os._exit(0)
   except Exception:
     sentry.capture_exception()
     raise
