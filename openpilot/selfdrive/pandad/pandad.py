@@ -218,17 +218,17 @@ def _wait_for_panda(timeout_s: float) -> bool:
   return False
 
 
-def _log_boot_health(health: dict, internal: bool) -> None:
+def _boot_health_fields(health: dict, internal: bool) -> dict:
   """VBSM_BOOTCAUSE: the panda's own state before this wrapper resets it. Read at every
   SoM boot: a small panda uptime means the panda itself rebooted while the SoM was off
   (a 12 V brownout; its init then bootkicks the SoM), a large one means the SoM was
   kicked by an ignition/harness edge. som_reset_triggered can only be set after a
   STANDBY->BOOTKICK transition, i.e. it proves the panda did NOT reboot since the last
   SoM session and that an ignition/harness edge kicked the SoM."""
-  cloudlog.event("pandad.boot_health", panda_uptime_s=health.get("uptime"), som_reset_triggered=health.get("som_reset_triggered"),
-                 ignition_line=health.get("ignition_line"), ignition_can=health.get("ignition_can"), harness_status=health.get("car_harness_status"),
-                 heartbeat_lost=health.get("heartbeat_lost"), power_save=health.get("power_save_enabled"), voltage_mv=health.get("voltage"),
-                 fault_status=health.get("fault_status"), internal=internal)
+  return dict(panda_uptime_s=health.get("uptime"), som_reset_triggered=health.get("som_reset_triggered"),
+              ignition_line=health.get("ignition_line"), ignition_can=health.get("ignition_can"), harness_status=health.get("car_harness_status"),
+              heartbeat_lost=health.get("heartbeat_lost"), power_save=health.get("power_save_enabled"), voltage_mv=health.get("voltage"),
+              fault_status=health.get("fault_status"), internal=internal)
 
 
 def _supervise(process, serial: str) -> bool:
@@ -303,11 +303,12 @@ def main() -> None:
   signal.signal(signal.SIGINT, signal_handler)
 
   # check health for lost heartbeat
+  boot_health: dict | None = None  # VBSM_BOOTCAUSE: read now, logged once the first lap is up (see below)
   try:
     for s in Panda.list():
       with Panda(s) as p:
         health = p.health()
-        _log_boot_health(health, p.is_internal())
+        boot_health = _boot_health_fields(health, p.is_internal())
         if p.is_internal() and health["heartbeat_lost"]:
           Params().put_bool("PandaHeartbeatLost", True, block=True)
           cloudlog.event("heartbeat lost", deviceState=health)
@@ -354,6 +355,12 @@ def main() -> None:
         assert len(panda_serials) == 1
         cloudlog.info(f"{len(panda_serials)} panda found, connecting - {panda_serials}")
         flash_panda(panda_serials[0])
+
+        # VBSM_BOOTCAUSE: emitted here, not at the read above - the wrapper's first
+        # lines predate logmessaged and the non-blocking swaglog socket drops them
+        if boot_health is not None:
+          cloudlog.event("pandad.boot_health", **boot_health)
+          boot_health = None
 
         if do_exit:
           break  # a manager exit landed in this lap: do not launch a child nobody will signal

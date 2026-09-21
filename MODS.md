@@ -114,7 +114,9 @@ two on-demand paths. Honest failures, not faked successes.
   boot-time events now record the evidence: `hardwared` logs `boot cause` with the three `/sys/bootinfo`
   reasons, and `pandad` logs `pandad.boot_health` from the health it already reads before its first reset
   (panda uptime, `som_reset_triggered`, ignition line/CAN, harness status, heartbeat lost, power save,
-  voltage, fault status). Reading them: a panda uptime of seconds at SoM boot with ignition off = the
+  voltage, fault status; the read happens before the wrapper's own reset, the event is emitted on the first
+  lap and hardwared's 5 s in, because lines sent before `logmessaged` listens are dropped by the
+  non-blocking swaglog socket — the first PR D boot lost both). Reading them: a panda uptime of seconds at SoM boot with ignition off = the
   panda itself rebooted (12 V brownout) and its init kicked the SoM; a large uptime, or
   `som_reset_triggered` true (only possible after a STANDBY→BOOTKICK transition, i.e. no panda reboot
   since the last session), = an ignition/harness edge did. A small uptime with the ignition line on is
