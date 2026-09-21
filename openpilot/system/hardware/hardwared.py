@@ -625,6 +625,11 @@ def hardware_thread(end_event, hw_queue) -> None:
       uptime_onroad += now_ts - max(last_uptime_ts, started_ts)
     last_uptime_ts = now_ts
 
+    # VBSM_BOOTCAUSE: 5 s in, not at main() start - lines emitted before logmessaged is
+    # listening are dropped by the non-blocking swaglog socket (the first PR D boot lost both)
+    if count == int(5. / DT_HW):
+      _log_boot_cause()
+
     if (count % int(60. / DT_HW)) == 0:
       params.put("UptimeOffroad", uptime_offroad, block=True)
       params.put("UptimeOnroad", uptime_onroad, block=True)
@@ -651,7 +656,6 @@ def _log_boot_cause() -> dict:
 
 
 def main():
-  _log_boot_cause()
   hw_queue = queue.Queue(maxsize=1)
   end_event = threading.Event()
 
