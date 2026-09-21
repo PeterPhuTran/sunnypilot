@@ -23,10 +23,6 @@
     "openpilot/selfdrive/pandad/pandad.py",
     "openpilot/sunnypilot/parkwatchd.py",
     "openpilot/system/hardware/power_monitoring.py",
-    "openpilot/selfdrive/locationd/locationd.py",
-    "openpilot/selfdrive/modeld/models/dmonitoring_model_tinygrad.pkl.chunk01of01",
-    "openpilot/selfdrive/modeld/models/dm_warp_1344x760_tinygrad.pkl",
-    "openpilot/selfdrive/modeld/models/dm_warp_1928x1208_tinygrad.pkl",
-    "openpilot/selfdrive/modeld/dmonitoringmodeld.py"
+    "openpilot/selfdrive/locationd/locationd.py"
   ]
 }
