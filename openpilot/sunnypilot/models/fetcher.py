@@ -151,6 +151,10 @@ class ModelFetcher:
     "qcom": (MODEL_URL, ""),
     "chestnut": (MODEL_URL_CHESTNUT, "_Chestnut"),
   }
+  # VBSM_QUIET: hold a source this long after a failed fetch. Kept under the UI's 20 s
+  # "Refresh Model List" spinner (model_info.MODEL_SYNC_TIMEOUT) so a user refresh
+  # pressed during a hold still gets its attempt before the spinner gives up.
+  FETCH_BACKOFF_S = 15.0
 
   def __init__(self, params: Params):
     self.params = params
@@ -160,6 +164,8 @@ class ModelFetcher:
       for source, (_, suffix) in self.MODEL_SOURCES.items()
     }
     self._refetched: set[str] = set()
+    # VBSM_QUIET: per-source hold after a transport failure (see get_bundles_for_source)
+    self._retry_after: dict[str, float] = {}
     self.params.put("ModelManager_ActiveJson", {
       "qcom": self.MODEL_URL,
       "chestnut": self.MODEL_URL_CHESTNUT,
@@ -171,7 +177,8 @@ class ModelFetcher:
 
   def _fetch_and_cache_models(self, source: str) -> list[custom.ModelManagerSP.ModelBundle] | None:
     """Fetches fresh model data from remote and updates cache.
-    Returns None on transport errors. Raises on 404 and other fatal HTTP errors.
+    Returns None on any failed fetch: HTTPError is a RequestException, so a 404 or
+    5xx is logged and caught below like a transport error (it never raised).
     """
     model_url, _ = self.MODEL_SOURCES[source]
     try:
@@ -236,9 +243,20 @@ class ModelFetcher:
         self._refetched.add(source)
         cloudlog.warning(f"Cached models for {source} not valid; refetching once")
 
+    # VBSM_QUIET: an offline boot retried every source once a second and logged three
+    # warnings each time (~50 lines per boot, 1/s until the network came up). After any
+    # failed fetch hold the source for FETCH_BACKOFF_S and serve the cache quietly.
+    if time.monotonic() < self._retry_after.get(source, 0.0):
+      try:
+        return self.model_parser.parse_models(cached_data) if cached_data else []
+      except Exception:
+        return []
+
     fetched_bundles = self._fetch_and_cache_models(source)
     if fetched_bundles is not None:
+      self._retry_after.pop(source, None)
       return fetched_bundles
+    self._retry_after[source] = time.monotonic() + self.FETCH_BACKOFF_S
 
     if not cached_data:
       cloudlog.warning("Failed to fetch fresh data and no cache available")

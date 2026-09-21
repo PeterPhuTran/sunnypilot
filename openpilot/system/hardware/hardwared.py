@@ -633,7 +633,25 @@ def hardware_thread(end_event, hw_queue) -> None:
     should_start_prev = should_start
 
 
+def _log_boot_cause() -> dict:
+  """VBSM_BOOTCAUSE: the SoC's record of why it powered up and last powered down. The
+  journal is volatile on this device, so this is the only after-the-fact evidence of a
+  poweroff that turned into a reboot (2026-09-20: powerup 'unknown reboot' after a
+  'ps_hold, keypad_reset1' poweroff: the software poweroff completed, then the panda's
+  bootkick line brought the SoM back; on a comma four that line doubles as the reset)."""
+  reasons = {}
+  for name in ("powerup_reason", "powerup_reason_details", "poweroff_reason"):
+    try:
+      with open(f"/sys/bootinfo/{name}", errors="replace") as f:
+        reasons[name] = " ".join(f.read().replace("\x00", " ").split())[:120]
+    except (OSError, ValueError):
+      reasons[name] = None
+  cloudlog.event("boot cause", **reasons)
+  return reasons
+
+
 def main():
+  _log_boot_cause()
   hw_queue = queue.Queue(maxsize=1)
   end_event = threading.Event()
 

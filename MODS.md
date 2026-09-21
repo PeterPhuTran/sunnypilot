@@ -79,7 +79,7 @@ two on-demand paths. Honest failures, not faked successes.
   at `monotonic_s` ≈ 3,600. Old records carry the raw BMS value in `draw_w`; split any trend at this commit.
 - 2026-09-08: the budget integrator was inert on the comma four (`get_current_power_draw()` reads a hwmon node that does not exist there, so 0 W). `park_power_draw()` now falls back to the SoM BMS reading (~2.7 W idle, a lower bound of the whole device), then a 3 W floor; the shutdown record carries `draw_w` / `draw_source`. First real record: 9.1 h parked, used 0.0 Wh, ended by the 11.8 V voltage rule.
 
-### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`, `VBSM_EXIT`
+### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`, `VBSM_EXIT`, `VBSM_BOOTCAUSE`
 - `process.py`: upstream's manager never restarts a process that dies mid-session — one crash means
   the process (and, for the driving model, openpilot engagement) is gone until reboot. The manager
   now reaps a dead child and rebuilds it: 5 restarts per DRIVE, 10 s apart, then it parks with its
@@ -106,6 +106,19 @@ two on-demand paths. Honest failures, not faked successes.
   same outcome without the stall (upstream fix would be `await asyncio.sleep(1.0)` in its main loop).
   Acceptance: at car-off `modeld_tinygrad is dead with 0` and no `signal 9` for it; at drive start a
   single `sending signal 9 to backup_manager` with no preceding `signal 2`.
+- `VBSM_BOOTCAUSE` (2026-09-20): why did the device boot? On 2026-09-20 16:47 PT the SoM came back 76 s
+  after a `sudo poweroff` with no ignition; `/sys/bootinfo` said powerup `unknown reboot` after a poweroff
+  of `ps_hold, keypad_reset1` — the software poweroff completed, then the panda's bootkick line brought the
+  SoM back (on a comma four that line doubles as the reset; there is no separate BOOT_RESET wire as on a
+  comma 3X). The journal is volatile, so two
+  boot-time events now record the evidence: `hardwared` logs `boot cause` with the three `/sys/bootinfo`
+  reasons, and `pandad` logs `pandad.boot_health` from the health it already reads before its first reset
+  (panda uptime, `som_reset_triggered`, ignition line/CAN, harness status, heartbeat lost, power save,
+  voltage, fault status). Reading them: a panda uptime of seconds at SoM boot with ignition off = the
+  panda itself rebooted (12 V brownout) and its init kicked the SoM; a large uptime, or
+  `som_reset_triggered` true (only possible after a STANDBY→BOOTKICK transition, i.e. no panda reboot
+  since the last session), = an ignition/harness edge did. A small uptime with the ignition line on is
+  just a harness power-up. `bootkick_tick` runs at 1 Hz: the countdowns are 20 s and 5 s.
 
 #### Port note — 2026-09-07 rebase onto sunnypilot `40d6afd3` (v2026.003.000)
 Upstream squashed `staging` (no common ancestor with the previous base `45515f72`), so this was a
@@ -315,6 +328,20 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 - **Shutdown debounce** (`hardwared.py`): the offroad shutdown decision must hold for 2 consecutive
   iterations before `DoShutdown` fires — kills the race where a shutdown latched in the same
   sampling window as an ignition rise and turned a departure into a double boot.
+- **Offline-boot catalog storm** (`models/fetcher.py`, `VBSM_QUIET`, 2026-09-20): with no network the
+  models manager retried every source once a second and logged three warnings each time (~50 lines per
+  boot). After any failed fetch (transport, 404/5xx — `HTTPError` is a `RequestException` and was always
+  caught, never raised — or a captive-portal page) a source is now held for `FETCH_BACKOFF_S = 15` and
+  served from the cache quietly; a successful fetch clears the hold. 15 s keeps a user's "Refresh Model
+  List" (20 s spinner) inside one hold; the hold is per source and per process and cannot withhold a
+  catalog for longer than that.
+- **Oversized sunnylink log** (`athenad.py`, `VBSM_QUIET`, 2026-09-20): a swaglog minute over 32 KB cannot
+  be sent to sunnylink in one request; the handler waited ~100 s for a response that never came and
+  retried the same file every hour forever. `add_log_to_queue()` now returns False for it and the handler
+  marks it done (`LOG_ATTR_VALUE_MAX_UNIX_TIME`) once.
+- **Night notice retired** (`augmented_road_view.py`, 2026-09-20): `_refresh_bsm_night` was never called
+  (dead since the detector was shelved); it and `_draw_bsm_night_notice` are gone. `BSM_STATE_PATH` stays
+  as the documented name of the daemon's state file.
 - **`VBSM_LOG_LEVEL`** (2026-09-20): `SwagLogger.event()` (`common/logging_extra.py`) logs at ERROR
   whenever an `error` kwarg is *present*, whatever its value. `hardwared.py` passed `error=not ok` on
   `chestnut gpu rails` and `error=<bool>` on `chestnut flash done`; `modeld.py` passed `error=False` on
@@ -361,15 +388,15 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/car/card.py` | §1 | — |
 | `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §4 big-model alerts, §5 personality re-read + LKAS toggle | `VBSM_CHIME_HOLD`, `VBSM_CONFIG`, `VBSM_GPU_ALERTS`, `VBSM_HUD`, `VBSM_EXP_TOGGLE`, `VBSM_LKAS_REPURPOSED` |
 | `openpilot/sunnypilot/mads/mads.py` | §5 LKAS button freed for the toggle | `VBSM_EXP_TOGGLE` |
-| `openpilot/sunnypilot/models/fetcher.py` | §6 manifest storm fix | `VBSM_QUIET` |
+| `openpilot/sunnypilot/models/fetcher.py` | §6 manifest storm fix, offline fetch backoff | `VBSM_QUIET` |
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1 settings | `BigConfigControl` |
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap | `BSM_STATE_PATH`, `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
-| `openpilot/system/athena/athenad.py` | §2 | `VBSM_PRIVACY` |
+| `openpilot/system/athena/athenad.py` | §2; §6 oversized-log skip | `VBSM_PRIVACY`, `VBSM_QUIET` |
 | `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
-| `openpilot/system/hardware/hardwared.py` | §2b park, §4 idle power, §6 shutdown debounce + rails/flash log level | `VBSM_GPU_IDLE`, `VBSM_PARK`, `VBSM_LOG_LEVEL` |
-| `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events | `VBSM_PARKWATCH` |
+| `openpilot/system/hardware/hardwared.py` | §2b park, §3 boot cause, §4 idle power, §6 shutdown debounce + rails/flash log level | `VBSM_GPU_IDLE`, `VBSM_PARK`, `VBSM_LOG_LEVEL`, `VBSM_BOOTCAUSE` |
+| `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events; §3 boot health | `VBSM_PARKWATCH`, `VBSM_BOOTCAUSE` |
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
 | `openpilot/system/hardware/power_monitoring.py` | §2b parked energy budget | `VBSM_PARK` |
 | `openpilot/selfdrive/locationd/locationd.py` | §4 bounded lockout, buffered message validity | `VBSM_LOC_CAP`, `VBSM_LOC_VALID` |
