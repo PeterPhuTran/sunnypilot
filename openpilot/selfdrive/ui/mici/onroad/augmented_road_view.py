@@ -19,7 +19,6 @@ from openpilot.common.swaglog import cloudlog
 import json
 import os
 import time
-from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
 from enum import IntEnum
@@ -35,11 +34,7 @@ WIDE_CAM = VisionStreamType.VISION_STREAM_WIDE_ROAD
 DRIVER_CAM = VisionStreamType.VISION_STREAM_CABIN
 BSM_PARAM_INTERVAL = 2.0  # seconds between blind spot camera config checks
 BSM_CONFIG_PATH = "/data/vision_bsm.json"
-BSM_STATE_PATH = "/dev/shm/vision_bsm_state"
-BSM_STATE_INTERVAL = 1.0  # seconds between night-flag checks
-BSM_STATE_STALE = 3.0
-BSM_NIGHT_TEXT = "low light - blind spot detection unreliable"
-BSM_NIGHT_FONT_SIZE = 22
+BSM_STATE_PATH = "/dev/shm/vision_bsm_state"  # written by vision_bsm; the night notice that read it was retired with the model (VBSM_HUD)
 DEFAULT_DEVICE_CAMERA = DEVICE_CAMERAS["tici", "ar0231"]
 
 
@@ -237,8 +232,6 @@ class AugmentedRoadView(CameraView):
 
     # blind spot camera view
     self._bsm_config_mtime = 0.0
-    self._bsm_night = False
-    self._bsm_state_checked = 0.0
     self._bsm_zone: tuple[float, float, float, float] | None = None
     self._bsm_left = True
     self._bsm_zones: dict = {}
@@ -288,30 +281,6 @@ class AugmentedRoadView(CameraView):
     if x1 <= x0 or y1 <= y0:
       return None
     return x0, y0, x1 - x0, y1 - y0
-
-  def _refresh_bsm_night(self):
-    now = rl.get_time()
-    if now - self._bsm_state_checked < BSM_STATE_INTERVAL:
-      return
-    self._bsm_state_checked = now
-    try:
-      with open(BSM_STATE_PATH) as f:
-        state = json.load(f)
-      fresh = time.clock_gettime(time.CLOCK_BOOTTIME) - state.get("ts", -1e9) < BSM_STATE_STALE
-      self._bsm_night = fresh and bool(state.get("night"))
-    except (OSError, ValueError):
-      self._bsm_night = False
-
-  def _draw_bsm_night_notice(self, rect: rl.Rectangle):
-    """Quiet caption: after dark the outside of the glass is barely lit."""
-    font = gui_app.font(FontWeight.MEDIUM)
-    size = measure_text_cached(font, BSM_NIGHT_TEXT, BSM_NIGHT_FONT_SIZE)
-    x = rect.x + (rect.width - size.x) / 2
-    y = rect.y + rect.height - size.y - 12
-    rl.draw_rectangle_rounded(rl.Rectangle(x - 10, y - 5, size.x + 20, size.y + 10),
-                              0.35, 8, rl.Color(0, 0, 0, 140))
-    rl.draw_text_ex(font, BSM_NIGHT_TEXT, rl.Vector2(x, y), BSM_NIGHT_FONT_SIZE, 0,
-                    rl.Color(255, 255, 255, 190))
 
   def _update_bsm(self) -> bool:
     """The signalled side's window takes the whole screen while that blinker is on."""
@@ -395,10 +364,7 @@ class AugmentedRoadView(CameraView):
 
     # Draw all UI overlays. The driving path makes no sense drawn over a view out
     # of a side window, but alerts still have to reach the driver.
-    if blind_spot_view:
-      if self._bsm_night:
-        self._draw_bsm_night_notice(self._content_rect)
-    else:
+    if not blind_spot_view:
       self._model_renderer.render(self._content_rect)
 
     # Fade out bottom of overlays for looks

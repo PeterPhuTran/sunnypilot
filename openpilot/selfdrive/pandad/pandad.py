@@ -218,6 +218,19 @@ def _wait_for_panda(timeout_s: float) -> bool:
   return False
 
 
+def _log_boot_health(health: dict, internal: bool) -> None:
+  """VBSM_BOOTCAUSE: the panda's own state before this wrapper resets it. Read at every
+  SoM boot: a small panda uptime means the panda itself rebooted while the SoM was off
+  (a 12 V brownout; its init then bootkicks the SoM), a large one means the SoM was
+  kicked by an ignition/harness edge. som_reset_triggered can only be set after a
+  STANDBY->BOOTKICK transition, i.e. it proves the panda did NOT reboot since the last
+  SoM session and that an ignition/harness edge kicked the SoM."""
+  cloudlog.event("pandad.boot_health", panda_uptime_s=health.get("uptime"), som_reset_triggered=health.get("som_reset_triggered"),
+                 ignition_line=health.get("ignition_line"), ignition_can=health.get("ignition_can"), harness_status=health.get("car_harness_status"),
+                 heartbeat_lost=health.get("heartbeat_lost"), power_save=health.get("power_save_enabled"), voltage_mv=health.get("voltage"),
+                 fault_status=health.get("fault_status"), internal=internal)
+
+
 def _supervise(process, serial: str) -> bool:
   """Wait for the C++ pandad, but take the panda over on the ignition-off edge.
 
@@ -294,6 +307,7 @@ def main() -> None:
     for s in Panda.list():
       with Panda(s) as p:
         health = p.health()
+        _log_boot_health(health, p.is_internal())
         if p.is_internal() and health["heartbeat_lost"]:
           Params().put_bool("PandaHeartbeatLost", True, block=True)
           cloudlog.event("heartbeat lost", deviceState=health)
