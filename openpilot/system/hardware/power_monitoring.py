@@ -33,6 +33,20 @@ PARK_SHUTDOWN_LOG = "/data/vbsm_shutdowns.jsonl"
 # whole-device idle.
 PARK_SOM_TO_DEVICE = 1.6
 PARK_DRAW_FLOOR_W = 4.5
+# VBSM_PARK: how much a boot that never sees ignition may spend before it
+# powers off. On a comma four the panda enters stop mode once the SoM is off
+# (power save on, SAFETY_SILENT) and any CAN frame or SBU edge wakes it by
+# resetting it; a freshly reset panda boot-kicks the SoM (panda/board/main.c,
+# cuatro branch of the main loop; board/sys/power_saving.h). So a parked car
+# that is locked, unlocked or polled by its own ECUs boots the device with no
+# ignition. Four such wakes with records on 2026-09-20/21 ran 12-15 min and
+# 1.0-1.1 Wh each, none followed by an ignition inside that window, and a wake
+# that inherits a saved balance from a voltage-ended park is not bounded by the
+# boot floor: it runs until that balance is spent or the 11.8 V rule fires. This
+# caps the spend, not the balance: the saved balance stays for the next drive. 0.4 Wh at the 4.5 W floor is ~320 s of parked
+# time, enough for the updater's post-boot cycle (observed ~85 s from boot to
+# 'git reset success') and for deploy.sh, which waits for the finalized overlay.
+PARK_WAKE_SPEND_WH = 0.4
 # VBSM_PARK: while the home Pi is actively pulling footage it touches this
 # tmpfs marker (once per batch). A fresh marker suspends the budget and timer
 # rules so a park never ends mid-sync; the 11.8 V rule and ForcePowerDown are
@@ -40,6 +54,9 @@ PARK_DRAW_FLOOR_W = 4.5
 # the TTL bounds a Pi that vanished mid-sync (wall-clock mtime: a forward NTP
 # jump can only expire it early, which fails safe).
 SYNC_ACTIVE_FILE = "/dev/shm/vbsm_sync_active"
+# VBSM_PARK: touched the first time this boot sees ignition; tmpfs, so a reboot
+# clears it but a hardwared respawn does not (started_seen is process-local).
+BOOT_IGNITION_FILE = "/dev/shm/vbsm_boot_ignition"
 SYNC_ACTIVE_TTL_S = 30 * 60
 
 
@@ -84,9 +101,11 @@ MAX_TIME_OFFROAD_S = 30*3600
 # install is not powered off before it is registered. Here the only offroad
 # boots are updater/deploy reboots while parked, and the hour blocked every
 # park rule each time (2026-09-16: 82 min awake at ~4.5 W on a battery that
-# then rested at 11.89 V). 600 s covers the manager and the updater's
-# post-boot cycle.
-MIN_ON_TIME_S = 600
+# then rested at 11.89 V). 600 s covered the manager and the updater's
+# post-boot cycle; 300 s still does. In practice DELAY_SHUTDOWN_TIME_S below
+# (300 s after hardwared's first offroad tick, ~20-25 s into boot) is the gate
+# that binds, so a no-ignition boot ends ~320-345 s after boot (2026-09-21).
+MIN_ON_TIME_S = 300
 DELAY_SHUTDOWN_TIME_S = 300 # Wait at least DELAY_SHUTDOWN_TIME_S seconds after offroad_time to shutdown.
 VOLTAGE_SHUTDOWN_MIN_OFFROAD_TIME_S = 60
 
@@ -111,6 +130,7 @@ class PowerMonitoring:
     self.draw_raw_w = 0.0
     self.draw_source = "none"
     self._draw_source_logged: str | None = None
+    self.boot_ignition = os.path.exists(BOOT_IGNITION_FILE)  # VBSM_PARK: survives a respawn, not a reboot
     if self.budget_uWh != CAR_BATTERY_CAPACITY_uWh:
       cloudlog.event("vbsm park budget", wh=self.budget_uWh / 1e6, stock_wh=CAR_BATTERY_CAPACITY_uWh / 1e6)
 
@@ -121,6 +141,12 @@ class PowerMonitoring:
   def calculate(self, voltage: float | None, ignition: bool):
     try:
       now = time.monotonic()
+      if ignition and not self.boot_ignition:  # VBSM_PARK: this boot has seen ignition, the wake cap no longer applies
+        self.boot_ignition = True
+        try:
+          open(BOOT_IGNITION_FILE, "a").close()
+        except OSError:
+          pass
 
       # If peripheralState is None, we're probably not in a car, so we don't care
       if voltage is None:
@@ -214,22 +240,28 @@ class PowerMonitoring:
     sync = sync_active()  # VBSM_PARK: footage pull in progress -> budget/timer suspended, voltage kept
     timer = self.max_time_offroad_exceeded(offroad_time) and not sync
     budget = self.car_battery_capacity_uWh <= 0 and not sync
+    # VBSM_PARK: a boot that has seen neither ignition (tmpfs marker, survives a
+    # hardwared respawn) nor an onroad start (started_seen) -- a CAN/SBU wake, an
+    # updater or deploy reboot -- may spend PARK_WAKE_SPEND_WH and no more,
+    # whatever balance it inherited; the sync marker suspends it like the budget.
+    wake = (not started_seen) and (not self.boot_ignition) and self.power_used_uWh >= PARK_WAKE_SPEND_WH * 1e6 and not sync
     disable_power_down = self.params.get_bool("DisablePowerDown")
     force = self.params.get_bool("ForcePowerDown")
     min_on_ok = started_seen or (now > MIN_ON_TIME_S)
     should_shutdown |= timer
     should_shutdown |= low_voltage_shutdown
     should_shutdown |= budget
+    should_shutdown |= wake
     should_shutdown &= not ignition
     should_shutdown &= (not disable_power_down)
     should_shutdown &= in_car
     should_shutdown &= offroad_time > DELAY_SHUTDOWN_TIME_S
     should_shutdown |= force
     should_shutdown &= min_on_ok
-    reasons = [name for name, hit in (("force", force), ("budget", budget), ("voltage", low_voltage_shutdown), ("timer", timer)) if hit]
+    reasons = [name for name, hit in (("force", force), ("budget", budget), ("wake", wake), ("voltage", low_voltage_shutdown), ("timer", timer)) if hit]
     self.last_eval = {
       "decision": bool(should_shutdown), "reason": "+".join(reasons) if reasons else "none",
-      "timer": bool(timer), "voltage": bool(low_voltage_shutdown), "budget": bool(budget), "force": bool(force), "sync_active": bool(sync),
+      "timer": bool(timer), "voltage": bool(low_voltage_shutdown), "budget": bool(budget), "wake": bool(wake), "boot_ignition": bool(self.boot_ignition), "force": bool(force), "sync_active": bool(sync),
       "ignition": bool(ignition), "in_car": bool(in_car), "disable_power_down": bool(disable_power_down),
       "delay_ok": bool(offroad_time > DELAY_SHUTDOWN_TIME_S), "min_on_ok": bool(min_on_ok), "started_seen": bool(started_seen),
       "offroad_s": round(offroad_time, 1), "monotonic_s": round(now, 1),

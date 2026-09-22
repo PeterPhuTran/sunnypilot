@@ -67,6 +67,38 @@ two on-demand paths. Honest failures, not faked successes.
   Log lines: `pandad.flash_and_connect` carries `handback=true/false`; a retry logs `parkwatch retry`.
   Acceptance: no "Panda in DFU mode found" / "Done flashing" after a `parkwatch window end`; relaunch in a
   few seconds with `handback=true` and `count` unchanged.
+- 2026-09-21 (`VBSM_PARK` wake spend cap): the panda on a comma four enters stop mode once the SoM is off (power
+  save on, SAFETY_SILENT, the parked state) and wakes on any CAN frame or SBU edge by resetting itself
+  (`panda/board/main.c`, cuatro branch of the main loop; `board/sys/power_saving.h` arms EXTI on FDCAN1-3 RX
+  and SBU1/2); a freshly reset panda starts in `BOOT_BOOTKICK`, so a lock, unlock, door or the car's own ECU
+  chatter boots the device with no ignition. `pandad.boot_health` showed `panda_uptime_s` 15-18 with
+  `ignition_line=false` on the three instrumented no-ignition boots (09-20 18:48; 09-21 08:59, 11:37); the 09-20
+  19:48 boot logged no boot_health and is classified from its shutdown record (`started_seen=false`, 739 s,
+  1.0 Wh). The four wakes with records ran 735/739/889/758 s and 1.00/1.00/1.13/1.00 Wh, none followed by an
+  ignition inside that window, and a wake that inherits a balance from a voltage-ended park (08:59: 8.4 Wh) is
+  not bounded by the boot floor: it runs until that balance is spent (up to the knob; 8.4 Wh is ~1.9 h at 4.5 W)
+  or the 11.8 V rule fires. New rule in `should_shutdown()`: a boot that has seen neither ignition nor an onroad
+  start may spend `PARK_WAKE_SPEND_WH = 0.4` and no more (reason `wake`, suspended by the sync marker like the
+  budget); the inherited balance itself is left for the next drive, and the boot floor (a tenth of the knob) is
+  unchanged, so boots that went onroad (`started_seen=true`) and their parks behave exactly as before. "Seen
+  ignition" is a tmpfs marker (`/dev/shm/vbsm_boot_ignition`, touched by `calculate()` on the first ignition tick):
+  a reboot clears it, a hardwared respawn mid-park does not, and it also covers an ignition boot whose startup
+  stayed blocked (Always Offroad, thermal, connectivity or terms gates never set `started_seen`). `MIN_ON_TIME_S` 600 → 300; in practice
+  upstream's `DELAY_SHUTDOWN_TIME_S` (300 s after hardwared's first offroad tick, ~20-25 s into boot) is the
+  binding gate. A no-ignition boot now ends ~320-345 s after boot (`offroad_s` ≈ 301-320) with `used_wh`
+  ≈ 0.40-0.45, reason `wake` (or `wake+voltage` when the LPF is already under 11.8 V; `budget+wake` only if the balance
+  ran out while the rules were suspended, a fresh boot cannot reach it because the boot floor, a tenth of the
+  knob, is above the cap; reason tokens are emitted in the fixed order force, budget, wake, voltage, timer); the bench's 340 s assumes the 4.5 W floor, the four field wakes averaged 4.7-5.05 W (the
+  early-boot BMS reading is higher), so in practice the 300 s delay gate binds. Was 735-889 s and 1.0-1.1 Wh, or
+  up to the inherited balance (~1.9 h for 8.4 Wh). The updater's post-boot cycle (observed ~85 s from boot
+  to `git reset success`) and `tools/deploy.sh` (waits for `.overlay_consistent` before rebooting) both fit; a
+  sync pass that plants the marker before the wake rule fires (~320-345 s into the boot) extends the wake for
+  the pull, bounded by the pass ending, the 30-min TTL and the 11.8 V rule, as it does a drive park (09-20: the
+  Pi's pass landed inside both hourly at-home wakes). Acceptance: `vbsm_shutdowns.jsonl` records with `started_seen=false`
+  carry `reason` `wake` (or `wake+voltage` / `budget+wake`) at `offroad_s` ≈ 301-320 with `used_wh` ≈ 0.40-0.45
+  and `boot_ignition=false` — classify by `reason`, never by `monotonic_s`; records with `started_seen=true` (or
+  `boot_ignition=true`) are unchanged; the `CarBatteryCapacity` saved after a wake equals max(boot floor,
+  inherited balance) minus ~0.4 Wh (0.6 Wh at knob 10 after a budget-ended park, 8.0 Wh after an 8.4 Wh inheritance).
 - 2026-09-20 (`VBSM_PARK` calibration): the BMS fallback only sees the SoM (2.6–3.2 W) while the whole
   device draws 4.1–4.8 W at the panda, so the "10 Wh" knob was spending ~17 Wh per park (four 3.7 h parks ran
   the balance to the boot floor in the 09-19 review). `park_power_draw()` now scales the BMS reading by
