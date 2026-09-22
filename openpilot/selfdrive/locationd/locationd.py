@@ -37,6 +37,19 @@ def calculate_invalid_input_decay(invalid_limit, recovery_time, frequency):
   return (1 - 1 / (2 * invalid_limit)) ** (1 / (recovery_time * frequency))
 
 
+# VBSM_LOC_VALID: see main(). Counts invalid MESSAGES, not invalid cycles.
+VALIDITY_INVALID_LIMIT = 3
+VALIDITY_RECOVERY_STEP = 0.5
+
+
+def validity_step(msgs_invalid, fresh_invalid, stale_dead_invalid, all_valid):
+  if fresh_invalid or stale_dead_invalid:
+    return min(msgs_invalid + 1, VALIDITY_INVALID_LIMIT)
+  if all_valid:
+    return max(msgs_invalid - VALIDITY_RECOVERY_STEP, 0)
+  return msgs_invalid   # an invalid message already counted is still the latest: hold, don't count it again
+
+
 def init_xyz_measurement(measurement: capnp._DynamicStructBuilder, values: np.ndarray, stds: np.ndarray, valid: bool):
   assert len(values) == len(stds) == 3
   measurement.x, measurement.y, measurement.z = map(float, values)
@@ -299,13 +312,19 @@ def main():
   # cameraOdometry message invalid; inputsOK was false for 60 ms and the state
   # machine was back in ENABLED before the alert finished drawing. The sanity
   # counters above already have a threshold and a decay; give message validity a
-  # comparable buffer: three bad cycles to fault (100 ms after the first at the
+  # comparable buffer: three bad messages to fault (100 ms after the first at the
   # cameraOdometry rate), one good cycle to clear. Bad counts a whole step and good
   # only half a step back, so a stream that is invalid every other message still
   # trips instead of oscillating under the limit forever.
-  VALIDITY_INVALID_LIMIT = 3
-  VALIDITY_RECOVERY_STEP = 0.5
+  # 2026-09-22: count each invalid MESSAGE once, not every cycle it is the latest.
+  # extrinsicsCalibration is 4 Hz and calibrationd copies cameraOdometry's validity,
+  # so the same one-frame blip came back as ONE invalid calibration message that
+  # stayed latest for 250 ms = 5 cycles and tripped the limit anyway (2026-09-16).
+  # While an already-counted invalid message is latest the counter holds; if its
+  # service then stops publishing (not alive: 10x its period), it counts again, so
+  # a service that dies on an invalid message still faults.
   msgs_invalid = VALIDITY_INVALID_LIMIT   # inputs start bad: a service that has never arrived is not valid
+  fresh_invalid = False                   # an invalid message arrived since the last cameraOdometry cycle
 
   initial_pose_data = params.get("LocationFilterInitialState")
   if initial_pose_data is not None:
@@ -349,10 +368,15 @@ def main():
     else:
       filter_initialized = sm.all_checks() and sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
 
+    # VBSM_LOC_VALID: sm.update() can time out without cameraOdometry, so remember
+    # invalid messages seen on those passes until the next cameraOdometry cycle
+    fresh_invalid = fresh_invalid or any(sm.updated[s] and not sm.valid[s] for s in sm.services)
     if sm.updated["cameraOdometry"]:
       critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critcal_services)
       # VBSM_LOC_VALID
-      msgs_invalid = min(msgs_invalid + 1, VALIDITY_INVALID_LIMIT) if not sm.all_valid() else max(msgs_invalid - VALIDITY_RECOVERY_STEP, 0)
+      stale_dead_invalid = any(not sm.valid[s] and not sm.alive[s] for s in sm.services)
+      msgs_invalid = validity_step(msgs_invalid, fresh_invalid, stale_dead_invalid, sm.all_valid())
+      fresh_invalid = False
       inputs_valid = msgs_invalid < VALIDITY_INVALID_LIMIT and critical_service_inputs_valid
       sensors_valid = sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
 
