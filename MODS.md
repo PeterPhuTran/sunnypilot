@@ -302,6 +302,16 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   replay caught on the upstream PR. Replayed against the 2026-09-15 route: the startup episode is cycle-for-cycle
   identical to the old rule (18 cycles both ways) and the one spurious episode disappears.
   Upstream-worthy, and distinct from `VBSM_LOC_CAP`, which only touches the counter branch.
+  2026-09-22: counts invalid MESSAGES, not invalid cycles (`validity_step()`). The per-cycle rule re-counted
+  whatever message was latest on every 20 Hz cycle, and `extrinsicsCalibration` is 4 Hz and copies
+  cameraOdometry's validity, so the same one-frame blip came back as ONE invalid calibration message that
+  stayed latest for 250 ms = 5 cycles and still raised the alert (2026-09-16, one occurrence, on this rule). Now
+  an invalid message counts once when it arrives (remembered across `sm.update()` timeouts until the next
+  cameraOdometry cycle), the counter holds while it stays latest, and decays only when everything is valid. A
+  service whose latest message is invalid and that has stopped publishing (not alive, 10x its period) counts
+  every cycle, so dying on an invalid message still faults (~2.5 s for calibration). Cost: a sustained fault
+  on the 4 Hz service is reported after 3 invalid messages (~0.5 s) instead of ~0.1 s; 20/100 Hz services and
+  startup are unchanged. Archive replay (every rlog on the Pi): the only episode that differs is that cascade.
 - **Watchdog GPU duties** (`VBSM_GPU_KICK`, `ui_watchdog.py`): restarts a modeld that booted before
   the enclosure enumerated (standstill + disengaged only, gated on the GPU slot holding a bundle and
   `ChestnutActive` false); SIGKILLs a load wedged past 90 s (a GIL-held process ignores everything
