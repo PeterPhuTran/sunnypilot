@@ -426,7 +426,38 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   that the shipped reader matches the pickle format. Never pin the driving-model pickles the same
   way: those come from the model catalog, not the tree.
 
-## Managed files (23) and markers
+### 8. Camera view reader-slot pool — `VBSM_VIPC_POOL`
+- **What** (`selfdrive/ui/mici/onroad/cameraview.py`): the mici camera view keeps one
+  `VisionIpcClient` per stream and reuses it on every road / wide / cabin switch, instead of
+  building a new client per switch. Idle pooled clients that are neither on screen nor pending are
+  dropped at each offroad transition and when the on-screen client reconnects to a new camerad
+  session.
+- **Why**: every `VisionIpcClient` takes a msgq reader slot when it is constructed, and msgq never
+  gives slots back (`msgq_close_queue` only munmaps). In experimental mode the view switches to the
+  wide camera below 5 m/s, so a long stop-and-go drive fills the wide queue's `NUM_READERS = 25`
+  slots at UI wide switch #23/#24 (26 minus modeld, encoderd and the UI's start stream). The next
+  registration evicts every reader. modeld reads its wide client only after the road frame arrives,
+  so on a frame where wide N was published before road N (about 41 % of frames) its re-registered
+  reader skips wide N and waits about 48 ms for wide N+1: `frames out of sync!`, road N+1 dropped,
+  `cameraOdometry.valid = False`, a short invalid cascade (calibration, paramsd, lagd, torqued,
+  driver monitoring, planner) and selfdrived's `commIssue` — "TAKE CONTROL IMMEDIATELY", recovering
+  after about 0.5 s. Seen on 2026-09-15 and 2026-09-25 (each at the predicted switch number); a scan
+  of 53.5 steady hours of logs found the same mechanism behind all 7 `frames out of sync` events
+  and no other cause. Upstream report: commaai/openpilot#38505 (msgq `NUM_READERS` 15 -> 25 only
+  delayed it).
+- **Effect**: the UI holds at most one slot per camera queue per camerad session (plus one per idle
+  stream at each started glitch that does not restart camerad), so the wide queue stays near
+  3-6 readers and the eviction cannot happen. A lapped idle client is reset by `msgq_reset_reader`
+  (no new slot), and `connect()` reuses the constructor's socket, so reconnects do not leak either.
+  A switch back to a pooled stream shows its first new frame within one frame period.
+- **Not covered**: `vision_bsm.py` still builds a new cabin client after 50 empty receives
+  (reconnect path). That is rare onroad and cannot cost the driving model a frame; at worst a
+  cabin-queue overflow makes dmonitoringmodeld drop one cabin frame (no validity effect observed).
+  UI restarts (`VBSM_RESTART`) build a new pool, 1-3 slots each, bounded by the restart limit.
+- **Retire when**: msgq releases reader slots on close, or upstream's camera view stops building a
+  client per switch. The port's drift guard stops on any upstream change to `cameraview.py`.
+
+## Managed files (24) and markers
 
 | File | Mods | Markers |
 |---|---|---|
@@ -444,6 +475,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap | `BSM_STATE_PATH`, `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
+| `openpilot/selfdrive/ui/mici/onroad/cameraview.py` | §8 reader-slot pool | `VBSM_VIPC_POOL` |
 | `openpilot/system/athena/athenad.py` | §2; §6 oversized-log skip | `VBSM_PRIVACY`, `VBSM_QUIET` |
 | `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
 | `openpilot/system/hardware/hardwared.py` | §2b park, §3 boot cause, §4 idle power, §6 shutdown debounce + rails/flash log level | `VBSM_GPU_IDLE`, `VBSM_PARK`, `VBSM_LOG_LEVEL`, `VBSM_BOOTCAUSE` |
