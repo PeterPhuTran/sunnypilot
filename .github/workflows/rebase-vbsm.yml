@@ -132,11 +132,18 @@ jobs:
           check VBSM_PARKWATCH   openpilot/system/manager/process_config.py
           check VBSM_PARK        openpilot/system/hardware/power_monitoring.py
           check VBSM_PARK        openpilot/system/hardware/hardwared.py
+          check VBSM_VIPC_POOL   openpilot/selfdrive/ui/mici/onroad/cameraview.py
           # a lost restart policy is silent until something dies mid-drive, so
           # assert the call sites too, not just the marker comment
           test "$(git cat-file blob "$C:openpilot/system/manager/process.py" \
                   | grep -c 'if self.hold_dead_proc():')" = 2 \
             || { echo "::error::hold_dead_proc not wired into both start() methods"; fail=1; }
+          # the mici camera view must build clients only through its pool: one VisionIpcClient(
+          # call. A client per switch leaks msgq reader slots and evicts modeld's wide reader
+          # on long experimental-mode drives ("frames out of sync" -> commIssue, MODS.md s8)
+          test "$(git cat-file blob "$C:openpilot/selfdrive/ui/mici/onroad/cameraview.py" \
+                  | grep -c 'VisionIpcClient(')" = 1 \
+            || { echo "::error::cameraview.py builds a VisionIpcClient outside its pool"; fail=1; }
           # without this the device would try to compile, which it cannot do
           git rev-parse -q --verify "$C:prebuilt" > /dev/null \
             || { echo "::error::prebuilt marker missing"; fail=1; }
