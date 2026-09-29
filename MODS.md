@@ -254,6 +254,30 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   once it has seen 12 V and L0 (events `chestnut late probe sees 12v`, `chestnut late f3`, `chestnut link ready
   late`). `/dev/shm/vbsm_gpu_link_wait` marks the skip; every modeld process clears both at start. ui_watchdog's
   automatic kick waits for the ready marker whenever the wait marker exists, so a kick can never buy a second skip.
+- **Cold-boot link wait** (`VBSM_GPU_COLDWAIT`, `modeld_v2/modeld.py` + `ui_watchdog.py`, 2026-09-28): the
+  silent-but-enumerated bridge shows up on about half the first starts after the device was off (13 of <=26 from 09-17
+  to 09-28) and has never been seen on a later start. Anchored to kernel boot, the silence ended 43.6-48.7 s after boot
+  (sd 1.6 s; 09-27: 47.3-50.7), while the plain budget runs from main(), so a modeld that reaches main() early has
+  less of it left. 09-27 had the earliest main() of all silent starts (27.1 s after boot vs 29-38): the budget ran
+  out at 47.1 s, the eGPU was skipped, the late probe kicked, the SIGKILL restart took 14 s in the boot CPU storm,
+  and a reboot (DoReboot, most likely the driver) came 4.4 s into the reload. Now, once a read has come back
+  `unreadable`, the wait may run until 70 s after kernel boot (`CHESTNUT_COLD_BOOT_AGE_S`) but never past 40 s after
+  main() (`CHESTNUT_COLD_MAX_S`). In practice the extension is max(0, min(20, 50 - boot age at the wait's start)) s:
+  a wait that starts 50 s or more into the boot (the observed kick restart started at ~67 s) keeps the plain budget,
+  and so do `no_12v`, `absent` and a never-silent `timeout`. Margin over every observed silence: 16-26 s (the old
+  budget had 2-4 s on 7 of 12). 09-27 would have read `ready` when the bridge woke and had a big frame ~24 s later
+  (~71-75 s after boot) instead of a small model, a kick, a ~40 s no-model reload and the reboot. Costs: an early
+  engage on the small model is no longer offered during the wait ("Big Model Loading" blocks engagement, the HUD
+  shows LOADING); a bridge that answers and then trains keeps the extension (ends `timeout` at main+40 s if it never
+  reaches L0); and in the never-seen case of a bridge that stays silent the small model comes up to ~20 s later
+  (12-20 s at the observed main() times). The seconds used past the plain deadline (`extended_s`, rounded up; the
+  events also carry `wait_boot_age_s`) go to ui_watchdog through `/dev/shm/vbsm_gpu_preflight_ext` ("<pid>
+  <seconds>", cleared by every modeld start, also written if the probe errors after extending); its 90 s wedge
+  deadline moves by that much for that pid only (non-finite values ignored, clamped to 35 s), so every other load
+  keeps 90 s. Ship both files together: without the watchdog side an extended start whose load is unusually slow
+  (>~45 s after ready; measured 23.4-23.8 s) would hit the wedge kill and its boot-long `load` veto. Re-derive both
+  constants before anything moves main() earlier (e.g. pinning modeld's imports to core 7). Bench:
+  `pending/prK/bench_coldwait.py` (real old/new wait with a simulated bridge and clock, real GpuKick.tick; 38 checks).
 - **Kick cooldown clock** (`VBSM_GPU_KICK`, `ui_watchdog.py`): `last_kick` started at 0.0 while `now` is
   `time.monotonic()`, which starts near zero at boot, so the 120 s cooldown read as "kicked at boot" and refused
   every kick in the first two minutes of uptime -- exactly what a cold boot into onroad offers. 2026-09-16: 40 s
@@ -484,7 +508,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 |---|---|---|
 | `VBSM.md`, `CHESTNUT.md`, `MODS.md` | documentation | — |
 | `openpilot/sunnypilot/vision_bsm.py` | §1 (additive file) | — |
-| `openpilot/sunnypilot/ui_watchdog.py` | §3, §4 (additive file) | `VBSM_WATCHDOG`, `VBSM_RESTART`, `VBSM_GPU_KICK`, `VBSM_GPU_KICK_ARMED`, `VBSM_GPU_RETRY`, `VBSM_GPU_LATE`, `VBSM_GPU_KICK_REQUEST` |
+| `openpilot/sunnypilot/ui_watchdog.py` | §3, §4 (additive file) | `VBSM_WATCHDOG`, `VBSM_RESTART`, `VBSM_GPU_KICK`, `VBSM_GPU_KICK_ARMED`, `VBSM_GPU_RETRY`, `VBSM_GPU_LATE`, `VBSM_GPU_KICK_REQUEST`, `VBSM_GPU_COLDWAIT` |
 | `openpilot/sunnypilot/chestnut_power.py` | §4 (additive file) | `VBSM_GPU_IDLE` |
 | `openpilot/system/manager/process.py` | §3 | `VBSM_RESTART` |
 | `openpilot/system/manager/process_config.py` | §1, §3 process entries, backup_manager sigkill | `VBSM_EXIT` |
@@ -498,7 +522,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/onroad/cameraview.py` | §8 reader-slot pool | `VBSM_VIPC_POOL` |
 | `openpilot/system/athena/athenad.py` | §2; §6 oversized-log skip | `VBSM_PRIVACY`, `VBSM_QUIET` |
-| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
+| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe, cold-boot wait; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE`, `VBSM_GPU_COLDWAIT`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
 | `openpilot/system/hardware/hardwared.py` | §2b park, §3 boot cause, §4 idle power, §6 shutdown debounce + rails/flash log level | `VBSM_GPU_IDLE`, `VBSM_PARK`, `VBSM_LOG_LEVEL`, `VBSM_BOOTCAUSE` |
 | `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events; §3 boot health | `VBSM_PARKWATCH`, `VBSM_BOOTCAUSE` |
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
