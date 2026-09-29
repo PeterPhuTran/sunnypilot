@@ -201,6 +201,15 @@ class SelfdriveD(CruiseHelper):
     CruiseHelper.__init__(self, self.CP)
     self.button_state_tracker = ButtonStateTracker()
 
+  def _big_model_settling(self) -> bool:
+    # VBSM_SETTLE_GATE: a big-model load, and the warm-up after it, holds modelV2 and everything
+    # downstream of it back on purpose, so the load masks commIssue, the localization errors and
+    # "active but no modelV2". Only while disengaged: engaged (openpilot, or MADS steering; a paused
+    # MADS does not steer), a load means modeld died under the driver, and the mask would also cancel
+    # the soft disable commIssue already began.
+    settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + BIG_MODEL_WARMUP_SEC
+    return settling and not (self.enabled or self.mads.active)
+
   def update_events(self, CS):
     """Compute onroadEvents from carState"""
 
@@ -229,7 +238,7 @@ class SelfdriveD(CruiseHelper):
     # frame (it still loads the small model in between), so "active but no
     # modelV2" inside the settling window is the load finishing, not a failure
     # -- it raised a false "Big Model Failed" banner on 2026-09-13
-    big_model_settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + BIG_MODEL_WARMUP_SEC
+    big_model_settling = self._big_model_settling()
     model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2'] and not big_model_settling
     big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
     if big_failed and not self.big_model_failed:
@@ -497,7 +506,7 @@ class SelfdriveD(CruiseHelper):
     # generic catch-all. ideally, a more specific event should be added above instead
     has_disable_events = self.events.contains(ET.NO_ENTRY) and (self.events.contains(ET.SOFT_DISABLE) or self.events.contains(ET.IMMEDIATE_DISABLE))
     no_system_errors = (not has_disable_events) or (len(self.events) == num_events)
-    big_model_settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + BIG_MODEL_WARMUP_SEC
+    big_model_settling = self._big_model_settling()
     if not self.sm.all_checks() and no_system_errors and not big_model_settling:  # the load holds modelV2 and friends back on purpose
       if not self.sm.all_alive():
         self.events.add(EventName.commIssue)
@@ -525,6 +534,16 @@ class SelfdriveD(CruiseHelper):
       if (not self.sm['vehicleParameters'].valid and cal_status == log.ExtrinsicsCalibration.Status.calibrated and
           not TESTING_CLOSET and (not SIMULATION or REPLAY)):
         self.events.add(EventName.paramsdTemporaryError)
+
+    # VBSM_SETTLE_GATE: what the load masks is no alert while disengaged, but it must not be engaged
+    # into either: the masks lift on engagement and the soft disable would follow at once
+    if big_model_settling and not self.events.has(EventName.bigModelLoading):
+      dm = self.sm['deviceMotion']
+      held = not dm.posenetOK or not dm.inputsOK or \
+        (not self.sm['vehicleParameters'].valid and cal_status == log.ExtrinsicsCalibration.Status.calibrated and
+         not TESTING_CLOSET and (not SIMULATION or REPLAY))
+      if not self.sm.all_checks() or (not self.CP.notCar and held):
+        self.events.add(EventName.bigModelLoading)
 
     # conservative HW alert. if the data or frequency are off, locationd will throw an error
     if any((self.sm.frame - self.sm.recv_frame[s])*DT_CTRL > 10. for s in self.sensor_packets):

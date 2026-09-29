@@ -283,6 +283,27 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   but no modelV2" is ignored inside the 5 s settling window (modeld marks the big model active ~2 s
   before its first published frame, which raised a false "Big Model Failed" banner). `BIG_MODEL_WARMUP_SEC`
   replaces the local `warmup_sec`.
+- **Load masks only while disengaged** (`VBSM_SETTLE_GATE`, `selfdrived.py`, 2026-09-28): upstream's
+  `big_model_settling` (a load, and the 5 s after it) masks commIssue, posenetInvalid,
+  locationdTemporaryError and paramsdTemporaryError, and the fork added "active but no modelV2" to it. It
+  applied while ENGAGED too, where a load can only mean modeld died under the driver. (a) If modeld dies
+  inside the 5 s after a load (the driver can engage the moment "Big Model Ready" shows), the soft
+  disable waits for the window to end. (b) When the replacement modeld reaches main() it sets
+  ChestnutLoading, the SOFT_DISABLE event vanishes and `softDisabling` goes back to enabled (state.py).
+  Together: a death ~1.7 s after the load (the field kick timing) with a 3-5 s launch-to-main left the
+  car engaged on a dead modelV2 for 27.6-29.5 s in the time-stepped sim, steering on the last
+  desiredCurvature. (b) alone needs a launch-to-main under ~3 s, never seen (restarts measured >=4.3 s).
+  Now `_big_model_settling()` is False while engaged (openpilot, or MADS `active`; a paused MADS does not
+  steer and keeps the masks), and while the masks apply anything they hide adds `bigModelLoading`
+  (NO_ENTRY), since the masks lift on engagement and a soft disable would follow at once. Effect on
+  normal starts: every start now refuses an engage for ~1.0-1.7 s after "Big Model Ready" (median 1.3 s
+  over 74 field loads, until deviceMotion and all_checks come up), then clears; only 1 of 96 archived
+  loads had an engage that early. `bigModelLoading` therefore spans ~1 s past the load end, so tools that
+  time loads from that event (tools/cablecmp.py, vbsm-train/brownout_ds/_tools/build_manifest.py) read
+  ~1 s long. Benches: `pending/prJ/bench_settle_gate.py` (real source of both versions, 35-case truth
+  table) and `bench_settle_gate_dyn.py` (real update_events segments + real state.py and mads/state.py
+  at 100 Hz, 13 scenarios: old 27.6-29.5 s engaged on a dead model, new 3.0 s then disengaged).
+  Upstream-worthy (the mask is sunnypilot's, not the fork's).
 - **Bounded locationd lockout** (`VBSM_LOC_CAP`, `locationd.py`, NEW managed file): the invalid-input
   counters are capped at limit+1. Unbounded, one 2 s burst of rejected gyro samples (the gyro/camera
   yaw-rate cross-check has nothing to compare against during a camera-odometry gap) took ~10 minutes to
@@ -468,7 +489,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/system/manager/process.py` | §3 | `VBSM_RESTART` |
 | `openpilot/system/manager/process_config.py` | §1, §3 process entries, backup_manager sigkill | `VBSM_EXIT` |
 | `openpilot/selfdrive/car/card.py` | §1 | — |
-| `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §4 big-model alerts, §5 personality re-read + LKAS toggle | `VBSM_CHIME_HOLD`, `VBSM_CONFIG`, `VBSM_GPU_ALERTS`, `VBSM_HUD`, `VBSM_EXP_TOGGLE`, `VBSM_LKAS_REPURPOSED` |
+| `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §4 big-model alerts + settle gate, §5 personality re-read + LKAS toggle | `VBSM_CHIME_HOLD`, `VBSM_CONFIG`, `VBSM_GPU_ALERTS`, `VBSM_SETTLE_GATE`, `VBSM_HUD`, `VBSM_EXP_TOGGLE`, `VBSM_LKAS_REPURPOSED` |
 | `openpilot/sunnypilot/mads/mads.py` | §5 LKAS button freed for the toggle | `VBSM_EXP_TOGGLE` |
 | `openpilot/sunnypilot/models/fetcher.py` | §6 manifest storm fix, offline fetch backoff | `VBSM_QUIET` |
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1 settings | `BigConfigControl` |
