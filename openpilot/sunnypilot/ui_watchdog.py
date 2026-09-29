@@ -41,6 +41,7 @@ the manager's own per-catalog stash/restore and needs no help from here.
 NOTE: crash files under /data/community/crashes carry a stale Jul-28 date when
 the boot predates NTP sync; search by mtime, not by name.
 """
+import math
 import os
 import signal
 import time
@@ -67,6 +68,10 @@ MAX_GPU_HANGS_PER_BOOT = 6  # backstop only: a rail this bad stops earning retri
 GPU_RETRY_RAIL_MV = 13000     # rail back in the charging band...
 GPU_RETRY_RAIL_HOLD_S = 60.0  # ...and holding it, before spending a retry
 GPU_LOAD_DEADLINE_S = 90.0  # every legitimate load path resolves by 60s
+# VBSM_GPU_COLDWAIT: modeld writes "<pid> <seconds>" when its cold-boot link wait ran past the plain budget;
+# the load deadline moves by that much for that pid only, bounded
+GPU_PREFLIGHT_EXT_FILE = "/dev/shm/vbsm_gpu_preflight_ext"
+GPU_PREFLIGHT_EXT_MAX_S = 35.0   # modeld's worst case: 20 s extension + poll + two 2 s reads + a 10 s F3 write
 GPU_STABLE_S = 10.0      # enclosure must stay enumerated this long
 MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write ChestnutLoading
 GPU_KICK_COOLDOWN_S = 120.0
@@ -83,6 +88,17 @@ GPU_KICK_REQUEST_MAX_AGE_S = 600.0
 # once it has seen 12 V and PCIe L0. Both are tmpfs, written fresh by every modeld process.
 GPU_LINK_WAIT_FILE = "/dev/shm/vbsm_gpu_link_wait"
 GPU_LINK_READY_FILE = "/dev/shm/vbsm_gpu_link_ready"
+
+
+def preflight_ext_s(pid):
+  """VBSM_GPU_COLDWAIT: seconds modeld `pid` waited for the link past its plain budget (0 if none or unreadable)."""
+  try:
+    with open(GPU_PREFLIGHT_EXT_FILE) as f:
+      p, s = f.read().split()
+    v = float(s)
+    return min(max(v, 0.0), GPU_PREFLIGHT_EXT_MAX_S) if math.isfinite(v) and int(p) == pid else 0.0   # nan would disarm the kill
+  except (OSError, ValueError):
+    return 0.0
 
 
 def find_proc(match, exclude=()):
@@ -307,11 +323,13 @@ class GpuKick:
     # car-off, with the timeout never having fired). Only an external kill
     # works. ChestnutLoading past the deadline is definitive: every legitimate
     # path -- success or the in-process exit -- resolves by 60s.
-    if (self.params.get_bool("ChestnutLoading") and now - self.modeld_seen[1] > GPU_LOAD_DEADLINE_S
+    load_age = now - self.modeld_seen[1]
+    if (self.params.get_bool("ChestnutLoading") and load_age > GPU_LOAD_DEADLINE_S
+        and load_age > GPU_LOAD_DEADLINE_S + preflight_ext_s(pid)   # VBSM_GPU_COLDWAIT
         and not os.path.exists(GPU_VETO_FILE)):
       self._veto("load")
       cloudlog.error(f"ui_watchdog: modeld pid {pid} wedged in eGPU load "
-                     f"({now - self.modeld_seen[1]:.0f}s), killing for vetoed respawn")
+                     f"({load_age:.0f}s, preflight ext {preflight_ext_s(pid):.1f}s), killing for vetoed respawn")
       try:
         os.kill(pid, signal.SIGKILL)
       except OSError as e:

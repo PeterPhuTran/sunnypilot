@@ -7,6 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 from collections.abc import Callable
+import math
 import os
 os.environ['GMMU'] = '0'
 # VBSM_GPU_READY: tinygrad resolves Device.DEFAULT by probing every backend in order
@@ -339,7 +340,8 @@ class ModelState(ModelStateBase):
 # link that never trains with 12 V present skips the open (nothing to leak) and takes
 # the SoC fallback -- the ui_watchdog kick stays the safety net. The wait ends 22 s
 # after main() starts, so 22 + 60 (loader budget) + ~3 (small model) stays under
-# ui_watchdog's 90 s load deadline: the watchdog matches ".modeld" in the cmdline,
+# ui_watchdog's 90 s load deadline (VBSM_GPU_COLDWAIT may extend the wait at a cold boot and
+# moves that deadline by the same amount): the watchdog matches ".modeld" in the cmdline,
 # which only appears at setproctitle() a few ms into main(), and polls every 2 s, so
 # its clock starts at or after ours. Imports (4-11 s warm, longer cold) come before
 # main() and must not shrink the link budget (they did in e8b7e968, which counted
@@ -347,6 +349,19 @@ class ModelState(ModelStateBase):
 CHESTNUT_READY_TIMEOUT_S = 20.0
 CHESTNUT_READY_END_BY_S = 22.0   # after main() entry, see above
 CHESTNUT_READY_POLL_S = 0.5
+# VBSM_GPU_COLDWAIT: at a fresh power-up the bridge can be enumerated but silent ('unreadable'). In the field
+# (2026-09-17..28, anchored to kernel boot) the silence ended 43.6-48.7 s after kernel boot (09-27: 47.3-50.7),
+# only on the first start after the device had been off. The plain budget runs from main(), so a modeld that
+# reaches main() early has less of it left: 09-27 had the earliest main() of all silent starts and missed it,
+# the eGPU was skipped and the late-probe kick then cost ~40 s with no model. So once a read has come back
+# unreadable, the wait may run on until CHESTNUT_COLD_BOOT_AGE_S after kernel boot, but never past
+# CHESTNUT_COLD_MAX_S after main(). In practice the extension is max(0, min(20, 50 - boot age at the wait's
+# start)) s: a wait that starts 50 s or more into the boot (kick, crash respawn) keeps the plain budget. The
+# seconds used past the plain deadline go to ui_watchdog through CHESTNUT_PREFLIGHT_EXT_FILE, which moves its
+# load deadline for this pid by as much. Re-derive both constants before anything makes main() earlier.
+CHESTNUT_COLD_BOOT_AGE_S = 70.0
+CHESTNUT_COLD_MAX_S = 40.0
+CHESTNUT_PREFLIGHT_EXT_FILE = "/dev/shm/vbsm_gpu_preflight_ext"
 CHESTNUT_F3_TIMEOUT_MS = 10000   # tinygrad's own timeout for the PCIe power write
 CHESTNUT_F3_RESEND_S = 10.0      # re-send F3=1 only if the LTSSM is still in Detect this long after the last write
 CHESTNUT_POWERED_MV = 5000       # helpers.CHESTNUT_POWERED_VOLTAGE
@@ -530,12 +545,32 @@ def wait_chestnut_ready(t_main: float) -> str:
   f3_total=1. 'absent' = six reads with no bridge in sysfs; 'unreadable' = the bridge is enumerated but answered no
   read by the deadline (2026-09-16 cold boot: enumerated at 5000 Mb/s from boot, silent for ~30 s)."""
   t0 = time.monotonic()
+  boot_age0 = deadline = cold_deadline = None
   reads = f3 = misses = unpowered = unreadable = 0
   raw = None
   reason = "timeout"
+
+  def extension_s() -> float:
+    # VBSM_GPU_COLDWAIT: seconds past the plain deadline, only when the extension was in effect; rounded up
+    if not unreadable or deadline is None or cold_deadline is None or cold_deadline <= deadline:
+      return 0.0
+    return math.ceil(max(0.0, time.monotonic() - deadline) * 10) / 10
+
+  def tell_watchdog(ext: float) -> None:
+    # VBSM_GPU_COLDWAIT: before the 60 s loader budget starts, so ui_watchdog's load deadline moves with us
+    if ext > 0:
+      try:
+        with open(CHESTNUT_PREFLIGHT_EXT_FILE, "w") as f:
+          f.write(f"{os.getpid()} {ext}")
+      except OSError:
+        cloudlog.exception("chestnut preflight extension marker write failed")
+
   try:
+    boot_age0 = time.clock_gettime(time.CLOCK_BOOTTIME)
     deadline = min(t0 + CHESTNUT_READY_TIMEOUT_S, t_main + CHESTNUT_READY_END_BY_S)
     deadline = max(deadline, t0 + 2.0)
+    # VBSM_GPU_COLDWAIT: only a bridge that has read unreadable, early in the boot, gets the extension
+    cold_deadline = max(deadline, min(t_main + CHESTNUT_COLD_MAX_S, t0 + CHESTNUT_COLD_BOOT_AGE_S - boot_age0))
     while True:
       raw = chestnut_raw()
       reads += 1
@@ -561,15 +596,19 @@ def wait_chestnut_ready(t_main: float) -> str:
         if mv >= CHESTNUT_POWERED_MV and (never_written or (in_detect and time.monotonic() - _last_f3 >= CHESTNUT_F3_RESEND_S)):
           f3 += 1
           chestnut_f3_on()
-      if time.monotonic() >= deadline:
+      if time.monotonic() >= (cold_deadline if unreadable else deadline):
         reason = "unreadable" if raw is None and unreadable else "timeout"
         break
       time.sleep(CHESTNUT_READY_POLL_S)
   except Exception:
     cloudlog.exception("chestnut link probe error")
+    tell_watchdog(extension_s())   # probe_error still starts the loader
     return "probe_error"
+  extended_s = extension_s()
+  tell_watchdog(extended_s)
   fields = dict(reason=reason, reads=reads, unreadable=unreadable, f3_writes=f3, f3_total=_f3_writes, wait_s=round(time.monotonic() - t0, 1),
-                main_age_s=round(time.monotonic() - t_main, 1), pid_age_s=round(time.monotonic() - PROC_START, 1), **chestnut_fields(raw))
+                main_age_s=round(time.monotonic() - t_main, 1), pid_age_s=round(time.monotonic() - PROC_START, 1),
+                wait_boot_age_s=round(boot_age0, 1), extended_s=extended_s, **chestnut_fields(raw))
   if reason == "ready":
     cloudlog.event("chestnut link ready", **fields)  # VBSM_LOG_LEVEL: no error kwarg on success
   else:
@@ -600,7 +639,7 @@ def main(demo=False):
   params = Params()
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
-  for stale in (CHESTNUT_LINK_WAIT_FILE, CHESTNUT_LINK_READY_FILE):   # VBSM_GPU_LATE: every process decides afresh
+  for stale in (CHESTNUT_LINK_WAIT_FILE, CHESTNUT_LINK_READY_FILE, CHESTNUT_PREFLIGHT_EXT_FILE):   # VBSM_GPU_LATE/COLDWAIT: every process decides afresh
     try:
       os.remove(stale)
     except OSError:
