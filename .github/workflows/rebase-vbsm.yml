@@ -138,6 +138,7 @@ jobs:
           check VBSM_SETTLE_GATE openpilot/selfdrive/selfdrived/selfdrived.py
           check VBSM_GPU_COLDWAIT openpilot/sunnypilot/modeld_v2/modeld.py
           check VBSM_GPU_COLDWAIT openpilot/sunnypilot/ui_watchdog.py
+          check VBSM_SENSORD     openpilot/system/sensord/sensord.py
           # a lost restart policy is silent until something dies mid-drive, so
           # assert the call sites too, not just the marker comment
           test "$(git cat-file blob "$C:openpilot/system/manager/process.py" \
@@ -163,6 +164,11 @@ jobs:
             git cat-file blob "$C:$f" | grep -c '"/dev/shm/vbsm_gpu_preflight_ext"' > /dev/null \
               || { echo "::error::$f does not use the shared preflight extension file"; fail=1; }
           done
+          # sensord must exit when any thread dies: with any(), a dead interrupt thread is hidden by
+          # the temperature poller and the IMU stays silent for the whole drive (MODS.md, VBSM_SENSORD)
+          test "$(git cat-file blob "$C:openpilot/system/sensord/sensord.py" \
+                  | grep -c 'while all(t.is_alive() for t in threads):')" = 1 \
+            || { echo "::error::sensord.py main loop no longer exits on a dead thread"; fail=1; }
           # without this the device would try to compile, which it cannot do
           git rev-parse -q --verify "$C:prebuilt" > /dev/null \
             || { echo "::error::prebuilt marker missing"; fail=1; }
