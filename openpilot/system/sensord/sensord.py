@@ -19,6 +19,33 @@ from openpilot.system.sensord.sensors.lsm6ds3_temp import LSM6DS3_Temp
 
 I2C_BUS_IMU = 1
 
+# VBSM_SENSORD: at a cold boot the manager can start sensord before udev has applied
+# 99-gpio.rules (root:gpio 0660) to /dev/gpiochip0, and the open fails with EACCES
+# (2026-10-08: sensord started at 15:05:02, the chown landed at 15:05:04.03). Wait for
+# it; when udev is only seconds late this stays inside selfdrived's 10 s sensorDataInvalid.
+GPIO_OPEN_WAIT_S = 30.
+GPIO_OPEN_RETRY_S = 0.25
+
+def open_irq_fd(event: threading.Event) -> int | None:
+  t0 = time.monotonic()
+  logged = False
+  while True:
+    try:
+      fd = gpiochip_get_ro_value_fd("sensord", 0, 84)
+    except (PermissionError, FileNotFoundError) as e:
+      # both fail at os.open(), before any fd exists, so a retry leaks nothing
+      if time.monotonic() - t0 >= GPIO_OPEN_WAIT_S:
+        raise
+      if not logged:
+        cloudlog.error(f"sensord: gpiochip0 not ready ({e}), waiting up to {GPIO_OPEN_WAIT_S:.0f} s")
+        logged = True
+      if event.wait(GPIO_OPEN_RETRY_S):
+        return None
+      continue
+    if logged:
+      cloudlog.warning(f"sensord: gpiochip0 ready after {time.monotonic() - t0:.2f} s")
+    return fd
+
 def interrupt_loop(sensors: list[tuple[Sensor, str, bool]], event) -> None:
   pm = messaging.PubMaster([service for sensor, service, interrupt in sensors if interrupt])
 
@@ -29,7 +56,9 @@ def interrupt_loop(sensors: list[tuple[Sensor, str, bool]], event) -> None:
   # Requesting both edges as the data ready pulse from the lsm6ds sensor is
   # very short (75us) and is mostly detected as falling edge instead of rising.
   # So if it is detected as rising the following falling edge is skipped.
-  fd = gpiochip_get_ro_value_fd("sensord", 0, 84)
+  fd = open_irq_fd(event)
+  if fd is None:
+    return
 
   # Configure IRQ affinity
   irq_path = "/proc/irq/336/smp_affinity_list"
@@ -76,6 +105,15 @@ def interrupt_loop(sensors: list[tuple[Sensor, str, bool]], event) -> None:
           cloudlog.exception(f"Error processing {service}")
 
 
+def run_logged(target, *args) -> None:
+  # VBSM_SENSORD: an uncaught thread exception only reaches stderr (the tmux pane), never swaglog
+  try:
+    target(*args)
+  except Exception:
+    cloudlog.exception(f"sensord: {target.__name__} died")
+    raise
+
+
 def polling_loop(sensor: Sensor, service: str, event: threading.Event) -> None:
   pm = messaging.PubMaster([service])
   rk = Ratekeeper(SERVICE_LIST[service].frequency, print_delay_threshold=None)
@@ -110,7 +148,7 @@ def main() -> None:
   # Initialize sensors
   exit_event = threading.Event()
   threads = [
-    threading.Thread(target=interrupt_loop, args=(sensors_cfg, exit_event), daemon=True)
+    threading.Thread(target=run_logged, args=(interrupt_loop, sensors_cfg, exit_event), daemon=True)
   ]
   for sensor, service, interrupt in sensors_cfg:
     try:
@@ -118,18 +156,23 @@ def main() -> None:
       if not interrupt:
         # Start polling thread for sensors without interrupts
         threads.append(threading.Thread(
-          target=polling_loop,
-          args=(sensor, service, exit_event),
+          target=run_logged,
+          args=(polling_loop, sensor, service, exit_event),
           daemon=True
         ))
     except Exception:
       cloudlog.exception(f"Error initializing {service} sensor")
 
+  died = False
   try:
     for t in threads:
       t.start()
-    while any(t.is_alive() for t in threads):
+    # VBSM_SENSORD: all(), not any(). With any(), a dead interrupt thread left the temperature
+    # poller holding the process up: the manager saw sensord running while accelerometer and
+    # gyroscope were silent for the whole drive. Exit instead and let VBSM_RESTART rebuild it.
+    while all(t.is_alive() for t in threads):
       time.sleep(1)
+    died = True
   except KeyboardInterrupt:
     pass
   finally:
@@ -143,6 +186,10 @@ def main() -> None:
         sensor.shutdown()
       except Exception:
         cloudlog.exception("Error shutting down sensor")
+
+  if died:
+    cloudlog.error("sensord: a sensor thread died, exiting for a restart")
+    raise SystemExit(1)
 
 if __name__ == "__main__":
   main()

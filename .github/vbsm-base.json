@@ -24,6 +24,7 @@
     "openpilot/sunnypilot/parkwatchd.py",
     "openpilot/system/hardware/power_monitoring.py",
     "openpilot/selfdrive/locationd/locationd.py",
-    "openpilot/selfdrive/ui/mici/onroad/cameraview.py"
+    "openpilot/selfdrive/ui/mici/onroad/cameraview.py",
+    "openpilot/system/sensord/sensord.py"
   ]
 }

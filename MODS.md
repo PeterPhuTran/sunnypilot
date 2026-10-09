@@ -111,7 +111,7 @@ two on-demand paths. Honest failures, not faked successes.
   at `monotonic_s` ≈ 3,600. Old records carry the raw BMS value in `draw_w`; split any trend at this commit.
 - 2026-09-08: the budget integrator was inert on the comma four (`get_current_power_draw()` reads a hwmon node that does not exist there, so 0 W). `park_power_draw()` now falls back to the SoM BMS reading (~2.7 W idle, a lower bound of the whole device), then a 3 W floor; the shutdown record carries `draw_w` / `draw_source`. First real record: 9.1 h parked, used 0.0 Wh, ended by the 11.8 V voltage rule.
 
-### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`, `VBSM_EXIT`, `VBSM_BOOTCAUSE`
+### 3. Process reliability — `VBSM_RESTART`, `VBSM_WATCHDOG`, `VBSM_EXIT`, `VBSM_BOOTCAUSE`, `VBSM_SENSORD`
 - `process.py`: upstream's manager never restarts a process that dies mid-session — one crash means
   the process (and, for the driving model, openpilot engagement) is gone until reboot. The manager
   now reaps a dead child and rebuilds it: 5 restarts per DRIVE, 10 s apart, then it parks with its
@@ -153,6 +153,24 @@ two on-demand paths. Honest failures, not faked successes.
   `som_reset_triggered` true (only possible after a STANDBY→BOOTKICK transition, i.e. no panda reboot
   since the last session), = an ignition/harness edge did. A small uptime with the ignition line on is
   just a harness power-up. `bootkick_tick` runs at 1 Hz: the countdowns are 20 s and 5 s.
+- `VBSM_SENSORD` (2026-10-08, `system/sensord/sensord.py`): at a cold boot on 2026-10-08 the manager
+  started sensord before udev had applied `99-gpio.rules` (root:gpio 0660) to `/dev/gpiochip0`. This
+  coldplug was slow (sensord started at 15:05:02 on the pre-NTP clock, the node's chown landed at
+  15:05:04.03, other gpiochips were still being handled ~45 s into the boot). The interrupt thread died
+  on `PermissionError` at `os.open`. The temperature poller kept the process alive, because `main()`
+  looped while *any* thread lived, so the manager saw sensord running while accelerometer and gyroscope
+  stayed silent for the whole drive: `Sensor Data Invalid` after 10 s and then `commIssue`. The
+  traceback reached only the tmux pane, never swaglog. The interrupt thread now retries the open every
+  0.25 s for up to 30 s on `PermissionError` / `FileNotFoundError` (both fail before an fd exists, so a
+  retry leaks nothing) and logs `gpiochip0 not ready` once, then `gpiochip0 ready after <s>`. Any other
+  error (EBUSY at the line request) is not retried. A thread that dies is logged through
+  `cloudlog.exception`, and `main()` now loops while *all* threads live and exits 1, so `VBSM_RESTART`
+  rebuilds the process 10 s later. A SIGINT during the wait still exits 0. Bench
+  `pending/prL/bench_sensord_gpio.py`: 16/16, the old file reproduces the silent failure. On the car, with
+  the node held at 0600 for 3 s, the first IMU message came 0.67 s after the chown was restored.
+  Acceptance: on a slow cold boot, `gpiochip0 not ready` then `ready after` lines and no
+  `sensorDataInvalid`; on a normal boot, no sensord lines at all. Retire when upstream sensord tolerates a
+  late gpiochip (same code at commaai/openpilot master as of 2026-10-08).
 
 #### Port note — 2026-09-07 rebase onto sunnypilot `40d6afd3` (v2026.003.000)
 Upstream squashed `staging` (no common ancestor with the previous base `45515f72`), so this was a
@@ -502,7 +520,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 - **Retire when**: msgq releases reader slots on close, or upstream's camera view stops building a
   client per switch. The port's drift guard stops on any upstream change to `cameraview.py`.
 
-## Managed files (24) and markers
+## Managed files (25) and markers
 
 | File | Mods | Markers |
 |---|---|---|
@@ -528,6 +546,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
 | `openpilot/system/hardware/power_monitoring.py` | §2b parked energy budget | `VBSM_PARK` |
 | `openpilot/selfdrive/locationd/locationd.py` | §4 bounded lockout, buffered message validity | `VBSM_LOC_CAP`, `VBSM_LOC_VALID` |
+| `openpilot/system/sensord/sensord.py` | §3 late gpiochip wait, exit on a dead thread | `VBSM_SENSORD` |
 
 Retired: `VBSM_DM_PKL_PIN` (§7, the three driver-monitoring pickles and the `dmonitoringmodeld.py`
 tripwire, dropped 2026-09-21 once upstream staging `81d7957c` shipped consistent pickles); `VBSM_COMPAT` (a modeld_v2 unpacking shim, superseded when upstream fixed the API
