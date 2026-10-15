@@ -282,6 +282,12 @@ class ModelState(ModelStateBase):
 CHESTNUT_READY_TIMEOUT_S = 20.0
 CHESTNUT_READY_END_BY_S = 22.0   # after main() entry, see above
 CHESTNUT_READY_POLL_S = 0.5
+# VBSM_GPU_12V_GRACE: the accessory outlet can power up a few seconds after modeld starts. On 2026-10-15 the device
+# had booted ~1 min before ignition, modeld read 5-8 mV, called no_12v after three reads (1.0 s), and its late probe
+# saw 13.9 V and L0 2.1 s later: the eGPU was skipped, "Big Model Failed / Restart the car" showed for 20 s and the
+# kick reloaded modeld. The supply now has to read unpowered for this long before the wait gives up on it; a wait
+# that runs out of budget while still unpowered also ends as no_12v (nothing was attempted, so no strike).
+CHESTNUT_NO_12V_GRACE_S = 10.0
 # VBSM_GPU_COLDWAIT: at a fresh power-up the bridge can be enumerated but silent ('unreadable'). In the field
 # (2026-09-17..28, anchored to kernel boot) the silence ended 43.6-48.7 s after kernel boot (09-27: 47.3-50.7),
 # only on the first start after the device had been off. The plain budget runs from main(), so a modeld that
@@ -476,10 +482,12 @@ def wait_chestnut_ready(t_main: float) -> str:
   """'ready' | 'timeout' | 'no_12v' | 'absent' | 'unreadable' | 'probe_error'. Never raises. Read-first: F3=1 only with
   12 V and the link down; the preflight's write counts (f3_total), so a cold boot normally shows f3_writes=0 here and
   f3_total=1. 'absent' = six reads with no bridge in sysfs; 'unreadable' = the bridge is enumerated but answered no
-  read by the deadline (2026-09-16 cold boot: enumerated at 5000 Mb/s from boot, silent for ~30 s)."""
+  read by the deadline (2026-09-16 cold boot: enumerated at 5000 Mb/s from boot, silent for ~30 s); 'no_12v' = the
+  supply read under 5 V for CHESTNUT_NO_12V_GRACE_S, or still did when the budget ended (VBSM_GPU_12V_GRACE)."""
   t0 = time.monotonic()
   boot_age0 = deadline = cold_deadline = None
-  reads = f3 = misses = unpowered = unreadable = 0
+  reads = f3 = misses = unreadable = 0
+  unpowered_since = None   # VBSM_GPU_12V_GRACE: start of the current run of reads under 5 V
   raw = None
   reason = "timeout"
 
@@ -520,17 +528,26 @@ def wait_chestnut_ready(t_main: float) -> str:
         if lt == CHESTNUT_PCIE_L0:
           reason = "ready"
           break
-        unpowered = unpowered + 1 if mv < CHESTNUT_POWERED_MV else 0
-        if unpowered >= 3:
-          reason = "no_12v"
-          break
+        if mv < CHESTNUT_POWERED_MV:
+          if unpowered_since is None:
+            unpowered_since = time.monotonic()
+          if time.monotonic() - unpowered_since >= CHESTNUT_NO_12V_GRACE_S:   # VBSM_GPU_12V_GRACE
+            reason = "no_12v"
+            break
+        else:
+          unpowered_since = None
         never_written = _last_f3 == float("-inf")
         in_detect = lt in (0x00, 0x01)   # an unpowered link reads 0x00 or 0x01 (bench 2026-09-14)
         if mv >= CHESTNUT_POWERED_MV and (never_written or (in_detect and time.monotonic() - _last_f3 >= CHESTNUT_F3_RESEND_S)):
           f3 += 1
           chestnut_f3_on()
       if time.monotonic() >= (cold_deadline if unreadable else deadline):
-        reason = "unreadable" if raw is None and unreadable else "timeout"
+        if raw is None and unreadable:
+          reason = "unreadable"
+        elif unpowered_since is not None:
+          reason = "no_12v"   # VBSM_GPU_12V_GRACE: out of budget with no 12 V yet: nothing attempted, no strike
+        else:
+          reason = "timeout"
         break
       time.sleep(CHESTNUT_READY_POLL_S)
   except Exception:
