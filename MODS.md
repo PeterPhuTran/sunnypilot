@@ -243,8 +243,9 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   deadline (the watchdog matches `.modeld` in the cmdline, which only appears at `setproctitle()` inside `main()`, and
   polls every 2 s, so its clock starts at or after modeld's; e8b7e968 counted from process start and let a slow
   import shrink the link budget).
-  Outcomes: `ready` opens; `no_12v` (three reads under 5 V, a dead outlet) and `absent` (six failed reads) skip the
-  open without a strike toward the boot veto, so the kick may retry later; `timeout` (12 V present, link never
+  Outcomes: `ready` opens; `no_12v` (under 5 V for 10 s, or still under 5 V when the budget ends: a dead outlet,
+  `VBSM_GPU_12V_GRACE`) and `absent` (six failed reads) skip the open without a strike toward the boot veto, so the
+  kick may retry later; `timeout` (12 V present, link never
   trained) skips the open and counts a strike; `probe_error` opens anyway. Events: `chestnut preflight` (state at
   start: DEV, opened devices, lock fds, supply, LTSSM, whether the power bit was written and the LTSSM right after),
   `chestnut link ready` / `chestnut link not ready` (reason, reads, F3 writes in the wait and in total, wait, age since
@@ -254,6 +255,15 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   before its first drive. First drive on e8b7e968 (2026-09-14 20:08 and 20:23 PT): both starts warm (hardwared's
   rails-on had trained the link), preflight LTSSM 0x78, ready on the first read, open 4.4 s / 1.9 s, big model from the
   first process in 26 s / 23 s, 100 % big frames, 0 % drops; the cold-boot link-down path is still unobserved.
+- **12 V grace** (`VBSM_GPU_12V_GRACE`, `modeld_v2/modeld.py`, 2026-10-15): `no_12v` used to fire after three
+  reads under 5 V (1.0 s). That morning the device had booted about a minute before ignition, so modeld started with
+  the accessory outlet still off (5-8 mV). It skipped the eGPU after 1.0 s, the late probe saw 13.9 V and L0 2.1 s
+  later, and the driver got "Big Model Failed / Restart the car to retry" for 20 s, then a kick reload (CTV3M in
+  27 s). The supply now has to stay under 5 V for `CHESTNUT_NO_12V_GRACE_S` = 10 s (three times the observed lag)
+  before the wait gives up, inside the unchanged 20/22 s budget, so ui_watchdog's deadline arithmetic holds. A wait
+  that runs out of budget while still unpowered reports `no_12v`, not a `timeout` strike. Cost: a truly dead outlet
+  starts the SoC model about 9 s later. Field record before the change: 72 `ready`, 2 `no_12v` (one dead outlet, one
+  this late outlet). Scenario test: `pending/no12v-grace/test_wait_ready.py` (out of tree, old vs new, 9 cases).
 - **Lock-contention retry, revised** (`VBSM_GPU_LOCK_RETRY`, `modeld_v2/modeld.py`): every failed open logs
   `eGPU open failed` with each sub-exception's type@file:line, whether it failed inside tinygrad's flock, the lock
   fds this process held before and after, and the elapsed time. One retry (2 s later) is attempted only when the
@@ -560,7 +570,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/onroad/cameraview.py` | §8 reader-slot pool | `VBSM_VIPC_POOL` |
 | `openpilot/system/athena/athenad.py` | §2; §6 oversized-log skip | `VBSM_PRIVACY`, `VBSM_QUIET` |
-| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, lock retry, late probe, cold-boot wait; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE`, `VBSM_GPU_COLDWAIT`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
+| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, fallback ladder, readiness, 12 V grace, lock retry, late probe, cold-boot wait; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_12V_GRACE`, `VBSM_GPU_LOCK_RETRY`, `VBSM_GPU_LATE`, `VBSM_GPU_COLDWAIT`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
 | `openpilot/system/hardware/hardwared.py` | §2b park, §3 boot cause, §4 idle power, §6 shutdown debounce + rails/flash log level | `VBSM_GPU_IDLE`, `VBSM_PARK`, `VBSM_LOG_LEVEL`, `VBSM_BOOTCAUSE` |
 | `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events; §3 boot health | `VBSM_PARKWATCH`, `VBSM_BOOTCAUSE` |
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
