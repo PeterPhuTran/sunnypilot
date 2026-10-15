@@ -291,12 +291,12 @@ def main():
   estimator = LocationEstimator(DEBUG)
 
   filter_initialized = False
-  critcal_services = ["accelerometer", "gyroscope", "cameraOdometry"]
+  critical_services = ["accelerometer", "gyroscope", "cameraOdometry"]
   observation_input_invalid = defaultdict(int)
 
-  input_invalid_limit = {s: round(INPUT_INVALID_LIMIT * (SERVICE_LIST[s].frequency / 20.)) for s in critcal_services}
-  input_invalid_threshold = {s: input_invalid_limit[s] - 0.5 for s in critcal_services}
-  input_invalid_decay = {s: calculate_invalid_input_decay(input_invalid_limit[s], INPUT_INVALID_RECOVERY, SERVICE_LIST[s].frequency) for s in critcal_services}
+  input_invalid_limit = {s: round(INPUT_INVALID_LIMIT * (SERVICE_LIST[s].frequency / 20.)) for s in critical_services}
+  input_invalid_threshold = {s: input_invalid_limit[s] - 0.5 for s in critical_services}
+  input_invalid_decay = {s: calculate_invalid_input_decay(input_invalid_limit[s], INPUT_INVALID_RECOVERY, SERVICE_LIST[s].frequency) for s in critical_services}
   # VBSM_LOC_CAP: the counters were unbounded, so one burst of rejected samples
   # (184 gyro samples in 2 s on 2026-09-13, when a 35 s camera-odometry gap
   # starved the gyro/camera yaw-rate cross-check) took ~10 minutes of clean
@@ -304,7 +304,7 @@ def main():
   # "locationd Temporary Error" meanwhile. Capping at limit+1 keeps a persistent
   # fault flagged (each bad sample re-pins the cap) but bounds recovery after
   # the fault ends to the designed INPUT_INVALID_RECOVERY window.
-  input_invalid_cap = {s: input_invalid_limit[s] + 1 for s in critcal_services}
+  input_invalid_cap = {s: input_invalid_limit[s] + 1 for s in critical_services}
   # VBSM_LOC_VALID: sm.all_valid() has no hysteresis at all, so a SINGLE message
   # flagged invalid -- 50 ms of a 20 Hz stream -- drops inputsOK and puts a
   # full-screen "TAKE CONTROL IMMEDIATELY / locationd Temporary Error" on the
@@ -354,7 +354,7 @@ def main():
         if valid:
           t = log_mono_time * 1e-9
           res = estimator.handle_log(t, which, msg)
-          if which not in critcal_services:
+          if which not in critical_services:
             continue
 
           if res == HandleLogResult.TIMING_INVALID:
@@ -372,7 +372,7 @@ def main():
     # invalid messages seen on those passes until the next cameraOdometry cycle
     fresh_invalid = fresh_invalid or any(sm.updated[s] and not sm.valid[s] for s in sm.services)
     if sm.updated["cameraOdometry"]:
-      critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critcal_services)
+      critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critical_services)
       # VBSM_LOC_VALID
       stale_dead_invalid = any(not sm.valid[s] and not sm.alive[s] for s in sm.services)
       msgs_invalid = validity_step(msgs_invalid, fresh_invalid, stale_dead_invalid, sm.all_valid())

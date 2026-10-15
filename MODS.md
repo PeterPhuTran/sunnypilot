@@ -173,6 +173,28 @@ hand-merge of six managed files. Substantive changes to the fork layer:
 - `home.py`, `augmented_road_view.py`: upstream's `TextAlignment` enums replace `rl.GuiTextAlignment`;
   upstream added USB/loading chestnut icons beside the fork's voltage label.
 
+#### Port note — 2026-10-14 onto sunnypilot `65feb2b6` (v2026.003.000, model selector 20)
+Upstream staging moved the model selector to version 20 on 2026-10-08 (catalog
+`driving_models_chestnut_v27.json`, a newer tinygrad), and the daily port stopped on nine managed
+files. This was a hand-merge; substantive changes to the fork layer:
+- `modeld.py`: upstream moved per-model input handling into `model_adapters.py` and renamed
+  `ChestnutState` to `ChestnutGpuState`: modeld now publishes only GPU metrics on `chestnutGpuState`,
+  and hardwared's new `chestnut_state_thread` reads the bridge and publishes `chestnutState`. Upstream
+  also removed the `ChestnutModelError` param from `params_keys.h`, so the fork's writes of it are
+  dropped (it was write-only, and an unregistered key raises `UnknownKeyName`). The fallback ladder,
+  veto and late-probe logic is unchanged.
+- `locationd.py`: upstream renamed `critcal_services` to `critical_services`; the `VBSM_LOC_CAP` and
+  `VBSM_LOC_VALID` code follows the new name.
+- `toggles.py`: upstream added descriptions to the stock controls; the blind spot controls are
+  unchanged.
+- `hardwared.py`, `selfdrived.py`, `card.py`, `process.py`, `home.py`, `fetcher.py`: upstream-only
+  edits that merged cleanly (sentry removal, `sm.seen` guards on the localizer errors, the bridge
+  state thread, the alert-pill icon callback, catalog v27).
+- Watch on the first drives: `chestnut_state_thread` opens the bridge over libusb next to modeld's
+  own EP0 reads (`VBSM_GPU_READY`) and `chestnut_power.py`. Confirm cold-boot loads are unaffected.
+- The selector bump invalidates the cached model bundles (as on 2026-09-07), so both model slots
+  must be re-selected and re-downloaded after the first boot on this base.
+
 ## 4. eGPU (chestnut) integration — `VBSM_GPU_*`
 The enclosure runs from the 12 V accessory outlet, which shaped everything (measured ~0.45 Ω supply
 path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
