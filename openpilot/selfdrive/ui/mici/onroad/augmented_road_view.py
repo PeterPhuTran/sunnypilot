@@ -238,6 +238,10 @@ class AugmentedRoadView(CameraView):
     self._bsm_enabled = False
     self._bsm_params_checked = 0.0
 
+    # VBSM_REVERSE_CAM: the cabin camera takes the screen in reverse (`reverse_view`, default on)
+    self._reverse_view = True
+    self._reversing = False
+
   def _refresh_bsm_params(self):
     now = rl.get_time()
     if now - self._bsm_params_checked < BSM_PARAM_INTERVAL:
@@ -250,6 +254,7 @@ class AugmentedRoadView(CameraView):
     except OSError:
       self._bsm_enabled = False
       self._bsm_zones = {}
+      self._reverse_view = True
       return
     if mtime == self._bsm_config_mtime:
       return
@@ -263,9 +268,11 @@ class AugmentedRoadView(CameraView):
       # view is a plain mirror of the signalled side and no CPU goes to the model.
       self._bsm_enabled = bool(config.get("camera_view"))
       self._bsm_zones = config.get("zones", {}) if self._bsm_enabled else {}
+      self._reverse_view = bool(config.get("reverse_view", True))
     except (OSError, ValueError):
       self._bsm_enabled = False
       self._bsm_zones = {}
+      self._reverse_view = True
 
   def _bsm_bounds(self, side: str) -> tuple[float, float, float, float] | None:
     """Bounding box of a side's calibrated polygons, as (x, y, w, h) in 0..1."""
@@ -309,6 +316,17 @@ class AugmentedRoadView(CameraView):
     self._bsm_zone = self._bsm_bounds("left" if left else "right")
     return self._bsm_zone is not None
 
+  def _update_reverse(self) -> bool:
+    """VBSM_REVERSE_CAM: the whole cabin frame takes the screen while the car is in reverse.
+
+    Same trust rule as the window view: the gear only counts while carState is
+    flowing, so a frozen carState cannot hold the cabin view on screen.
+    """
+    sm = ui_state.sm
+    self._reversing = bool(self._reverse_view and sm.alive['carState'] and sm.valid['carState'] and
+                           sm['carState'].gearShifter == car.CarState.GearShifter.reverse)
+    return self._reversing
+
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""
     return self._bookmark_icon.is_swiping_left()
@@ -337,6 +355,7 @@ class AugmentedRoadView(CameraView):
       return
 
     blind_spot_view = self._update_bsm()
+    reverse_view = self._update_reverse()
     self._switch_stream_if_needed(ui_state.sm)
 
     # Update calibration before rendering
@@ -363,8 +382,8 @@ class AugmentedRoadView(CameraView):
     super()._render(self._content_rect)
 
     # Draw all UI overlays. The driving path makes no sense drawn over a view out
-    # of a side window, but alerts still have to reach the driver.
-    if not blind_spot_view:
+    # of a side window or the cabin in reverse, but alerts still have to reach the driver.
+    if not (blind_spot_view or reverse_view):
       self._model_renderer.render(self._content_rect)
 
     # Fade out bottom of overlays for looks
@@ -427,7 +446,9 @@ class AugmentedRoadView(CameraView):
     # not what is on screen now
     effective = self._target_stream_type if self._switching else self.stream_type
 
-    if self._bsm_zone is not None and DRIVER_CAM in self.available_streams:
+    if self._reversing and DRIVER_CAM in self.available_streams:
+      target = DRIVER_CAM  # VBSM_REVERSE_CAM
+    elif self._bsm_zone is not None and DRIVER_CAM in self.available_streams:
       target = DRIVER_CAM
     elif sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
       v_ego = sm['carState'].vEgo
@@ -479,6 +500,10 @@ class AugmentedRoadView(CameraView):
       self.view_from_wide_calib = view_frame_from_device_frame @ wide_from_device @ device_from_calib
 
   def _calc_frame_matrix(self, rect: rl.Rectangle) -> np.ndarray:
+    # VBSM_REVERSE_CAM: the whole cabin frame, fitted and mirrored like a rear-view mirror
+    if self._reversing and self.stream_type == DRIVER_CAM:
+      return super()._calc_frame_matrix(rect)
+
     # blind spot view: magnify the driver frame until only the signalled window is left
     if self._bsm_zone is not None and self.stream_type == DRIVER_CAM and self.frame:
       x0, y0, w, h = self._bsm_zone
