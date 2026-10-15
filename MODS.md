@@ -524,6 +524,22 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 - **Retire when**: msgq releases reader slots on close, or upstream's camera view stops building a
   client per switch. The port's drift guard stops on any upstream change to `cameraview.py`.
 
+### 9. Reverse view — `VBSM_REVERSE_CAM`
+- **What** (`selfdrive/ui/mici/onroad/augmented_road_view.py`): while the car is in reverse, the
+  onroad view switches to the cabin camera and shows the whole frame, fitted and mirrored like a
+  rear-view mirror, with the driving path hidden. Alerts and the HUD still draw. Reverse takes
+  priority over the blind spot window view and the experimental-mode wide camera. Leaving reverse
+  returns to the road camera through the same switch path, so a switch still in flight is cancelled
+  rather than landing late (`_cancel_pending_switch`).
+- **Switch**: `reverse_view` in `/data/vision_bsm.json`, default on, set from the toggles page
+  ("driver camera in reverse"). A missing or unreadable file reads as on.
+- **Trust rule**: as for the window view, the gear only counts while `carState` is alive and valid,
+  so a frozen `carState` cannot hold the cabin view on screen.
+- **Why**: the comma four has no rear camera; the cabin camera is the only one facing backward.
+- **Tested**: `pending/reverse-cam/test_reverse_view.py` (out of tree) drives the extracted methods
+  through 13 cases: switch, priority, stale or invalid `carState`, toggle off, shift out before and
+  after the cabin stream connects, no cabin stream, and the frame matrix.
+
 ## Managed files (24) and markers
 
 | File | Mods | Markers |
@@ -538,8 +554,8 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §4 big-model alerts + settle gate, §5 personality re-read + LKAS toggle | `VBSM_CHIME_HOLD`, `VBSM_CONFIG`, `VBSM_GPU_ALERTS`, `VBSM_SETTLE_GATE`, `VBSM_HUD`, `VBSM_EXP_TOGGLE`, `VBSM_LKAS_REPURPOSED` |
 | `openpilot/sunnypilot/mads/mads.py` | §5 LKAS button freed for the toggle | `VBSM_EXP_TOGGLE` |
 | `openpilot/sunnypilot/models/fetcher.py` | §6 manifest storm fix, offline fetch backoff | `VBSM_QUIET` |
-| `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1 settings | `BigConfigControl` |
-| `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap | `BSM_STATE_PATH`, `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
+| `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1, §9 settings | `BigConfigControl`, `VBSM_REVERSE_CAM` |
+| `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap, §9 reverse view | `BSM_STATE_PATH`, `VBSM_HUD`, `VBSM_GPU_HUD_TAP`, `VBSM_REVERSE_CAM` |
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/onroad/cameraview.py` | §8 reader-slot pool | `VBSM_VIPC_POOL` |
@@ -561,7 +577,7 @@ left the managed set with it).
 
 | Control | Effect |
 |---|---|
-| `/data/vision_bsm.json` | blind spot monitor config — `enabled` (gates the daemon), `camera_view`, `chime`, `chime_always`, calibrated `zones`; all settable from the toggles page |
+| `/data/vision_bsm.json` | blind spot monitor config — `enabled` (gates the daemon), `camera_view`, `chime`, `chime_always`, `reverse_view` (§9), calibrated `zones`; all settable from the toggles page |
 | `BlindSpot` (param) | on-screen blind spot icons — the one BSM setting that is a param, because upstream owns it |
 | `/data/vbsm_gpu_ppt_w` | GPU power cap in watts (default 80, clamp 40–220, 0 disables) |
 | `/data/vbsm_no_gpu_idle_off` | opt out of the parked GPU power-off |

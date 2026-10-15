@@ -125,6 +125,7 @@ class TogglesLayoutMici(NavScroller):
     self._vision_bsm_chime = BigConfigControl("blind spot chime on signal", "chime", default=True)
     self._vision_bsm_chime_always = BigConfigControl("chime on every blind spot car", "chime_always")
     self._vision_bsm_view = BigConfigControl("blind spot window view on signal", "camera_view")
+    self._reverse_view = BigConfigControl("driver camera in reverse", "reverse_view", default=True)  # VBSM_REVERSE_CAM
 
     self._scroller.add_widgets([
       self._personality_toggle,
@@ -137,6 +138,7 @@ class TogglesLayoutMici(NavScroller):
       self._vision_bsm_chime,
       self._vision_bsm_chime_always,
       self._vision_bsm_view,
+      self._reverse_view,
       record_front,
       record_mic,
       enable_openpilot,
@@ -201,6 +203,7 @@ class TogglesLayoutMici(NavScroller):
     self._vision_bsm_chime.refresh()
     self._vision_bsm_chime_always.refresh()
     self._vision_bsm_view.refresh()
+    self._reverse_view.refresh()
 
   def _on_experimental_mode(self, state: bool):
     if state and not ui_state.params.get_bool("ExperimentalModeConfirmed"):
