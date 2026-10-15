@@ -591,6 +591,7 @@ class VideoClips:
     camera = clip["camera"]
     filename = clip["filename"]
     assert camera == os.path.basename(camera) and camera.endswith("camera.hevc"), "invalid camera filename"
+    assert "dcamera" not in camera, "VBSM_PRIVACY: driver camera is private, no clips"
     assert filename == os.path.basename(filename), "invalid filename"
     with self.lock:
       self.clips[filename] = self.Clip(route_name, camera, source_start_time, source_end_time, clip["bitrate"], clip["speedup"],
@@ -659,6 +660,12 @@ def uploadFilesToUrls(files_data: list[UploadFileDict]) -> UploadFilesToUrlRespo
   failed: list[str] = []
   for file in files:
     if len(file.fn) == 0 or file.fn[0] == '/' or '..' in file.fn or len(file.url) == 0:
+      failed.append(file.fn)
+      continue
+
+    # VBSM_PRIVACY: in-cabin footage stays on the device; refuse any requested
+    # upload of driver camera files regardless of who asks over the socket
+    if "dcamera" in os.path.basename(file.fn):
       failed.append(file.fn)
       continue
 
@@ -919,10 +926,14 @@ def add_log_to_queue(log_path, log_id, is_sunnylink=False):
       cloudlog.debug(f"Target is sunnylink and log file {log_path} is small enough to send in one request ({size_in_bytes} bytes).")
       send_queue_push(jsonrpc_str, SEND_PRIORITY_LOW)
     elif is_sunnylink:
-      cloudlog.warning(f"Target is sunnylink and log file {log_path} is too large to send in one request.")
+      # VBSM_QUIET: tell the caller nothing was queued, so it does not wait 100 s for a
+      # response and retry the same file every hour forever
+      cloudlog.warning(f"Target is sunnylink and log file {log_path} is too large to send in one request; skipping it.")
+      return False
     else:
       cloudlog.debug(f"Target is not sunnylink, proceeding to send log file {log_path} in one request ({size_in_bytes} bytes).")
       send_queue_push(jsonrpc_str, SEND_PRIORITY_LOW)
+    return True
 
 
 def log_handler(end_event: threading.Event, log_attr_name=LOG_ATTR_NAME) -> None:
@@ -951,7 +962,10 @@ def log_handler(end_event: threading.Event, log_attr_name=LOG_ATTR_NAME) -> None
           log_path = os.path.join(Paths.swaglog_root(), log_entry)
           setxattr(log_path, log_attr_name, int.to_bytes(curr_time, 4, sys.byteorder))
 
-          add_log_to_queue(log_path, log_entry, is_sunnylink)
+          if add_log_to_queue(log_path, log_entry, is_sunnylink) is False:
+            # VBSM_QUIET: an oversized minute is marked done once instead of retried hourly
+            setxattr(log_path, log_attr_name, LOG_ATTR_VALUE_MAX_UNIX_TIME)
+            continue
           curr_log = log_entry
         except OSError:
           pass  # file could be deleted by log rotation

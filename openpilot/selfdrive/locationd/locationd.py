@@ -37,6 +37,19 @@ def calculate_invalid_input_decay(invalid_limit, recovery_time, frequency):
   return (1 - 1 / (2 * invalid_limit)) ** (1 / (recovery_time * frequency))
 
 
+# VBSM_LOC_VALID: see main(). Counts invalid MESSAGES, not invalid cycles.
+VALIDITY_INVALID_LIMIT = 3
+VALIDITY_RECOVERY_STEP = 0.5
+
+
+def validity_step(msgs_invalid, fresh_invalid, stale_dead_invalid, all_valid):
+  if fresh_invalid or stale_dead_invalid:
+    return min(msgs_invalid + 1, VALIDITY_INVALID_LIMIT)
+  if all_valid:
+    return max(msgs_invalid - VALIDITY_RECOVERY_STEP, 0)
+  return msgs_invalid   # an invalid message already counted is still the latest: hold, don't count it again
+
+
 def init_xyz_measurement(measurement: capnp._DynamicStructBuilder, values: np.ndarray, stds: np.ndarray, valid: bool):
   assert len(values) == len(stds) == 3
   measurement.x, measurement.y, measurement.z = map(float, values)
@@ -284,6 +297,34 @@ def main():
   input_invalid_limit = {s: round(INPUT_INVALID_LIMIT * (SERVICE_LIST[s].frequency / 20.)) for s in critical_services}
   input_invalid_threshold = {s: input_invalid_limit[s] - 0.5 for s in critical_services}
   input_invalid_decay = {s: calculate_invalid_input_decay(input_invalid_limit[s], INPUT_INVALID_RECOVERY, SERVICE_LIST[s].frequency) for s in critical_services}
+  # VBSM_LOC_CAP: the counters were unbounded, so one burst of rejected samples
+  # (184 gyro samples in 2 s on 2026-09-13, when a 35 s camera-odometry gap
+  # starved the gyro/camera yaw-rate cross-check) took ~10 minutes of clean
+  # data to decay below the threshold, and openpilot refused every engage with
+  # "locationd Temporary Error" meanwhile. Capping at limit+1 keeps a persistent
+  # fault flagged (each bad sample re-pins the cap) but bounds recovery after
+  # the fault ends to the designed INPUT_INVALID_RECOVERY window.
+  input_invalid_cap = {s: input_invalid_limit[s] + 1 for s in critical_services}
+  # VBSM_LOC_VALID: sm.all_valid() has no hysteresis at all, so a SINGLE message
+  # flagged invalid -- 50 ms of a 20 Hz stream -- drops inputsOK and puts a
+  # full-screen "TAKE CONTROL IMMEDIATELY / locationd Temporary Error" on the
+  # screen for its whole 2 s. On 2026-09-15 one camera frame desync marked one
+  # cameraOdometry message invalid; inputsOK was false for 60 ms and the state
+  # machine was back in ENABLED before the alert finished drawing. The sanity
+  # counters above already have a threshold and a decay; give message validity a
+  # comparable buffer: three bad messages to fault (100 ms after the first at the
+  # cameraOdometry rate), one good cycle to clear. Bad counts a whole step and good
+  # only half a step back, so a stream that is invalid every other message still
+  # trips instead of oscillating under the limit forever.
+  # 2026-09-22: count each invalid MESSAGE once, not every cycle it is the latest.
+  # extrinsicsCalibration is 4 Hz and calibrationd copies cameraOdometry's validity,
+  # so the same one-frame blip came back as ONE invalid calibration message that
+  # stayed latest for 250 ms = 5 cycles and tripped the limit anyway (2026-09-16).
+  # While an already-counted invalid message is latest the counter holds; if its
+  # service then stops publishing (not alive: 10x its period), it counts again, so
+  # a service that dies on an invalid message still faults.
+  msgs_invalid = VALIDITY_INVALID_LIMIT   # inputs start bad: a service that has never arrived is not valid
+  fresh_invalid = False                   # an invalid message arrived since the last cameraOdometry cycle
 
   initial_pose_data = params.get("LocationFilterInitialState")
   if initial_pose_data is not None:
@@ -318,18 +359,25 @@ def main():
 
           if res == HandleLogResult.TIMING_INVALID:
             cloudlog.warning(f"Observation {which} ignored due to failed timing check")
-            observation_input_invalid[which] += 1
+            observation_input_invalid[which] = min(observation_input_invalid[which] + 1, input_invalid_cap[which])
           elif res == HandleLogResult.INPUT_INVALID:
             cloudlog.warning(f"Observation {which} ignored due to failed sanity check")
-            observation_input_invalid[which] += 1
+            observation_input_invalid[which] = min(observation_input_invalid[which] + 1, input_invalid_cap[which])
           elif res == HandleLogResult.SUCCESS:
             observation_input_invalid[which] *= input_invalid_decay[which]
     else:
       filter_initialized = sm.all_checks() and sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
 
+    # VBSM_LOC_VALID: sm.update() can time out without cameraOdometry, so remember
+    # invalid messages seen on those passes until the next cameraOdometry cycle
+    fresh_invalid = fresh_invalid or any(sm.updated[s] and not sm.valid[s] for s in sm.services)
     if sm.updated["cameraOdometry"]:
       critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critical_services)
-      inputs_valid = sm.all_valid() and critical_service_inputs_valid
+      # VBSM_LOC_VALID
+      stale_dead_invalid = any(not sm.valid[s] and not sm.alive[s] for s in sm.services)
+      msgs_invalid = validity_step(msgs_invalid, fresh_invalid, stale_dead_invalid, sm.all_valid())
+      fresh_invalid = False
+      inputs_valid = msgs_invalid < VALIDITY_INVALID_LIMIT and critical_service_inputs_valid
       sensors_valid = sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
 
       msg = estimator.get_msg(sensors_valid, inputs_valid, filter_initialized)
