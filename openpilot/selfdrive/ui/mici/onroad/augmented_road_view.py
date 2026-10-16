@@ -5,7 +5,7 @@ from opendbc.car.structs import car
 from openpilot.cereal.visionipc import VisionStreamType
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus, ChestnutState
 from openpilot.selfdrive.ui.mici.onroad import SIDE_PANEL_WIDTH
-from openpilot.selfdrive.ui.mici.onroad.alert_renderer import AlertRenderer
+from openpilot.selfdrive.ui.mici.onroad.alert_renderer import Alert, AlertRenderer
 from openpilot.selfdrive.ui.mici.onroad.driver_state import DriverStateRenderer
 from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer, GPU_KICK_REQUEST_FILE, CHESTNUT_HOLD_REBOOT_S
 from openpilot.selfdrive.ui.mici.onroad.model_renderer import ModelRenderer
@@ -33,6 +33,7 @@ NARROW_ROAD_CAM = VisionStreamType.VISION_STREAM_NARROW_ROAD
 WIDE_CAM = VisionStreamType.VISION_STREAM_WIDE_ROAD
 DRIVER_CAM = VisionStreamType.VISION_STREAM_CABIN
 BSM_PARAM_INTERVAL = 2.0  # seconds between blind spot camera config checks
+REVERSE_ALERT_S = 5.0  # VBSM_REVERSE_CAM: how long the full-size "Reverse" alert may cover the cabin view
 BSM_CONFIG_PATH = "/data/vision_bsm.json"
 BSM_STATE_PATH = "/dev/shm/vision_bsm_state"  # written by vision_bsm; the night notice that read it was retired with the model (VBSM_HUD)
 DEFAULT_DEVICE_CAMERA = DEVICE_CAMERAS["tici", "ar0231"]
@@ -197,6 +198,33 @@ class BookmarkIcon(Widget):
       rl.draw_texture_ex(self._icon, rl.Vector2(icon_x, icon_y), 0.0, 1.0, rl.WHITE)
 
 
+class ReverseAlertRenderer(AlertRenderer):
+  """VBSM_REVERSE_CAM: the stock "Reverse" alert is full size and stays up for the whole time in reverse, covering
+  the cabin view. Show it for `reverse_alert_s`, then stop drawing it (it fades out like any other alert). Only the
+  drawing changes: selfdrived still raises reverseGear, so engagement stays blocked, and its no-entry alert (a
+  different alert type) still shows. None keeps the stock behaviour."""
+
+  def __init__(self):
+    super().__init__()
+    self.reverse_alert_s: float | None = None
+    self._reverse_alert_since: float | None = None
+
+  def get_alert(self, sm) -> Alert | None:
+    prev = self._prev_alert
+    alert = super().get_alert(sm)
+    if alert is None or alert.alert_type != "reverseGear/permanent":
+      self._reverse_alert_since = None
+      return alert
+    now = time.monotonic()
+    if self._reverse_alert_since is None:
+      self._reverse_alert_since = now
+    if self.reverse_alert_s is None or now - self._reverse_alert_since < self.reverse_alert_s:
+      return alert
+    # super() just stored the hidden alert as the fade-out target; put back what was there, or it never fades away
+    self._prev_alert = prev
+    return None
+
+
 class AugmentedRoadView(CameraView):
   def __init__(self, bookmark_callback=None, stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_NARROW_ROAD):
     super().__init__("camerad", stream_type)
@@ -220,7 +248,7 @@ class AugmentedRoadView(CameraView):
     # VBSM_HUD: the profile-chip tap target lives in BookmarkIcon's touch
     # handler (the only receiver of road-view touches); give it the renderer
     self._bookmark_icon.hud_renderer = self._hud_renderer
-    self._alert_renderer = AlertRenderer()
+    self._alert_renderer = ReverseAlertRenderer()
     self._driver_state_renderer = DriverStateRenderer()
     self._confidence_ball = ConfidenceBall()
     self._offroad_label = UnifiedLabel("start the car to\nuse sunnypilot", 54, FontWeight.DISPLAY,
@@ -356,6 +384,11 @@ class AugmentedRoadView(CameraView):
 
     blind_spot_view = self._update_bsm()
     reverse_view = self._update_reverse()
+    self._alert_renderer.reverse_alert_s = REVERSE_ALERT_S if self._reverse_view else None
+    # VBSM_REVERSE_CAM: the stock "Reverse" alert kept the screen awake for the whole reverse; it is hidden after
+    # REVERSE_ALERT_S now, so keep the onroad sleep timer reset here instead, as the alert did
+    if reverse_view and gui_app.sunnypilot_ui():
+      ui_state.reset_onroad_sleep_timer()
     self._switch_stream_if_needed(ui_state.sm)
 
     # Update calibration before rendering
