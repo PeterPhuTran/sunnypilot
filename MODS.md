@@ -557,6 +557,21 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   through 13 cases: switch, priority, stale or invalid `carState`, toggle off, shift out before and
   after the cabin stream connects, no cabin stream, and the frame matrix.
 
+### 10. Hold to restart — `VBSM_HOLD_RESTART`
+- **What** (`selfdrive/ui/mici/onroad/augmented_road_view.py`): onroad, hold a finger still anywhere on the road
+  view for 3 s (`HOLD_RESTART_S`) and the restart prompt of Settings > Device > reboot opens, unchanged: "slide to
+  reboot" when disengaged, "Disengage to reboot" when engaged, the same `DoReboot` action, and the same exits
+  (swipe down from the top to go back; the nav stack also closes it when the car leaves standstill).
+- **Rules**: a touch that moves more than 20 px (`HOLD_RESTART_SLOP_PX`) is a swipe, not a hold; a touch that starts
+  on the chestnut icon keeps that icon's own gestures (`VBSM_GPU_HUD_TAP`); the release of a hold that opened the
+  prompt does nothing else (no personality cycle, no bookmark, no tap-to-home); the prompt opens once per touch.
+- **Why**: Settings > Device > reboot takes several taps and a scroll while the car is on.
+- **Coupling**: the prompt is upstream's `_engaged_confirmation_click` in `layouts/settings/device.py`, imported when
+  the gesture fires. A rename upstream disables the gesture (logged) and never stops the UI from starting; the port's
+  verify step checks that the function still exists.
+- **Tested**: `pending/hold-restart/test_hold_restart.py` (out of tree) replays touches through the real touch
+  handlers, 11 cases, mutation-checked.
+
 ## Managed files (24) and markers
 
 | File | Mods | Markers |
@@ -572,7 +587,7 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 | `openpilot/sunnypilot/mads/mads.py` | §5 LKAS button freed for the toggle | `VBSM_EXP_TOGGLE` |
 | `openpilot/sunnypilot/models/fetcher.py` | §6 manifest storm fix, offline fetch backoff | `VBSM_QUIET` |
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1, §9 settings | `BigConfigControl`, `VBSM_REVERSE_CAM` |
-| `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap, §9 reverse view | `BSM_STATE_PATH`, `VBSM_HUD`, `VBSM_GPU_HUD_TAP`, `VBSM_REVERSE_CAM` |
+| `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 tap, §9 reverse view, §10 hold to restart | `BSM_STATE_PATH`, `VBSM_HUD`, `VBSM_GPU_HUD_TAP`, `VBSM_REVERSE_CAM`, `VBSM_HOLD_RESTART` |
 | `openpilot/selfdrive/ui/mici/onroad/hud_renderer.py` | §5 | `VBSM_HUD`, `VBSM_GPU_HUD_TAP` |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/onroad/cameraview.py` | §8 reader-slot pool | `VBSM_VIPC_POOL` |

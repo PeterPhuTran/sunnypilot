@@ -34,6 +34,8 @@ WIDE_CAM = VisionStreamType.VISION_STREAM_WIDE_ROAD
 DRIVER_CAM = VisionStreamType.VISION_STREAM_CABIN
 BSM_PARAM_INTERVAL = 2.0  # seconds between blind spot camera config checks
 REVERSE_ALERT_S = 5.0  # VBSM_REVERSE_CAM: how long the full-size "Reverse" alert may cover the cabin view
+HOLD_RESTART_S = 3.0  # VBSM_HOLD_RESTART: hold a finger still on the road view this long for the restart prompt
+HOLD_RESTART_SLOP_PX = 20  # farther than this and the touch is a swipe, not a hold (the profile-chip tap tolerance)
 BSM_CONFIG_PATH = "/data/vision_bsm.json"
 BSM_STATE_PATH = "/dev/shm/vision_bsm_state"  # written by vision_bsm; the night notice that read it was retired with the model (VBSM_HUD)
 DEFAULT_DEVICE_CAMERA = DEVICE_CAMERAS["tici", "ar0231"]
@@ -82,6 +84,19 @@ def chestnut_touch_action(hud, pos, hold_s: float, moved_px: float) -> str:
     return ''
 
 
+def open_restart_prompt() -> None:
+  """VBSM_HOLD_RESTART: open the restart prompt of Settings > Device > reboot, unchanged ("slide to reboot" when
+  disengaged, "Disengage to reboot" when engaged, with the same DoReboot action). Imported on use, so a rename
+  upstream only disables the gesture (logged) and never stops the UI from starting."""
+  try:
+    from openpilot.selfdrive.ui.mici.layouts.settings.device import _engaged_confirmation_click
+    _engaged_confirmation_click(lambda: ui_state.params.put_bool("DoReboot", True, block=True), "reboot",
+                                gui_app.texture("icons_mici/settings/device/reboot.png", 64, 70), exit_on_confirm=False)
+    cloudlog.warning("VBSM_HOLD_RESTART: restart prompt opened from the road view")
+  except Exception:
+    cloudlog.exception("VBSM_HOLD_RESTART: could not open the restart prompt")
+
+
 class BookmarkIcon(Widget):
   PEEK_THRESHOLD = 50  # If icon peeks out this much, snap it fully visible
   FULL_VISIBLE_OFFSET = 200  # How far onscreen when fully visible
@@ -102,6 +117,12 @@ class BookmarkIcon(Widget):
     self._is_swiping_left: bool = False
     self._triggered_time: float = 0.0
     self._press_time: float = 0.0      # VBSM_GPU_HUD_TAP: hold duration for the reboot gesture
+    # VBSM_HOLD_RESTART: whether this touch opened the restart prompt, started on the chestnut icon (which owns its
+    # own hold), and how far it has moved from where it started
+    self._hold_fired = False
+    self._hold_on_chestnut = False
+    self._hold_start_y = 0.0
+    self._hold_moved_px = 0.0
 
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""
@@ -111,7 +132,25 @@ class BookmarkIcon(Widget):
     interacting, self._interacting = self._interacting, False
     return interacting
 
+  @property
+  def hold_fired(self) -> bool:
+    """VBSM_HOLD_RESTART: the current touch opened the restart prompt; its release must not act as a tap."""
+    return self._hold_fired
+
   def _update_state(self):
+    # VBSM_HOLD_RESTART: a finger held still for HOLD_RESTART_S opens the restart prompt. The prompt takes over the
+    # touch, so this view may never see the release: end the swipe here, and mark the touch so nothing else acts on it
+    if (ui_state.started and self._is_swiping and not self._hold_fired and not self._hold_on_chestnut and
+        self._hold_moved_px <= HOLD_RESTART_SLOP_PX and rl.get_time() - self._press_time >= HOLD_RESTART_S):
+      self._hold_fired = True
+      self._is_swiping = False
+      self._is_swiping_left = False
+      self._state = BookmarkState.HIDDEN
+      hud = getattr(self, "hud_renderer", None)
+      if hud is not None:
+        hud.chestnut_hold_since = None
+      open_restart_prompt()
+
     if self._state == BookmarkState.DRAGGING:
       # Allow pulling past activated position with rubber band effect
       swipe_offset = self._swipe_start_x - self._swipe_current_x
@@ -145,15 +184,26 @@ class BookmarkIcon(Widget):
       # VBSM_GPU_HUD_TAP: start the hold clock; the HUD grows the icon while a finger rests on it
       self._press_time = rl.get_time()
       hud = getattr(self, "hud_renderer", None)
+      self._hold_fired = False   # VBSM_HOLD_RESTART: every touch decides afresh
+      self._hold_on_chestnut = False
+      self._hold_start_y = mouse_event.pos.y
+      self._hold_moved_px = 0.0
       if hud is not None and hud.chestnut_icon_rect.width > 0 and rl.check_collision_point_rec(mouse_event.pos, hud.chestnut_icon_rect):
         hud.chestnut_hold_since = self._press_time
+        self._hold_on_chestnut = True
 
     elif mouse_event.left_down and self._is_swiping:
       self._swipe_current_x = mouse_event.pos.x
+      self._hold_moved_px = max(self._hold_moved_px, abs(mouse_event.pos.x - self._swipe_start_x),
+                                abs(mouse_event.pos.y - self._hold_start_y))   # VBSM_HOLD_RESTART
       swipe_offset = self._swipe_start_x - self._swipe_current_x
       self._is_swiping_left = swipe_offset > 0
       if self._is_swiping_left:
         self._interacting = True
+
+    elif mouse_event.left_released and self._hold_fired:
+      # VBSM_HOLD_RESTART: this touch already opened the restart prompt; its release does nothing else
+      self._hold_fired = False
 
     elif mouse_event.left_released:
       # VBSM_HUD: a tap (no meaningful swipe) on the profile chip cycles the
@@ -371,8 +421,8 @@ class AugmentedRoadView(CameraView):
       self._offroad_label.set_text("start the car to\nuse sunnypilot")
 
   def _handle_mouse_release(self, mouse_pos: MousePos):
-    # Don't trigger click callback if bookmark was triggered
-    if not self._bookmark_icon.interacting():
+    # Don't trigger click callback if bookmark was triggered, or if this touch opened the restart prompt (VBSM_HOLD_RESTART)
+    if not self._bookmark_icon.interacting() and not self._bookmark_icon.hold_fired:
       super()._handle_mouse_release(mouse_pos)
 
   def _render(self, _):
