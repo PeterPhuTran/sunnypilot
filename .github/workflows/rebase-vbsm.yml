@@ -25,6 +25,10 @@ on:
         description: rebuild the port even if already based on current staging
         type: boolean
         default: false
+      dry_run:
+        description: port and verify, but do not publish
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -35,7 +39,8 @@ env:
 
 jobs:
   port:
-    runs-on: ubuntu-latest
+    # pinned: ubuntu-latest moves to 26.04 (Python 3.14) from 2026-10-19; move on purpose, not in the middle of a port
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: check out the mod branch
@@ -56,6 +61,7 @@ jobs:
 
           NEW=$(git rev-parse upstream/staging)
           OLD_HEAD=$(git rev-parse HEAD)
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
 
           if [ "${{ inputs.force_port }}" != "true" ] \
              && git merge-base --is-ancestor "$NEW" HEAD 2>/dev/null; then
@@ -92,6 +98,13 @@ jobs:
           git update-index --add --cacheinfo "100644,$mblob,$MANIFEST"
 
           TREE=$(git write-tree)
+          # a forced rebuild of a head that already has this tree and this staging is not a deploy (a head that
+          # lost staging from its history, e.g. a squash-merged hand port, still gets the repair commit)
+          if [ "$TREE" = "$(git rev-parse "$OLD_HEAD^{tree}")" ] && git merge-base --is-ancestor "$NEW" "$OLD_HEAD"; then
+            echo "the port tree equals the branch head's tree (${OLD_HEAD:0:8}); nothing to publish"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           MSG=$(printf 'vision_bsm: port onto sunnypilot staging %s\n\nUpstream tree with the mod overlaid, carried unchanged from %s.\nA merge of both parents, so the branch history stays reachable whether\nupstream advanced or rewrote staging.\n' "${NEW:0:8}" "${OLD_HEAD:0:8}")
           COMMIT=$(printf '%s' "$MSG" | git commit-tree "$TREE" -p "$NEW" -p "$OLD_HEAD")
           git update-ref "refs/heads/$BRANCH" "$COMMIT"
@@ -99,95 +112,189 @@ jobs:
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: verify before publishing
-        if: steps.port.outputs.changed == 'true'
+        # no `if:` here: on "nothing to do" days this checks the branch head as it stands, so a hand port is
+        # verified by the first scheduled run after it instead of only when upstream next moves (publish keeps its if)
         run: |
           set -euo pipefail
           C=$(git rev-parse "refs/heads/$BRANCH")
           fail=0
+          NEWBASE=$(git cat-file blob "$C:$MANIFEST" | jq -r .base)
+          FILES=$(git cat-file blob "$C:$MANIFEST" | jq -r ".files[]")
           # grep -c, not -q: -q exits at the first match, the writer then dies of SIGPIPE and
           # pipefail fails the check at random (seen on the Pi: exit 141 on a present marker)
           check() {
-            git cat-file blob "$C:$2" | grep -c "$1" > /dev/null \
+            git cat-file blob "$C:$2" | grep -c -- "$1" > /dev/null \
               || { echo "::error::missing '$1' in $2"; fail=1; }
           }
+          absent() {   # a retired marker must not come back: absent <BRE pattern> <file>
+            git rev-parse -q --verify "$C:$2" > /dev/null || { echo "::error::$2 is missing"; fail=1; return 0; }
+            [ "$(git cat-file blob "$C:$2" | grep -c -- "$1" || true)" = 0 ] \
+              || { echo "::error::retired '$1' is still in $2"; fail=1; }
+          }
+          count() {    # count <fixed string> <file> <n>
+            n=$(git cat-file blob "$C:$2" | grep -cF -- "$1" || true)
+            [ "$n" = "$3" ] || { echo "::error::expected $3 x '$1' in $2, found $n"; fail=1; }
+          }
+          M=openpilot/sunnypilot/modeld_v2/modeld.py
+          U=openpilot/sunnypilot/ui_watchdog.py
+          H=openpilot/selfdrive/ui/mici/onroad/hud_renderer.py
+          A=openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
+          HW=openpilot/system/hardware/hardwared.py
+          SD=openpilot/selfdrive/selfdrived/selfdrived.py
+          CP=openpilot/sunnypilot/chestnut_power.py
+          # (A) the manifest describes this commit: base = upstream staging, NEW is in the history (a direct
+          #     parent), every managed file exists, and nothing outside the manifest differs from upstream
+          [ "$NEWBASE" = "${{ steps.port.outputs.new }}" ] \
+            || { echo "::error::manifest base ${NEWBASE:0:8} is not upstream staging"; fail=1; }
+          git merge-base --is-ancestor "$NEWBASE" "$C" \
+            || { echo "::error::manifest base ${NEWBASE:0:8} is not an ancestor of $BRANCH"; fail=1; }
+          for f in $FILES; do git rev-parse -q --verify "$C:$f" > /dev/null \
+            || { echo "::error::managed file $f is missing (the next port dies in its overlay)"; fail=1; }; done
+          extra=$(git diff-tree -r --name-only "$NEWBASE" "$C" | grep -vxF -f <(printf '%s\n' $FILES "$MANIFEST") || true)
+          [ -z "$extra" ] || { echo "::error::unmanaged files differ from upstream, the next port would revert them:" $extra; fail=1; }
+          # (B) every mod is still there
           check visionbsmd       openpilot/system/manager/process_config.py
           check "Field Debugging Log" CHESTNUT.md
           check "Complete Index" MODS.md
           check vision_bsm       openpilot/selfdrive/car/card.py
-          check VBSM             openpilot/selfdrive/selfdrived/selfdrived.py
+          check VBSM             "$SD"
           check BigConfigControl openpilot/selfdrive/ui/mici/layouts/settings/toggles.py
-          check BSM_STATE_PATH   openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
+          check BSM_STATE_PATH   "$A"
           check VBSM_PRIVACY     openpilot/system/athena/athenad.py
-          check VBSM_WATCHDOG    openpilot/sunnypilot/ui_watchdog.py
-          check VBSM_GPU_KICK    openpilot/sunnypilot/ui_watchdog.py
-          check VBSM_GPU_FALLBACK openpilot/sunnypilot/modeld_v2/modeld.py
-          check VBSM_GPU_PPT     openpilot/sunnypilot/modeld_v2/modeld.py
-          check VBSM_HUD         openpilot/selfdrive/ui/mici/onroad/hud_renderer.py
-          check VBSM_GPU_IDLE    openpilot/system/hardware/hardwared.py
+          check VBSM_WATCHDOG    "$U"
+          check VBSM_GPU_WEDGE   "$U"
+          check VBSM_GPU_FALLBACK "$M"
+          check VBSM_GPU_PPT     "$M"
+          check VBSM_GPU_READY   "$M"
+          check VBSM_GPU_FW_GATE "$M"
+          check VBSM_EXIT        "$M"
+          check VBSM_HUD         "$H"
+          check VBSM_GPU_IDLE    "$HW"
+          check VBSM_CYCLE_GUARD "$HW"
+          check VBSM_GPU_IDLE    "$CP"
           check VBSM_QUIET       openpilot/sunnypilot/models/fetcher.py
-          check VBSM_EXP_TOGGLE  openpilot/selfdrive/selfdrived/selfdrived.py
-          check VBSM_EXP_TOGGLE  openpilot/sunnypilot/mads/mads.py
           check VBSM_HUD         openpilot/selfdrive/ui/mici/layouts/home.py
           check uiwatchdog       openpilot/system/manager/process_config.py
           check VBSM_RESTART     openpilot/system/manager/process.py
           check VBSM_PARKWATCH   openpilot/selfdrive/pandad/pandad.py
           check VBSM_PARKWATCH   openpilot/system/manager/process_config.py
           check VBSM_PARK        openpilot/system/hardware/power_monitoring.py
-          check VBSM_PARK        openpilot/system/hardware/hardwared.py
+          check VBSM_PARK        "$HW"
           check VBSM_VIPC_POOL   openpilot/selfdrive/ui/mici/onroad/cameraview.py
-          check VBSM_SETTLE_GATE openpilot/selfdrive/selfdrived/selfdrived.py
-          check VBSM_GPU_COLDWAIT openpilot/sunnypilot/modeld_v2/modeld.py
-          check VBSM_GPU_COLDWAIT openpilot/sunnypilot/ui_watchdog.py
-          check VBSM_GPU_12V_GRACE openpilot/sunnypilot/modeld_v2/modeld.py
-          check VBSM_REVERSE_CAM openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
+          check VBSM_SETTLE_GATE "$SD"
+          check VBSM_GPU_COLDWAIT "$M"
+          check VBSM_GPU_COLDWAIT "$U"
+          check VBSM_GPU_COLDCACHE "$M"
+          check VBSM_GPU_COLDCACHE "$U"
+          check VBSM_GPU_12V_GRACE "$M"
+          check VBSM_REVERSE_CAM "$A"
           check VBSM_REVERSE_CAM openpilot/selfdrive/ui/mici/layouts/settings/toggles.py
-          check ReverseAlertRenderer openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
-          check VBSM_HOLD_RESTART openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
-          # the hold-to-restart gesture opens upstream's own settings prompt; a rename there would only disable
-          # the gesture silently (it is imported when the gesture fires), so stop the port instead
-          check "def _engaged_confirmation_click" openpilot/selfdrive/ui/mici/layouts/settings/device.py
+          check ReverseAlertRenderer "$A"
+          check VBSM_HOLD_RESTART "$A"
+          # the hold-to-restart gesture opens upstream's own settings prompt, imported when the gesture fires; a
+          # rename or a move there would only disable the gesture silently (upstream made settings/device.py a
+          # package on 2026-10-18), so stop the port instead. Never "fix" this by bringing a device.py back.
+          check "def _engaged_confirmation_click(callback: Callable, action_text: str, icon: rl.Texture, exit_on_confirm" \
+                openpilot/selfdrive/ui/mici/layouts/settings/device/device_layout.py
+          check "from openpilot.selfdrive.ui.mici.layouts.settings.device.device_layout import _engaged_confirmation_click" "$A"
+          git rev-parse -q --verify "$C:openpilot/selfdrive/assets/icons_mici/settings/device/reboot.png" > /dev/null \
+            || { echo "::error::the restart prompt's reboot icon is gone"; fail=1; }
           # a lost restart policy is silent until something dies mid-drive, so
           # assert the call sites too, not just the marker comment
-          test "$(git cat-file blob "$C:openpilot/system/manager/process.py" \
-                  | grep -c 'if self.hold_dead_proc():')" = 2 \
-            || { echo "::error::hold_dead_proc not wired into both start() methods"; fail=1; }
+          count 'if self.hold_dead_proc():' openpilot/system/manager/process.py 2
+          # the onroad cycle replaces a modeld that ignores SIGINT only because start() stops a dying child first
+          count 'if self.shutting_down:' openpilot/system/manager/process.py 2
           # the mici camera view must build clients only through its pool: one VisionIpcClient(
           # call. A client per switch leaks msgq reader slots and evicts modeld's wide reader
-          # on long experimental-mode drives ("frames out of sync" -> commIssue, MODS.md s8)
-          test "$(git cat-file blob "$C:openpilot/selfdrive/ui/mici/onroad/cameraview.py" \
-                  | grep -c 'VisionIpcClient(')" = 1 \
-            || { echo "::error::cameraview.py builds a VisionIpcClient outside its pool"; fail=1; }
-          # the load masks (commIssue, localization errors) must stay gated on disengaged at both
-          # call sites; an ungated one hides a dead modelV2 while engaged (MODS.md, VBSM_SETTLE_GATE)
-          test "$(git cat-file blob "$C:openpilot/selfdrive/selfdrived/selfdrived.py" \
-                  | grep -c 'self._big_model_settling()')" = 2 \
-            || { echo "::error::selfdrived.py load masks not gated by _big_model_settling() at both sites"; fail=1; }
-          # the cold-boot link wait only works if ui_watchdog moves its wedge deadline by what modeld
-          # reports, through the same /dev/shm file; otherwise a long wait is killed as a wedge
-          test "$(git cat-file blob "$C:openpilot/sunnypilot/ui_watchdog.py" \
-                  | grep -c 'GPU_LOAD_DEADLINE_S + preflight_ext_s(')" = 1 \
-            || { echo "::error::ui_watchdog.py wedge deadline ignores the preflight extension"; fail=1; }
-          for f in openpilot/sunnypilot/modeld_v2/modeld.py openpilot/sunnypilot/ui_watchdog.py; do
-            git cat-file blob "$C:$f" | grep -c '"/dev/shm/vbsm_gpu_preflight_ext"' > /dev/null \
-              || { echo "::error::$f does not use the shared preflight extension file"; fail=1; }
+          # on long stop-and-go drives ("frames out of sync" -> commIssue, MODS.md s8)
+          count 'VisionIpcClient(' openpilot/selfdrive/ui/mici/onroad/cameraview.py 1
+          # the load masks (commIssue, localization errors, modeldLagging) must stay gated on disengaged at both
+          # call sites; an ungated one hides a dead modelV2 while engaged (MODS.md, VBSM_SETTLE_GATE). The last
+          # line is upstream's own inline form, which ignores engagement.
+          count 'self._big_model_settling()' "$SD" 2
+          # ...and the gate itself: the load counts as settling only while nobody is engaged (openpilot or MADS)
+          count 'return settling and not (self.enabled or self.mads.active)' "$SD" 1
+          # while the masks apply, anything they hide refuses the engage (NO_ENTRY), upstream's modeldLagging included
+          count "lagging = self.sm['modelV2'].frameDropPerc > 1 and (not SIMULATION or REPLAY)" "$SD" 1
+          count 'if not self.sm.all_checks() or (not self.CP.notCar and held) or lagging:' "$SD" 1
+          check 'self.big_model_failed or not big_model_settling' "$SD"
+          absent 'big_model_settling = self.big_model_loading' "$SD"
+          # the cold-boot link wait and the cold-cache budget only work if ui_watchdog moves its wedge deadline by
+          # what modeld reports, through the same /dev/shm file; otherwise a long wait is handled as a wedge
+          count 'GPU_LOAD_DEADLINE_S + preflight_ext_s(' "$U" 1
+          for f in "$M" "$U"; do check '"/dev/shm/vbsm_gpu_preflight_ext"' "$f"; done
+          # (C) eGPU: upstream's retry is wired and is the only retry (MODS.md s4)
+          check 'params.get_bool("ChestnutRetry")' "$M"
+          check 'params.put_bool("OnroadCycleRequested", True)' "$M"
+          count 'put_bool("OnroadCycleRequested", True' "$M" 1
+          count 'put_bool("OnroadCycleRequested", True' "$U" 1
+          for f in "$H" "$A" "$SD"; do absent OnroadCycleRequested "$f"; done
+          check 'params.get_bool("OnroadCycleRequested")' "$HW"
+          # VBSM_CYCLE_GUARD and the watchdog's own engaged test are code, not just their comments; both see MADS
+          # (hardwared subscribes selfdriveStateSP for it: vbsm_verify's SUBS checks the subscription)
+          count "if (sm.alive['selfdriveState'] and sm['selfdriveState'].enabled) or" "$HW" 1
+          count "(sm.alive['selfdriveStateSP'] and sm['selfdriveStateSP'].mads.active):" "$HW" 1
+          count 'if not self.params.get_bool("ChestnutRetry") and not engaged and (self.cycle_asked is None or self.cycle_asked[0] != pid):' "$U" 1
+          check '^ *wait_for_chestnut()$' "$M"   # the call: a comment in the constants names it too
+          check 'if not model.chestnut:' "$M"
+          # the fork's rules around it: session gate, final-at-once outcomes (blocking write), product-gated USB
+          # traffic, firmware gate, cold-cache budget, exact-proctitle wedge match with a cycle grace, ROM guard
+          check 'respawned = CHESTNUT and loading_prev is not None' "$M"
+          # a respawn reports the lost session (ChestnutActive False) before it clears ChestnutLoading (one FIFO
+          # writer), so selfdrived never sees "load done, still active" in between ("Big Model Ready" flash)
+          check 'lost = respawned and (loading_prev or active_prev is not None)' "$M"
+          count 'if ready_reason in CHESTNUT_FINAL_REASONS or ready_reason in CHESTNUT_FW_REASONS:' "$M" 1
+          check 'params.put_bool("ChestnutRetry", True, block=True)' "$M"
+          count 'product != CHESTNUT_USB_PRODUCT' "$M" 2
+          check 'firmware_busy = chestnut_firmware_busy()' "$M"
+          # the firmware gate also runs inside the readiness wait (a bridge that came up late on old/ROM firmware)
+          check 'if unreadable % 4 == 1 and (fw := chestnut_firmware_busy()):' "$M"
+          check 'reason = chestnut_firmware_busy() or "unreadable"' "$M"
+          check 'loader.join(CHESTNUT_COLD_CACHE_EXTRA_S)' "$M"
+          # the cold-cache test computes the frame-fusion digest the way load_model() does (a stored digest copied
+          # into the key reads a changed warp/fused layout as warm), for the big model and the SoC model
+          count 'extra = _extended(pkl_path, extend)[2]' "$M" 1
+          check 'cold_small = chestnut_cache_cold(' "$M"
+          check 'small_ext = cold_small and chestnut_watchdog_ext_add(CHESTNUT_COLD_CACHE_EXTRA_S)' "$M"
+          # a vision-stream wait past main()+22 is reported to ui_watchdog too
+          check 'ext = max(0.0, deadline - (t_main + CHESTNUT_READY_END_BY_S))' "$M"
+          check 'find_exact(MODELD_PROCTITLE)' "$U"
+          count 'now - self.cycle_asked[1] < GPU_CYCLE_GRACE_S' "$U" 1
+          # the freeze backstop: armed only by this pid's own modelV2, then GPU_FREEZE_S of silence = SIGKILL
+          count "if sm.updated['modelV2'] and not first:" "$U" 1
+          count 'now - self.model_seen[1] > GPU_FREEZE_S' "$U" 1
+          absent 'find_proc(' "$U"
+          check 'in_rom_bootloader(' "$CP"
+          # the fork's competing retry paths stay retired (code only; MODS.md names them on purpose)
+          for f in "$M" "$U" "$H" "$A"; do
+            absent 'VBSM_GPU_KICK\|VBSM_GPU_RETRY\|VBSM_GPU_LATE\|VBSM_GPU_HUD_TAP\|VBSM_GPU_LOCK_RETRY' "$f"
+            absent 'vbsm_usbgpu_veto\|vbsm_gpu_hangs\|vbsm_gpu_load_fails\|vbsm_gpu_link_\|vbsm_gpu_kick_request' "$f"
           done
+          for f in "$A" "$H"; do
+            absent 'chestnut_touch_action\|_hold_on_chestnut\|chestnut_hold_since\|GPU_KICK_REQUEST_FILE\|CHESTNUT_HOLD_REBOOT_S' "$f"
+          done
+          # /data/vision_bsm.json is hand-edited: valid JSON that is not an object must read as the defaults, not
+          # crash-loop the UI (toggles builds at start-up), the onroad view or selfdrived
+          for f in "$A" openpilot/selfdrive/ui/mici/layouts/settings/toggles.py "$SD"; do check 'isinstance(config, dict)' "$f"; done
           # without this the device would try to compile, which it cannot do
           git rev-parse -q --verify "$C:prebuilt" > /dev/null \
             || { echo "::error::prebuilt marker missing"; fail=1; }
-          git cat-file blob "$C:openpilot/sunnypilot/vision_bsm.py" > /tmp/vb.py
-          python3 -m py_compile /tmp/vb.py || { echo "::error::daemon does not compile"; fail=1; }
           # regression guards from the route-46 post-mortem:
-          # (a) undefined-name sweep catches missed upstream renames that
-          #     import tests cannot see (NameError inside function bodies)
-          pip install --quiet pyflakes
-          NEWBASE=$(git cat-file blob "$C:$MANIFEST" | jq -r .base)
-          FILES=$(git cat-file blob "$C:$MANIFEST" | jq -r ".files[]")
+          # (a) undefined-name sweep catches missed upstream renames that import tests cannot see (NameError inside
+          #     function bodies); py_compile catches what that filter lets through (a stray conflict marker).
+          #     (D) experimental mode is gone upstream (b50b82f9): no managed file may read the removed capnp field,
+          #     ui_state attributes, cruise helper or icon (the removed params are covered by vbsm_verify's PARAM)
+          python3 -m pip install --quiet 'pyflakes==4.0.3'
+          # the sweep below reads "no output" as clean, so a pyflakes that cannot run must fail here, not pass there
+          python3 -m pyflakes --version > /dev/null
           for f in $FILES; do
             case "$f" in
               *.py)
                 git cat-file blob "$C:$f" > /tmp/pf.py
+                python3 -m py_compile /tmp/pf.py || { echo "::error::$f does not compile"; fail=1; }
                 PF=$(python3 -m pyflakes /tmp/pf.py | grep "undefined name" || true)
                 [ -z "$PF" ] || { echo "::error::pyflakes $f: $PF"; fail=1; }
+                absent '\.experimentalMode\>\|experimental_mode\|ExperimentalMode\|DynamicExperimentalControl\|cruise_helpers\|(CruiseHelper)\|VBSM_EXP_TOGGLE\|VBSM_LKAS_REPURPOSED' "$f"
                 ;;
             esac
           done
@@ -199,8 +306,12 @@ jobs:
             OURS=$(git ls-tree "$C" -- "$f" | awk '{print $1}')
             [ -z "$UP" ] || [ "$UP" = "$OURS" ] || { echo "::error::mode mismatch $f: ours $OURS vs upstream $UP"; fail=1; }
           done
+          # (E) Params keys, cross-module imports, UI assets, MODS.md index, DEV-pin position, upstream seams
+          git show "$GITHUB_SHA:.github/scripts/vbsm_verify.py" > /tmp/vbsm_verify.py
+          python3 -I /tmp/vbsm_verify.py "$C" || fail=1
           exit $fail
 
       - name: publish
-        if: steps.port.outputs.changed == 'true'
+        # dry_run is null on schedule (and !null is true), so scheduled runs always publish a verified port
+        if: steps.port.outputs.changed == 'true' && !inputs.dry_run
         run: git push --force-with-lease origin "$BRANCH"
