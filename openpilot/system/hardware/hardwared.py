@@ -12,7 +12,7 @@ import time
 from collections import OrderedDict, namedtuple
 
 import openpilot.cereal.messaging as messaging
-from openpilot.cereal import log, custom
+from openpilot.cereal import log
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.utils import strip_deprecated_keys
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -27,7 +27,6 @@ from openpilot.common.linux import LinuxSystemStats
 from openpilot.system.loggerd.config import get_available_percent
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.system.statsd import statlog
-from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.system.hardware.power_monitoring import PowerMonitoring, PARK_SHUTDOWN_LOG
 from openpilot.system.hardware.fan_controller import FanController
 from openpilot.system.hardware.chestnut.monitoring import chestnut_state_thread
@@ -44,9 +43,10 @@ PANDA_STATES_TIMEOUT = round(1000 / SERVICE_LIST['pandaStates'].frequency * 1.5)
 ONROAD_CYCLE_TIME = 1  # seconds to wait offroad after requesting an onroad cycle
 
 class Chestnut:
-  # flash offroad, modeld ignores chestnut until the product string matches
+  # flash before going onroad, modeld ignores chestnut until the product string matches
   MAX_ATTEMPTS = 3
   RETRY_INTERVAL = 20.
+  STARTUP_TIMEOUT = 30.
 
   def __init__(self):
     self.thread: threading.Thread | None = None
@@ -59,6 +59,10 @@ class Chestnut:
     self.power_thread: threading.Thread | None = None
     self.power_attempts = 0
     self.last_power = 0.
+
+  @property
+  def flashing(self) -> bool:
+    return self.thread is not None and self.thread.is_alive() and time.monotonic() - self.last_attempt < self.STARTUP_TIMEOUT
 
   @property
   def failed(self) -> bool:
@@ -79,8 +83,11 @@ class Chestnut:
   # OFF only after sustained offroad (manager has long stopped modeld, nothing
   # holds the device); ON strictly on the offroad->onroad edge so a hardwared
   # restart mid-drive never touches the bus while modeld owns the GPU. Both
-  # commands are idempotent; modeld's own retry+veto ladder is the backstop if
-  # the ON edge ever loses a race. Opt out: touch /data/vbsm_no_gpu_idle_off.
+  # commands are idempotent; upstream's one-shot load retry (ChestnutRetry +
+  # OnroadCycleRequested) is the backstop if the ON edge ever loses a race, and
+  # no rail command is sent while the firmware flasher holds the bridge. The
+  # validation above predates upstream's fw pin 8516b768: re-check F3=0 on it.
+  # Opt out: touch /data/vbsm_no_gpu_idle_off.
   IDLE_CUT_S = 120.
   POWER_RETRY_S = 15.
   MAX_POWER_ATTEMPTS = 4
@@ -105,6 +112,8 @@ class Chestnut:
       self.offroad_since = None
       return
     if self.power_thread is not None and self.power_thread.is_alive():
+      return
+    if self.thread is not None and self.thread.is_alive():  # flash.py owns the bridge
       return
 
     if offroad:
@@ -131,14 +140,16 @@ class Chestnut:
     self.power_thread.start()
 
   def update(self, offroad: bool, usb_state: list[dict]) -> None:
-    # VBSM_GPU_IDLE: the rail switch keys on the real device only (not the
-    # bootloader ids) -- upstream dropped the bare id tuples in favour of this
-    # helper, so the presence test goes through it too
-    present = any(is_chestnut_usb_id(d["vendorId"], d["productId"]) for d in usb_state)
-    self._update_rails(offroad, present)
-
     self.mismatch = any(is_chestnut_usb_id(d["vendorId"], d["productId"], include_bootloader=True) and
                         d["product"] != CHESTNUT_USB_PRODUCT for d in usb_state)
+    # VBSM_GPU_IDLE: the rail switch keys on the real device only (not the
+    # bootloader ids) -- upstream dropped the bare id tuples in favour of this
+    # helper, so the presence test goes through it too. Out-of-date firmware
+    # holds the rails alone: the flasher owns the bridge until the firmware is
+    # current or the flasher has given up.
+    present = any(is_chestnut_usb_id(d["vendorId"], d["productId"]) for d in usb_state)
+    self._update_rails(offroad, present and (not self.mismatch or self.failed))
+
     if not self.mismatch:
       self.flashed = False
       return
@@ -147,7 +158,7 @@ class Chestnut:
       return
     if self.thread is not None and self.thread.is_alive():
       return
-    if time.monotonic() - self.last_attempt < self.RETRY_INTERVAL:
+    if self.attempts > 0 and time.monotonic() - self.last_attempt < self.RETRY_INTERVAL:
       return
 
     self.attempts += 1
@@ -295,7 +306,8 @@ def hw_state_thread(end_event, hw_queue):
 def hardware_thread(end_event, hw_queue) -> None:
   system_stats = LinuxSystemStats() if sys.platform == "linux" else None
   pm = messaging.PubMaster(['deviceState'])
-  sm = messaging.SubMaster(["peripheralState", "gpsLocationExternal", "selfdriveState", "pandaStates", "chestnutState"], poll="pandaStates")
+  sm = messaging.SubMaster(["peripheralState", "gpsLocationExternal", "selfdriveState", "pandaStates", "chestnutState",
+                            "selfdriveStateSP"], poll="pandaStates")  # VBSM_CYCLE_GUARD: MADS-only lateral is not selfdriveState.enabled
 
   count = 0
 
@@ -320,7 +332,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     network_strength=NetworkStrength.unknown,
     network_stats={'wwanTx': -1, 'wwanRx': -1},
     modem_temps=[],
-    usb_state=[],
+    usb_state=get_usb_state(),
   )
 
   all_temp_filter = FirstOrderFilter(0., TEMP_TAU, DT_HW, initialized=False)
@@ -356,7 +368,15 @@ def hardware_thread(end_event, hw_queue) -> None:
     # handle requests to cycle system started state
     if params.get_bool("OnroadCycleRequested"):
       params.put_bool("OnroadCycleRequested", False, block=True)
-      offroad_cycle_count = sm.frame
+      # VBSM_CYCLE_GUARD: a cycle stops selfdrived, card and controlsd with no alert, so never under an engaged
+      # driver (openpilot, or MADS steering, which selfdriveState.enabled does not show), whoever asked (every
+      # requester today is disengaged by construction). Refused, not deferred: a deferred cycle would fire later,
+      # at speed.
+      if (sm.alive['selfdriveState'] and sm['selfdriveState'].enabled) or \
+         (sm.alive['selfdriveStateSP'] and sm['selfdriveStateSP'].mads.active):
+        cloudlog.event("onroad cycle refused while engaged", error=True)
+      else:
+        offroad_cycle_count = sm.frame
     onroad_conditions["not_onroad_cycle"] = (sm.frame - offroad_cycle_count) >= ONROAD_CYCLE_TIME * SERVICE_LIST['pandaStates'].frequency
 
     if sm.updated['pandaStates'] and len(pandaStates) > 0:
@@ -412,18 +432,9 @@ def hardware_thread(end_event, hw_queue) -> None:
     chestnut.update(started_ts is None, last_hw_state.usb_state)
     chestnut_state = sm["chestnutState"]
     chestnut_valid = sm.alive["chestnutState"] and sm.valid["chestnutState"]
-    # VBSM_GPU_IDLE-adjacent: Offroad_ChestnutUncompiled keys on the STOCK big
-    # model's compiled pkl, which never exists for a tinygrad bundle in the
-    # chestnut slot and never needs to. Upstream's own UI already treats
-    # runner==tinygrad as compiled (selfdrive/ui/sunnypilot/ui_state.py) but
-    # status.py does not, so bundle users would carry the alert forever.
-    def _chestnut_alert(name: str, show: bool, extra_text: str | None = None) -> None:
-      if name == "Offroad_ChestnutUncompiled" and show and           int(get_active_model_runner(params)) == int(custom.ModelManagerSP.Runner.tinygrad):
-        show = False
-      set_offroad_alert_if_changed(name, show, extra_text)
-    chestnut_status.update(started_ts is None, branch, last_hw_state.usb_state, chestnut.failed,
+    chestnut_status.update(started_ts is None or not onroad_conditions["ignition"], branch, last_hw_state.usb_state, chestnut.failed,
                            params.get_bool("ChestnutLoading"), params.get("ChestnutActive"),
-                           chestnut_state if chestnut_valid else None, _chestnut_alert)
+                           chestnut_state if chestnut_valid else None, set_offroad_alert_if_changed)
     # this subset is only used for offroad
     temp_sources = [
       msg.deviceState.memoryTempC,
@@ -467,6 +478,8 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     # must be at an engageable thermal band to go onroad
     startup_conditions["device_temp_engageable"] = thermal_status < ThermalStatus.overheated
+
+    startup_conditions["not_flashing_chestnut"] = not chestnut.flashing
 
     # ensure device is fully booted
     startup_conditions["device_booted"] = startup_conditions.get("device_booted", False) or HARDWARE.booted()

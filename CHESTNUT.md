@@ -7,9 +7,11 @@ This document records each problem, the evidence that identified it, and the fix
 person doesn't have to rediscover the chain. Companion doc: [VBSM.md](VBSM.md).
 
 All fixes live in `openpilot/sunnypilot/modeld_v2/modeld.py` (markers `VBSM_GPU_FALLBACK`,
-`VBSM_GPU_PPT`), `openpilot/sunnypilot/ui_watchdog.py` (`VBSM_GPU_KICK`), and
-`openpilot/selfdrive/ui/ui_state.py` (`VBSM_GPU_HUD`), maintained across upstream rebases by the
-content-port workflow described in VBSM.md.
+`VBSM_GPU_PPT`, `VBSM_GPU_READY` and relatives), `openpilot/sunnypilot/ui_watchdog.py` (`VBSM_GPU_WEDGE`; it
+was `VBSM_GPU_KICK` until 2026-10-19), `system/hardware/hardwared.py` and `sunnypilot/chestnut_power.py`
+(`VBSM_GPU_IDLE`), maintained across upstream rebases by the content-port workflow described in VBSM.md. The
+current state of every mechanism is in MODS.md §4; this log keeps the history, so its fix descriptions name
+mechanisms that were later retired (see the last section).
 
 ## The short version
 
@@ -250,3 +252,31 @@ while moving or engaged.
 starts on the readiness build). The late probe's events will show whether the link trains by itself, needs the F3
 write, or never comes up; `chestnut link ready late` followed by a kick and a big-model load is the good outcome.
 
+## Upstream's retry adopted (2026-10-19 port onto sunnypilot b50b82f9)
+
+**What changed upstream.** sunnypilot now retries a failed eGPU load itself: `ChestnutRetry` plus
+`OnroadCycleRequested` give one onroad cycle per ignition (1 s offroad, every onroad process restarted), then the
+final verdict (`ChestnutActive=False`, "Big Model Failed / Restart the car to retry"). It also swaps to the resident
+SoC model in-process on a mid-run failure, checks the link error word after every run (`error_state`), enforces 3 s
+AMD signal waits again, caps the GPU at 100 W through `AM_POWER_LIMIT`, loads models through a plain-artifact loader
+with a boot cache that is written only at the end of the first load on a tinygrad build, and flashes the enclosure
+to firmware 8516b768 before going onroad.
+
+**What the fork did.** The fork's own retry paths (the kick, its gates, the rail-gated retry, the driver request, the
+late probe, the lock retry, the load-fail ladder, the veto and strike files, the HUD tap) were retired: two retry
+systems that count failures differently disagree, and a fork kick that failed with `ChestnutRetry` unused would have
+made upstream cycle the whole stack mid-drive. What stayed answers problems upstream's retry does not: the DEV pin
+(issue 8), the readiness wait with its 12 V grace and cold-boot extension (issues 10 and 11: they make the first
+attempt succeed, so a training or silent bridge does not spend the one retry), the PPT cap (issue 2; 80 W by
+default, 60 W on this car, now also exported as `AM_POWER_LIMIT`), process replacement instead of an in-process load behind a wedged loader (issue 3),
+and the wedge backstop for a loader that holds the GIL (route 81), which now spends upstream's retry instead of
+writing a veto. New: a respawn inside an onroad session never touches the eGPU (session gate); `no_12v` and `absent`
+are final at once (a cycle does not switch the outlet); a cold model cache gets 60 s more and, on the final attempt,
+is left to finish in the background; a bridge on old, ROM or mid-flash firmware gets no fork USB traffic and runs
+the session on the SoC model with no false alert; hardwared refuses an onroad cycle while engaged.
+
+**Watch on the first drives.** `chestnut cache cold=True` and `models loaded in` (the first MDMV3 load on the new
+loader is unmeasured; the budget is 120 s when cold); `chestnut ppt limit applied=60`; any `cycling onroad to retry`
+and what the dash showed while card and controlsd restarted; `chestnut flash done` and the product string after
+the deploy boot; `chestnut gpu rails cmd=off success=True` after the first long park with 12 V held (F3=0 is
+unverified on 8516b768).

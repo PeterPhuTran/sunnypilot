@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """VBSM_WATCHDOG: recover a mici UI that is alive but has stopped drawing,
-and (VBSM_GPU_KICK) cycle modeld onto the chestnut GPU when it boots late.
+and (VBSM_GPU_WEDGE) replace a modeld whose eGPU load wedged.
 
 Division of labour with the manager: VBSM_RESTART in system/manager/process.py
 reaps a dead child so start() can rebuild it, which is what restores the
@@ -25,21 +25,30 @@ matched the substring "selfdrive.ui", which also matches
 'openpilot.selfdrive.ui.soundd', and killed soundd for idling as designed.
 Process identity is therefore matched on the exact proctitle, never a prefix.
 
-VBSM_GPU_KICK: the chestnut enclosure is powered from the car's SWITCHED 12V
-outlet, so it boots at the same moment openpilot does and loses the race —
-modeld evaluates chestnut_present() exactly once at startup, so a drive that
-starts before the enclosure enumerates runs the whole way on the SoC with the
-GPU idle. When the GPU is provably usable (same chestnut_present() check modeld
-itself runs), the models manager has finished switching the active bundle to
-the AMD catalog, and the running modeld reports it booted without the GPU
-(ChestnutLoading False), this watchdog kills modeld ONCE at a safe moment —
-standing still, openpilot not engaged — and the manager's restart policy
-brings it back; the fresh modeld re-runs its GPU check and loads the AMD
-bundle from the pre-cached chunks. Bundle ping-pong across power cycles is
-the manager's own per-catalog stash/restore and needs no help from here.
+VBSM_GPU_WEDGE: a big-model load can wedge inside a C call that HOLDS THE GIL,
+which freezes every thread in modeld, its own 60 s timeout and SIGINT handler
+included (route 81: only the manager's car-off SIGKILL ended it). Upstream has
+no exit from that state. ChestnutLoading still set past the load deadline is
+definitive, so this watchdog ends it the way upstream ends any failed load:
+the first time in an ignition it spends upstream's one retry (ChestnutRetry +
+OnroadCycleRequested, the onroad cycle modeld itself requests) and does NOT
+kill: the cycle's own stop (SIGINT, then the manager's 5 s join and SIGKILL in
+start()) replaces the frozen process, with no VBSM_RESTART respawn racing the
+cycle. If the same process is still loading GPU_CYCLE_GRACE_S later, or the
+retry is spent, or openpilot/MADS is engaged, it reports the failure
+(ChestnutActive False) and SIGKILLs; the VBSM_RESTART respawn runs the SoC
+model (modeld skips the eGPU when it is not the first of its onroad session).
+modeld is matched on its exact proctitle (modeld_warmup's contains ".modeld").
+The fork's own retry paths (the late-enumeration kick, the rail-gated
+mid-drive retry, the driver request, the veto/strike files) were retired on
+2026-10-19 in favour of upstream's retry.
 
-NOTE: crash files under /data/community/crashes carry a stale Jul-28 date when
-the boot predates NTP sync; search by mtime, not by name.
+The same backstop covers a modeld that freezes AFTER its load: one that has
+published modelV2 and then publishes nothing for GPU_FREEZE_S while its pid
+lives (the cold-cache heal's background eGPU build holding the GIL under the
+SoC model, or a big-model run() that never returns) is SIGKILLed, and the
+respawn runs the SoC model. Armed only by that pid's own output, so a load or
+a camerad wait before the first frame never counts.
 """
 import math
 import os
@@ -49,12 +58,10 @@ import time
 from openpilot.cereal import messaging
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.modeld.helpers import chestnut_present
-from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS
 
 UI_PROCTITLE = "openpilot.selfdrive.ui.ui"
+MODELD_PROCTITLE = "openpilot.selfdrive.modeld.modeld_tinygrad"   # VBSM_GPU_WEDGE: modeld_v2's setproctitle(PROCESS_NAME)
 EVIDENCE_DIR = "/data/vbsm_eval"
-EVIDENCE_CRASH_DIR = "/data/community/crashes"
 
 CHECK_INTERVAL = 2.0
 STALL_TIMEOUT = 30.0     # onroad seconds with no rendered frame = frozen
@@ -62,36 +69,29 @@ MIN_ONROAD_S = 90.0      # let the camera stack and first model runs settle
 MAX_KILLS_PER_BOOT = 3
 MIN_KILL_GAP_S = 60.0    # manager restart + UI startup needs room to finish
 
-GPU_VETO_FILE = "/dev/shm/vbsm_usbgpu_veto"  # tmpfs: a reboot grants a fresh chance
-GPU_HANG_COUNT_FILE = "/dev/shm/vbsm_gpu_hangs"  # per-boot mid-run hang strikes
-MAX_GPU_HANGS_PER_BOOT = 6  # backstop only: a rail this bad stops earning retries
-GPU_RETRY_RAIL_MV = 13000     # rail back in the charging band...
-GPU_RETRY_RAIL_HOLD_S = 60.0  # ...and holding it, before spending a retry
-GPU_LOAD_DEADLINE_S = 90.0  # every legitimate load path resolves by 60s
-# VBSM_GPU_COLDWAIT: modeld writes "<pid> <seconds>" when its cold-boot link wait ran past the plain budget;
-# the load deadline moves by that much for that pid only, bounded
+# VBSM_GPU_WEDGE: every legitimate load path resolves 12 s inside this: the link wait (<= 22 s after
+# main(), more only with VBSM_GPU_COLDWAIT, below) + the 60 s loader budget (more only with
+# VBSM_GPU_COLDCACHE, below) + <= 6 s for the small model (more only for a cold SoC cache, also
+# VBSM_GPU_COLDCACHE) or for the onroad cycle after a failed load
+GPU_LOAD_DEADLINE_S = 100.0
+# after spending upstream's retry: how long the onroad cycle gets to replace the frozen process (its SIGINT,
+# then the manager's 5 s join + SIGKILL in start(), ~7 s in all) before this watchdog kills it itself
+GPU_CYCLE_GRACE_S = 15.0
+# VBSM_GPU_COLDWAIT / VBSM_GPU_COLDCACHE: modeld writes "<pid> <seconds>" when its link wait ran past the plain
+# budget, its loader found a cold big-model cache and/or the SoC model's cache is cold; the load deadline moves by
+# that much for that pid only, bounded
 GPU_PREFLIGHT_EXT_FILE = "/dev/shm/vbsm_gpu_preflight_ext"
-GPU_PREFLIGHT_EXT_MAX_S = 35.0   # modeld's worst case: 20 s extension + poll + two 2 s reads + a 10 s F3 write
-GPU_STABLE_S = 10.0      # enclosure must stay enumerated this long
-MODELD_SETTLE_S = 15.0   # give a fresh modeld time to write ChestnutLoading
-GPU_KICK_COOLDOWN_S = 120.0
-MAX_GPU_KICKS = 2        # per drive; a modeld that then dies on AMD is the
-                         # manager restart policy's problem, not a kick loop
-GPU_VEGO_MAX = 0.5       # m/s — only ever kick at a standstill
-# VBSM_GPU_KICK_REQUEST: the driver asked for an eGPU retry (touched by the Pi relay over
-# ssh, or by hand). Honoured at the same standstill/disengaged point, without the
-# cruise-main gate; discarded once stale so it can never fire minutes later by surprise.
-GPU_KICK_REQUEST_FILE = "/dev/shm/vbsm_gpu_kick_request"
-GPU_KICK_REQUEST_MAX_AGE_S = 600.0
-# VBSM_GPU_LATE: modeld skipped the eGPU (dead outlet / bridge absent or unreadable / link
-# never trained) and keeps probing the bridge from a thread; it writes the ready marker
-# once it has seen 12 V and PCIe L0. Both are tmpfs, written fresh by every modeld process.
-GPU_LINK_WAIT_FILE = "/dev/shm/vbsm_gpu_link_wait"
-GPU_LINK_READY_FILE = "/dev/shm/vbsm_gpu_link_ready"
+GPU_PREFLIGHT_EXT_MAX_S = 155.0  # modeld's worst case: 35 s link wait (20 s extension + poll + two 2 s reads + a 10 s F3 write) + 60 s cold big-model cache + 60 s cold small-model cache
+# VBSM_GPU_WEDGE (freeze): a modeld that published modelV2 and then stays silent this long while alive is frozen
+# with the GIL held: the cold-cache heal's background eGPU build under the SoC model, or a big-model run() that
+# never returns. The respawn runs SoC. Cost: a camerad stall longer than this also costs one modeld respawn
+# (selfdrived has soft-disabled on the missing modelV2 long before)
+GPU_FREEZE_S = 15.0
 
 
 def preflight_ext_s(pid):
-  """VBSM_GPU_COLDWAIT: seconds modeld `pid` waited for the link past its plain budget (0 if none or unreadable)."""
+  """VBSM_GPU_COLDWAIT / VBSM_GPU_COLDCACHE: the load-deadline extension modeld `pid` reported: the link-wait
+  seconds past its plain budget plus 60 s for each cold model cache (0 if none or unreadable), clamped."""
   try:
     with open(GPU_PREFLIGHT_EXT_FILE) as f:
       p, s = f.read().split()
@@ -101,8 +101,10 @@ def preflight_ext_s(pid):
     return 0.0
 
 
-def find_proc(match, exclude=()):
-  """PID whose proctitle contains match and none of exclude."""
+def find_exact(title):
+  """PID whose proctitle is exactly `title`. Exact, never a substring: 'openpilot.selfdrive.ui.soundd' shares
+  the UI's prefix, and 'openpilot.sunnypilot.modeld_v2.warmup' (upstream's offroad modeld_warmup, which can
+  still be alive for a moment at an onroad edge) contains '.modeld'."""
   for entry in os.listdir("/proc"):
     if not entry.isdigit():
       continue
@@ -111,27 +113,14 @@ def find_proc(match, exclude=()):
         cmd = f.read().rstrip(b"\0").replace(b"\0", b" ").decode(errors="replace")
     except OSError:
       continue
-    if match in cmd and not any(x in cmd for x in exclude):
+    if cmd == title:
       return int(entry)
   return None
 
 
 def find_ui():
-  """PID of the UI, matched on its exact proctitle.
-
-  Exact, not substring: 'openpilot.selfdrive.ui.soundd' shares the prefix.
-  """
-  for entry in os.listdir("/proc"):
-    if not entry.isdigit():
-      continue
-    try:
-      with open(f"/proc/{entry}/cmdline", "rb") as f:
-        cmd = f.read().rstrip(b"\0").replace(b"\0", b" ").decode(errors="replace")
-    except OSError:
-      continue
-    if cmd == UI_PROCTITLE:
-      return int(entry)
-  return None
+  """PID of the UI, matched on its exact proctitle."""
+  return find_exact(UI_PROCTITLE)
 
 
 def dump_evidence(pid):
@@ -165,292 +154,81 @@ def dump_evidence(pid):
     return None
 
 
-class GpuKick:
-  """VBSM_GPU_KICK state; one tick per watchdog loop pass."""
+class GpuWedge:
+  """VBSM_GPU_WEDGE state; one tick per watchdog loop pass."""
 
   def __init__(self, params):
     self.params = params
-    self.gpu_since = None
     self.modeld_seen = None  # (pid, monotonic first seen)
-    self.gpu_was_active = False
-    self.kicks = 0
-    self.last_kick = None       # monotonic; None until the first kick (see the cooldown note)
-    self.rail_ok_since = None   # monotonic since the rail entered the charging band
-    self.retry_used = False     # one mid-drive eGPU retry per drive
-    self.veto_seen = False      # edge-detect a fresh veto to restart the hold window
-
-  def _veto(self, kind="hang"):
-    """Sustained inference hangs the accessory-outlet enclosure (tinygrad
-    "Device hang detected"); without a veto every restart after a hang burned
-    another 60s no-model window re-attempting the GPU mid-drive. One inference
-    death = SoC for the rest of this DRIVE (tick() clears a first-strike veto
-    once offroad); the second strike this boot sticks until reboot. modeld
-    checks the marker at start and bumps the same counter from its own in-run
-    hang handler."""
-    hangs = 1
-    try:
-      with open(GPU_HANG_COUNT_FILE) as f:
-        hangs = int(f.read().strip()) + 1
-    except (OSError, ValueError):
-      pass
-    try:
-      with open(GPU_HANG_COUNT_FILE, "w") as f:
-        f.write(str(hangs))
-    except OSError:
-      pass
-    try:
-      with open(GPU_VETO_FILE, "w") as f:
-        f.write(f"{kind} {int(time.time())}")
-      cloudlog.error(f"ui_watchdog: eGPU-active modeld died; vetoing the GPU "
-                     f"(strike {hangs}/{MAX_GPU_HANGS_PER_BOOT} this boot, {kind})")
-    except OSError as e:
-      cloudlog.error(f"ui_watchdog: veto write failed: {e}")
-
-  def _veto_from_hang(self):
-    """Only a mid-RUN death earns a drive-end clear or a retry. Match "hang"
-    positively: a device that never came up (the load ladder, or a loader
-    wedged past the deadline) has not shown it can run on this rail, and a
-    truncated or unreadable marker must not read as permission."""
-    try:
-      with open(GPU_VETO_FILE) as f:
-        return f.read(4) == "hang"
-    except OSError:
-      return False
-
-  def _kick_requested(self, now):
-    """A driver request file younger than GPU_KICK_REQUEST_MAX_AGE_S. Older ones are
-    deleted and logged, never queued: a request made while moving should fire at
-    the next stop, not at some stop ten minutes later."""
-    try:
-      age = time.time() - os.path.getmtime(GPU_KICK_REQUEST_FILE)
-    except OSError:
-      return False
-    if age > GPU_KICK_REQUEST_MAX_AGE_S:
-      try:
-        os.remove(GPU_KICK_REQUEST_FILE)
-      except OSError:
-        pass
-      cloudlog.warning(f"ui_watchdog: stale eGPU retry request ({age:.0f}s old) discarded")
-      return False
-    return True
-
-  def _hang_strikes(self):
-    try:
-      with open(GPU_HANG_COUNT_FILE) as f:
-        return int(f.read().strip())
-    except (OSError, ValueError):
-      return 0
+    self.cycle_asked = None  # (pid, monotonic) when this watchdog spent upstream's retry for that process
+    self.model_seen = None   # (pid, monotonic) of the last modelV2 seen while that pid ran
 
   def tick(self, sm, started, now):
     if not started:
-      # An ignition cycle, not a device reboot, is the natural retry point:
-      # the device stays up across car restarts, so a boot-scoped veto from
-      # one supply transient (2026-09-01: the car's charging cutting out
-      # mid-drive) stranded the big model for every later drive that boot --
-      # and made the "Restart the car to retry" alert a lie. First mid-run
-      # hang: the veto dies with the drive, cleared here. Second hang this
-      # boot: the rail is not having a transient day, the veto keeps.
-      # Load-ladder vetoes (payload "load") stay boot-scoped: that device
-      # never even ran, and the ladder already spent its own free retry.
-      if os.path.exists(GPU_VETO_FILE):
-        hangs = self._hang_strikes()
-        if self._veto_from_hang() and hangs < MAX_GPU_HANGS_PER_BOOT:
-          try:
-            os.remove(GPU_VETO_FILE)
-            cloudlog.warning(f"ui_watchdog: drive over; eGPU veto cleared for next "
-                             f"ignition (hang {hangs}/{MAX_GPU_HANGS_PER_BOOT} this boot)")
-          except OSError:
-            pass
-      # per-DRIVE budgets: the device stays up for days, so boot-scoped counters
-      # would let one bad day strand the big model until a manual reboot -- the
-      # same trap the veto itself had. The strike file stays boot-scoped as a
-      # backstop against a genuinely dying rail earning retries forever.
-      self.kicks = 0
-      self.retry_used = False
-      self.rail_ok_since = None
-      self.veto_seen = False
-      self.gpu_since = None
       self.modeld_seen = None
-      self.gpu_was_active = False
+      self.cycle_asked = None
+      self.model_seen = None
       return
 
-    # VBSM_GPU_RETRY: track how long the car rail has held the charging band.
-    # Updated before every early return below so the hold timer is continuous.
-    # A newly appeared veto restarts the window: the rail must prove itself for
-    # the full hold AFTER the hang rather than inherit credit from before it,
-    # or a hang during an otherwise healthy stretch would earn an instant retry.
-    veto = os.path.exists(GPU_VETO_FILE)
-    if veto and not self.veto_seen:
-      self.rail_ok_since = None
-    self.veto_seen = veto
-    volt = sm['peripheralState'].voltage if sm.alive['peripheralState'] else 0
-    if not 5000 < volt < 20000:   # implausible or absent reads as "not charging"
-      volt = 0
-    if volt < GPU_RETRY_RAIL_MV:
-      self.rail_ok_since = None
-    elif self.rail_ok_since is None:
-      self.rail_ok_since = now
-
-    if not chestnut_present():
-      self.gpu_since = None
-      return
-    if self.gpu_since is None:
-      self.gpu_since = now
-
-    pid = find_proc(".modeld", exclude=("dmonitoring", "watchdog"))
+    pid = find_exact(MODELD_PROCTITLE)
     if pid is None:
-      # a GPU-active modeld that vanishes while still onroad, with a crash
-      # file seconds old, died of the device hang -- a clean offroad stop
-      # leaves no fresh crash file and never trips this
-      if self.modeld_seen is not None and self.gpu_was_active and not os.path.exists(GPU_VETO_FILE):
-        try:
-          newest = max((os.path.getmtime(os.path.join(EVIDENCE_CRASH_DIR, f))
-                        for f in os.listdir(EVIDENCE_CRASH_DIR)), default=0)
-        except OSError:
-          newest = 0
-        if time.time() - newest < 90:
-          self._veto()
       self.modeld_seen = None
-      self.gpu_was_active = False
+      self.model_seen = None
       return
-    self.gpu_was_active = self.params.get_bool("ChestnutActive")
-    if self.modeld_seen is None or self.modeld_seen[0] != pid:
+    first = self.modeld_seen is None or self.modeld_seen[0] != pid
+    if first:
       self.modeld_seen = (pid, now)
-
-    # A wedged eGPU load blocks inside a C call HOLDING THE GIL, which freezes
-    # every thread in modeld INCLUDING its own 60s timeout (field-verified:
-    # modeld ignored SIGINT and needed the manager escalation SIGKILL at
-    # car-off, with the timeout never having fired). Only an external kill
-    # works. ChestnutLoading past the deadline is definitive: every legitimate
-    # path -- success or the in-process exit -- resolves by 60s.
-    load_age = now - self.modeld_seen[1]
-    if (self.params.get_bool("ChestnutLoading") and load_age > GPU_LOAD_DEADLINE_S
-        and load_age > GPU_LOAD_DEADLINE_S + preflight_ext_s(pid)   # VBSM_GPU_COLDWAIT
-        and not os.path.exists(GPU_VETO_FILE)):
-      self._veto("load")
-      cloudlog.error(f"ui_watchdog: modeld pid {pid} wedged in eGPU load "
-                     f"({load_age:.0f}s, preflight ext {preflight_ext_s(pid):.1f}s), killing for vetoed respawn")
+    # VBSM_GPU_WEDGE (freeze): armed only by this pid's own modelV2, never on the tick that first sees it (that
+    # update can still hold the previous pid's last message), so a load or a camerad wait before the first frame
+    # never counts; then GPU_FREEZE_S without one while the pid lives = frozen
+    if sm.updated['modelV2'] and not first:
+      self.model_seen = (pid, now)
+    elif self.model_seen is not None and self.model_seen[0] == pid and now - self.model_seen[1] > GPU_FREEZE_S:
+      cloudlog.error(f"ui_watchdog: modeld pid {pid} published no modelV2 for {now - self.model_seen[1]:.0f}s while alive, "
+                     f"killing for a SoC respawn")
       try:
         os.kill(pid, signal.SIGKILL)
       except OSError as e:
-        cloudlog.error(f"ui_watchdog: wedge kill failed: {e}")
-      self.modeld_seen = None
+        cloudlog.error(f"ui_watchdog: freeze kill failed: {e}")
+      self.model_seen = None
       return
 
-    if now - self.gpu_since < GPU_STABLE_S or now - self.modeld_seen[1] < MODELD_SETTLE_S:
+    load_age = now - self.modeld_seen[1]
+    if not (self.params.get_bool("ChestnutLoading") and load_age > GPU_LOAD_DEADLINE_S + preflight_ext_s(pid)):   # VBSM_GPU_COLDWAIT
       return
-    # `now` is time.monotonic(), which starts near zero at boot. With last_kick
-    # initialised to 0.0 the cooldown read as "kicked at boot" and refused every
-    # kick in the first 120 s of uptime -- exactly the window a cold boot into
-    # onroad offers (2026-09-16: 40 s standstill from route second 9, cruise main
-    # off, all other gates open, no kick; the driver rebooted instead).
-    if self.kicks >= MAX_GPU_KICKS or (self.last_kick is not None and now - self.last_kick < GPU_KICK_COOLDOWN_S):
+    if self.cycle_asked is not None and self.cycle_asked[0] == pid and now - self.cycle_asked[1] < GPU_CYCLE_GRACE_S:
+      return   # the onroad cycle replaces the frozen process: SIGINT, then the manager's join + SIGKILL
+    # ChestnutLoading is only ever True in the FIRST modeld of an onroad session, before it has published
+    # a single modelV2 (bigModelLoading NO_ENTRY the whole time), so nobody can be engaged on it here; checked
+    # anyway, because an onroad cycle under an engaged driver would stop selfdrived, card and controlsd
+    engaged = bool((sm.alive['selfdriveState'] and sm['selfdriveState'].enabled) or
+                   (sm.alive['selfdriveStateSP'] and sm['selfdriveStateSP'].mads.active))
+    # one cycle per process; ChestnutRetry makes it one per ignition. A cycle_asked left from an earlier pid means an
+    # offroad blip (the cycle, or a 1-2 s car restart) fell between two ticks, not that this ignition's retry is spent
+    if not self.params.get_bool("ChestnutRetry") and not engaged and (self.cycle_asked is None or self.cycle_asked[0] != pid):
+      self.params.put_bool("ChestnutRetry", True, block=True)
+      self.params.put_bool("OnroadCycleRequested", True, block=True)
+      self.cycle_asked = (pid, now)
+      cloudlog.error(f"ui_watchdog: modeld pid {pid} wedged in eGPU load ({load_age:.0f}s, preflight ext "
+                     f"{preflight_ext_s(pid):.1f}s), spending upstream's retry (onroad cycle), not killing")
       return
-    # VBSM_GPU_RETRY: a mid-run hang vetoes the eGPU for the drive, but the
-    # brownout behind it is transient -- the rail returns to the charging band
-    # later in most drives (2026-09-01 b1: 13.4V for 18 min, 12.1V for 50, then
-    # 13.35V again). Spend ONE retry per drive once the rail has held the band,
-    # and only through the standstill/disengaged gate below.
-    # Deliberately asymmetric: this same voltage signal was REFUTED as a
-    # proactive veto -- route af ran 37 min with 869 samples under 12.5V -- but
-    # as a retry gate a false negative only costs a missed opportunity, while a
-    # false positive there cost the big model outright.
-    retry_pending = False
-    if os.path.exists(GPU_VETO_FILE):   # fresh read: `veto` above only edge-detects
-      if (self.retry_used or not self._veto_from_hang()
-          or self._hang_strikes() >= MAX_GPU_HANGS_PER_BOOT
-          or self.rail_ok_since is None
-          or now - self.rail_ok_since < GPU_RETRY_RAIL_HOLD_S):
-        return
-      retry_pending = True
-
-    # the running modeld must itself say it booted without the GPU; a missing
-    # param proves nothing and must never trigger a kill. Loading alone is NOT
-    # that signal -- it goes False on SUCCESS too, and gating on it alone made
-    # the kick SIGKILL two perfectly healthy GPU sessions one second after
-    # their 39s BMV2 loads finished. ChestnutActive is the actual verdict.
-    loading = self.params.get("ChestnutLoading")
-    if loading is None or self.params.get_bool("ChestnutLoading"):
-      return
-    if self.params.get_bool("ChestnutActive"):
-      return
-
-    # upstream moved to per-hardware bundle SLOTS: only kick when the big-model
-    # slot actually holds a bundle for the restarted modeld to load. Read the
-    # key through ACTIVE_BUNDLE_KEYS -- this gate was still naming the
-    # pre-rename ModelManager_ActiveBundleUSBGPU param, which upstream keeps
-    # only for migration, so the next rename should not silently strand it.
-    if self.params.get(ACTIVE_BUNDLE_KEYS["chestnut"]) is None:
-      return
-
-    # only at a standstill with openpilot disengaged — never take the model
-    # away from a moving car
-    # alive/valid, not seen: `seen` latches True forever and the last message is
-    # retained, so a DEAD carState publisher would freeze vEgo at its last value
-    # -- frozen near zero, that reads as a permanent standstill and this would
-    # SIGKILL modeld at any speed.
-    if not (sm.alive['carState'] and sm.valid['carState']
-            and sm.alive['selfdriveState'] and sm.valid['selfdriveState']):
-      return
-    if sm['carState'].vEgo > GPU_VEGO_MAX or sm['selfdriveState'].enabled:
-      return
-    # VBSM_GPU_KICK_ARMED: a kick throws a working SoC model away for a ~35 s
-    # no-model reload. 2026-09-13 did that to a driver who had just armed
-    # cruise: two refused engages ("Big Model Loading"), then locationd lost
-    # its camera odometry during the gap and locked engagement out for the
-    # rest of the drive. Reload only while the driver is not about to engage:
-    # cruise main off, or the car in Park (a boot-in-Park kick is invisible).
-    cs = sm['carState']
-    requested = self._kick_requested(now)
-    if not requested and cs.cruiseState.available and str(cs.gearShifter) != 'park':
-      return
-    # VBSM_GPU_LATE: modeld skipped the eGPU because the outlet was dead or the
-    # bridge never answered / never trained (2026-09-16: bridge enumerated but
-    # unreadable for the first ~30 s of a cold boot). A kick before its late probe
-    # has seen 12 V and L0 would only buy another skip: 30 s without a model for
-    # nothing. A driver's request goes ahead regardless -- the fresh process
-    # re-probes and writes the PCIe power bit itself if the link is in Detect.
-    if not requested and os.path.exists(GPU_LINK_WAIT_FILE) and not os.path.exists(GPU_LINK_READY_FILE):
-      return
-
-    # clear the veto only here, with the car stopped and disengaged and the kick
-    # about to fire, so an eligible-but-ungated retry can never leave the GPU
-    # unvetoed for some unrelated modeld restart to pick up while moving. After
-    # the kick it stays cleared for the drive by design: the reload either
-    # reaches ChestnutActive, or fails and re-vetoes itself.
-    if retry_pending:
-      try:
-        os.remove(GPU_VETO_FILE)
-      except OSError as e:
-        cloudlog.error(f"ui_watchdog: retry veto clear failed: {e}")
-        return
-      self.retry_used = True
-      cloudlog.warning(f"ui_watchdog: rail held {volt}mV for "
-                       f"{now - self.rail_ok_since:.0f}s; spending this drive's one eGPU retry")
-
-    if requested:
-      try:
-        os.remove(GPU_KICK_REQUEST_FILE)
-      except OSError:
-        pass
-    self.kicks += 1
-    self.last_kick = now
-    cloudlog.error(f"ui_watchdog: gpu present but modeld pid {pid} booted without it; "
-                   f"kicking for AMD reload ({self.kicks}/{MAX_GPU_KICKS}, "
-                   f"{'driver request' if requested else 'auto'}, link_wait={os.path.exists(GPU_LINK_WAIT_FILE)}, "
-                   f"link_ready={os.path.exists(GPU_LINK_READY_FILE)})")
+    # the same verdict as modeld's own final failure; ChestnutLoading False also marks the session for the respawn
+    self.params.put_bool("ChestnutActive", False, block=True)
+    self.params.put_bool("ChestnutLoading", False, block=True)
+    cloudlog.error(f"ui_watchdog: modeld pid {pid} wedged in eGPU load ({load_age:.0f}s, preflight ext "
+                   f"{preflight_ext_s(pid):.1f}s, engaged {engaged}, cycle asked {self.cycle_asked is not None}), "
+                   f"final, killing for a SoC respawn")
     try:
       os.kill(pid, signal.SIGKILL)
     except OSError as e:
-      cloudlog.error(f"ui_watchdog: gpu kick failed: {e}")
+      cloudlog.error(f"ui_watchdog: wedge kill failed: {e}")
     self.modeld_seen = None
 
 
 def main():
   params = Params()
-  sm = messaging.SubMaster(['uiDebug', 'deviceState', 'carState', 'selfdriveState',
-                            'peripheralState'])
-  gpu = GpuKick(params)
+  sm = messaging.SubMaster(['uiDebug', 'deviceState', 'selfdriveState', 'selfdriveStateSP', 'modelV2'])
+  gpu = GpuWedge(params)
   now = time.monotonic()
   last_frame = now
   onroad_since = None

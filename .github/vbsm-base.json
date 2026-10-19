@@ -1,5 +1,5 @@
 {
-  "base": "5fb421d045b6fd1f862886c00b1ad8ab939202bc",
+  "base": "b50b82f9ab93a0266ebb8e9fcebd751868e9a209",
   "files": [
     "VBSM.md",
     "CHESTNUT.md",
@@ -18,7 +18,6 @@
     "openpilot/system/hardware/hardwared.py",
     "openpilot/sunnypilot/chestnut_power.py",
     "openpilot/sunnypilot/models/fetcher.py",
-    "openpilot/sunnypilot/mads/mads.py",
     "openpilot/selfdrive/ui/mici/layouts/home.py",
     "openpilot/selfdrive/pandad/pandad.py",
     "openpilot/sunnypilot/parkwatchd.py",

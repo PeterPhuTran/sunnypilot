@@ -131,6 +131,7 @@ enum class EventName_91f1992a1f77fb03: uint16_t {
   BIG_MODEL_READY_D_E_P_R_E_C_A_T_E_D,
   BIG_MODEL_FAILED,
   CAR_NOT_READY,
+  USER_BOOKMARK_NOT_PAIRED,
 };
 CAPNP_DECLARE_ENUM(EventName, 91f1992a1f77fb03);
 CAPNP_DECLARE_SCHEMA(d692e23d1a247d99);
@@ -1192,7 +1193,7 @@ struct UsbState {
   struct Device;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(8b644b0be77bac9f, 0, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(8b644b0be77bac9f, 1, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -3265,8 +3266,8 @@ struct Event {
     UPLOADER_STATE_D_E_P_R_E_C_A_T_E_D,
     PERIPHERAL_STATE,
     PANDA_STATES,
-    NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D,
-    NAV_ROUTE_D_E_P_R_E_C_A_T_E_D,
+    NAV_INSTRUCTION,
+    NAV_ROUTE,
     NAV_THUMBNAIL_D_E_P_R_E_C_A_T_E_D,
     ERROR_LOG_MESSAGE,
     NARROW_ROAD_ENCODE_DATA,
@@ -3707,9 +3708,6 @@ public:
   inline bool hasVersion() const;
   inline  ::capnp::Text::Reader getVersion() const;
 
-  inline bool hasPandaInfo() const;
-  inline  ::cereal::InitData::PandaInfo::Reader getPandaInfo() const;
-
   inline bool getDirty() const;
 
   inline bool hasGitCommit() const;
@@ -3718,16 +3716,11 @@ public:
   inline bool hasGitBranch() const;
   inline  ::capnp::Text::Reader getGitBranch() const;
 
-  inline bool getPassive() const;
-
   inline bool hasGitRemote() const;
   inline  ::capnp::Text::Reader getGitRemote() const;
 
   inline bool hasKernelVersion() const;
   inline  ::capnp::Text::Reader getKernelVersion() const;
-
-  inline bool hasAndroidProperties() const;
-  inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Reader getAndroidProperties() const;
 
   inline bool hasParams() const;
   inline  ::cereal::Map< ::capnp::Text,  ::capnp::Data>::Reader getParams() const;
@@ -3808,13 +3801,6 @@ public:
   inline void adoptVersion(::capnp::Orphan< ::capnp::Text>&& value);
   inline ::capnp::Orphan< ::capnp::Text> disownVersion();
 
-  inline bool hasPandaInfo();
-  inline  ::cereal::InitData::PandaInfo::Builder getPandaInfo();
-  inline void setPandaInfo( ::cereal::InitData::PandaInfo::Reader value);
-  inline  ::cereal::InitData::PandaInfo::Builder initPandaInfo();
-  inline void adoptPandaInfo(::capnp::Orphan< ::cereal::InitData::PandaInfo>&& value);
-  inline ::capnp::Orphan< ::cereal::InitData::PandaInfo> disownPandaInfo();
-
   inline bool getDirty();
   inline void setDirty(bool value);
 
@@ -3832,9 +3818,6 @@ public:
   inline void adoptGitBranch(::capnp::Orphan< ::capnp::Text>&& value);
   inline ::capnp::Orphan< ::capnp::Text> disownGitBranch();
 
-  inline bool getPassive();
-  inline void setPassive(bool value);
-
   inline bool hasGitRemote();
   inline  ::capnp::Text::Builder getGitRemote();
   inline void setGitRemote( ::capnp::Text::Reader value);
@@ -3848,13 +3831,6 @@ public:
   inline  ::capnp::Text::Builder initKernelVersion(unsigned int size);
   inline void adoptKernelVersion(::capnp::Orphan< ::capnp::Text>&& value);
   inline ::capnp::Orphan< ::capnp::Text> disownKernelVersion();
-
-  inline bool hasAndroidProperties();
-  inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Builder getAndroidProperties();
-  inline void setAndroidProperties( ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Reader value);
-  inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Builder initAndroidProperties();
-  inline void adoptAndroidProperties(::capnp::Orphan< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>&& value);
-  inline ::capnp::Orphan< ::cereal::Map< ::capnp::Text,  ::capnp::Text>> disownAndroidProperties();
 
   inline bool hasParams();
   inline  ::cereal::Map< ::capnp::Text,  ::capnp::Data>::Builder getParams();
@@ -3927,8 +3903,6 @@ public:
       : _typeless(kj::mv(typeless)) {}
 
   inline typename Deprecated::Pipeline getDeprecated();
-  inline  ::cereal::InitData::PandaInfo::Pipeline getPandaInfo();
-  inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Pipeline getAndroidProperties();
   inline  ::cereal::Map< ::capnp::Text,  ::capnp::Data>::Pipeline getParams();
   inline  ::cereal::Map< ::capnp::Text,  ::capnp::Data>::Pipeline getCommands();
 private:
@@ -4156,8 +4130,16 @@ public:
   inline bool hasChffrAndroidExtra() const;
   inline  ::cereal::InitData::ChffrAndroidExtra::Reader getChffrAndroidExtra() const;
 
+  inline bool hasPandaInfo() const;
+  inline  ::cereal::InitData::PandaInfo::Reader getPandaInfo() const;
+
+  inline bool getPassive() const;
+
   inline bool hasIosBuildInfo() const;
   inline  ::cereal::IosBuildInfo::Reader getIosBuildInfo() const;
+
+  inline bool hasAndroidProperties() const;
+  inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Reader getAndroidProperties() const;
 
 private:
   ::capnp::_::StructReader _reader;
@@ -4215,12 +4197,29 @@ public:
   inline void adoptChffrAndroidExtra(::capnp::Orphan< ::cereal::InitData::ChffrAndroidExtra>&& value);
   inline ::capnp::Orphan< ::cereal::InitData::ChffrAndroidExtra> disownChffrAndroidExtra();
 
+  inline bool hasPandaInfo();
+  inline  ::cereal::InitData::PandaInfo::Builder getPandaInfo();
+  inline void setPandaInfo( ::cereal::InitData::PandaInfo::Reader value);
+  inline  ::cereal::InitData::PandaInfo::Builder initPandaInfo();
+  inline void adoptPandaInfo(::capnp::Orphan< ::cereal::InitData::PandaInfo>&& value);
+  inline ::capnp::Orphan< ::cereal::InitData::PandaInfo> disownPandaInfo();
+
+  inline bool getPassive();
+  inline void setPassive(bool value);
+
   inline bool hasIosBuildInfo();
   inline  ::cereal::IosBuildInfo::Builder getIosBuildInfo();
   inline void setIosBuildInfo( ::cereal::IosBuildInfo::Reader value);
   inline  ::cereal::IosBuildInfo::Builder initIosBuildInfo();
   inline void adoptIosBuildInfo(::capnp::Orphan< ::cereal::IosBuildInfo>&& value);
   inline ::capnp::Orphan< ::cereal::IosBuildInfo> disownIosBuildInfo();
+
+  inline bool hasAndroidProperties();
+  inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Builder getAndroidProperties();
+  inline void setAndroidProperties( ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Reader value);
+  inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Builder initAndroidProperties();
+  inline void adoptAndroidProperties(::capnp::Orphan< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>&& value);
+  inline ::capnp::Orphan< ::cereal::Map< ::capnp::Text,  ::capnp::Text>> disownAndroidProperties();
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -4242,7 +4241,9 @@ public:
 
   inline  ::cereal::AndroidBuildInfo::Pipeline getAndroidBuildInfo();
   inline  ::cereal::InitData::ChffrAndroidExtra::Pipeline getChffrAndroidExtra();
+  inline  ::cereal::InitData::PandaInfo::Pipeline getPandaInfo();
   inline  ::cereal::IosBuildInfo::Pipeline getIosBuildInfo();
+  inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Pipeline getAndroidProperties();
 private:
   ::capnp::AnyPointer::Pipeline _typeless;
   friend class ::capnp::PipelineHook;
@@ -6401,6 +6402,10 @@ public:
 
   inline bool getControlsAllowedLongitudinal() const;
 
+  inline bool getNmiReset() const;
+
+  inline bool getHardfaultReset() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -6541,6 +6546,12 @@ public:
 
   inline bool getControlsAllowedLongitudinal();
   inline void setControlsAllowedLongitudinal(bool value);
+
+  inline bool getNmiReset();
+  inline void setNmiReset(bool value);
+
+  inline bool getHardfaultReset();
+  inline void setHardfaultReset(bool value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -7077,6 +7088,8 @@ public:
   inline bool hasDevices() const;
   inline  ::capnp::List< ::cereal::UsbState::Device,  ::capnp::Kind::STRUCT>::Reader getDevices() const;
 
+  inline bool getConnected() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -7111,6 +7124,9 @@ public:
   inline  ::capnp::List< ::cereal::UsbState::Device,  ::capnp::Kind::STRUCT>::Builder initDevices(unsigned int size);
   inline void adoptDevices(::capnp::Orphan< ::capnp::List< ::cereal::UsbState::Device,  ::capnp::Kind::STRUCT>>&& value);
   inline ::capnp::Orphan< ::capnp::List< ::cereal::UsbState::Device,  ::capnp::Kind::STRUCT>> disownDevices();
+
+  inline bool getConnected();
+  inline void setConnected(bool value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -8173,8 +8189,6 @@ public:
 
   inline bool getEngageable() const;
 
-  inline bool getExperimentalMode() const;
-
   inline  ::cereal::LongitudinalPersonality getPersonality() const;
 
   inline  ::cereal::CarControl::HUDControl::VisualAlert getAlertHudVisual() const;
@@ -8251,9 +8265,6 @@ public:
   inline bool getEngageable();
   inline void setEngageable(bool value);
 
-  inline bool getExperimentalMode();
-  inline void setExperimentalMode(bool value);
-
   inline  ::cereal::LongitudinalPersonality getPersonality();
   inline void setPersonality( ::cereal::LongitudinalPersonality value);
 
@@ -8309,6 +8320,8 @@ public:
 
   inline  ::cereal::CarControl::HUDControl::AudibleAlert getAlertSound() const;
 
+  inline bool getExperimentalMode() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -8339,6 +8352,9 @@ public:
 
   inline  ::cereal::CarControl::HUDControl::AudibleAlert getAlertSound();
   inline void setAlertSound( ::cereal::CarControl::HUDControl::AudibleAlert value);
+
+  inline bool getExperimentalMode();
+  inline void setExperimentalMode(bool value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -11824,6 +11840,8 @@ public:
 
   inline bool getAllowBrake() const;
 
+  inline float getAccelBoost() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -11908,6 +11926,9 @@ public:
 
   inline bool getAllowBrake();
   inline void setAllowBrake(bool value);
+
+  inline float getAccelBoost();
+  inline void setAccelBoost(float value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -19441,6 +19462,8 @@ public:
 
   inline bool getPhone() const;
 
+  inline bool getSleep() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -19477,6 +19500,9 @@ public:
 
   inline bool getPhone();
   inline void setPhone(bool value);
+
+  inline bool getSleep();
+  inline void setSleep(bool value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -23075,13 +23101,13 @@ public:
   inline bool hasPandaStates() const;
   inline  ::capnp::List< ::cereal::PandaState,  ::capnp::Kind::STRUCT>::Reader getPandaStates() const;
 
-  inline bool isNavInstructionDEPRECATED() const;
-  inline bool hasNavInstructionDEPRECATED() const;
-  inline  ::cereal::NavInstruction::Reader getNavInstructionDEPRECATED() const;
+  inline bool isNavInstruction() const;
+  inline bool hasNavInstruction() const;
+  inline  ::cereal::NavInstruction::Reader getNavInstruction() const;
 
-  inline bool isNavRouteDEPRECATED() const;
-  inline bool hasNavRouteDEPRECATED() const;
-  inline  ::cereal::NavRoute::Reader getNavRouteDEPRECATED() const;
+  inline bool isNavRoute() const;
+  inline bool hasNavRoute() const;
+  inline  ::cereal::NavRoute::Reader getNavRoute() const;
 
   inline bool isNavThumbnailDEPRECATED() const;
   inline bool hasNavThumbnailDEPRECATED() const;
@@ -24038,21 +24064,21 @@ public:
   inline void adoptPandaStates(::capnp::Orphan< ::capnp::List< ::cereal::PandaState,  ::capnp::Kind::STRUCT>>&& value);
   inline ::capnp::Orphan< ::capnp::List< ::cereal::PandaState,  ::capnp::Kind::STRUCT>> disownPandaStates();
 
-  inline bool isNavInstructionDEPRECATED();
-  inline bool hasNavInstructionDEPRECATED();
-  inline  ::cereal::NavInstruction::Builder getNavInstructionDEPRECATED();
-  inline void setNavInstructionDEPRECATED( ::cereal::NavInstruction::Reader value);
-  inline  ::cereal::NavInstruction::Builder initNavInstructionDEPRECATED();
-  inline void adoptNavInstructionDEPRECATED(::capnp::Orphan< ::cereal::NavInstruction>&& value);
-  inline ::capnp::Orphan< ::cereal::NavInstruction> disownNavInstructionDEPRECATED();
+  inline bool isNavInstruction();
+  inline bool hasNavInstruction();
+  inline  ::cereal::NavInstruction::Builder getNavInstruction();
+  inline void setNavInstruction( ::cereal::NavInstruction::Reader value);
+  inline  ::cereal::NavInstruction::Builder initNavInstruction();
+  inline void adoptNavInstruction(::capnp::Orphan< ::cereal::NavInstruction>&& value);
+  inline ::capnp::Orphan< ::cereal::NavInstruction> disownNavInstruction();
 
-  inline bool isNavRouteDEPRECATED();
-  inline bool hasNavRouteDEPRECATED();
-  inline  ::cereal::NavRoute::Builder getNavRouteDEPRECATED();
-  inline void setNavRouteDEPRECATED( ::cereal::NavRoute::Reader value);
-  inline  ::cereal::NavRoute::Builder initNavRouteDEPRECATED();
-  inline void adoptNavRouteDEPRECATED(::capnp::Orphan< ::cereal::NavRoute>&& value);
-  inline ::capnp::Orphan< ::cereal::NavRoute> disownNavRouteDEPRECATED();
+  inline bool isNavRoute();
+  inline bool hasNavRoute();
+  inline  ::cereal::NavRoute::Builder getNavRoute();
+  inline void setNavRoute( ::cereal::NavRoute::Reader value);
+  inline  ::cereal::NavRoute::Builder initNavRoute();
+  inline void adoptNavRoute(::capnp::Orphan< ::cereal::NavRoute>&& value);
+  inline ::capnp::Orphan< ::cereal::NavRoute> disownNavRoute();
 
   inline bool isNavThumbnailDEPRECATED();
   inline bool hasNavThumbnailDEPRECATED();
@@ -25058,11 +25084,14 @@ inline typename InitData::Deprecated::Pipeline InitData::Pipeline::getDeprecated
 }
 #endif  // !CAPNP_LITE
 inline typename InitData::Deprecated::Builder InitData::Builder::initDeprecated() {
+  _builder.setDataField<bool>(::capnp::bounded<17>() * ::capnp::ELEMENTS, 0);
   _builder.getPointerField(::capnp::bounded<1>() * ::capnp::POINTERS).clear();
   _builder.getPointerField(::capnp::bounded<4>() * ::capnp::POINTERS).clear();
   _builder.getPointerField(::capnp::bounded<5>() * ::capnp::POINTERS).clear();
   _builder.getPointerField(::capnp::bounded<6>() * ::capnp::POINTERS).clear();
+  _builder.getPointerField(::capnp::bounded<7>() * ::capnp::POINTERS).clear();
   _builder.getPointerField(::capnp::bounded<11>() * ::capnp::POINTERS).clear();
+  _builder.getPointerField(::capnp::bounded<13>() * ::capnp::POINTERS).clear();
   return typename InitData::Deprecated::Builder(_builder);
 }
 inline bool InitData::Reader::hasDongleId() const {
@@ -25147,45 +25176,6 @@ inline ::capnp::Orphan< ::capnp::Text> InitData::Builder::disownVersion() {
       ::capnp::bounded<3>() * ::capnp::POINTERS));
 }
 
-inline bool InitData::Reader::hasPandaInfo() const {
-  return !_reader.getPointerField(
-      ::capnp::bounded<7>() * ::capnp::POINTERS).isNull();
-}
-inline bool InitData::Builder::hasPandaInfo() {
-  return !_builder.getPointerField(
-      ::capnp::bounded<7>() * ::capnp::POINTERS).isNull();
-}
-inline  ::cereal::InitData::PandaInfo::Reader InitData::Reader::getPandaInfo() const {
-  return ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::get(_reader.getPointerField(
-      ::capnp::bounded<7>() * ::capnp::POINTERS));
-}
-inline  ::cereal::InitData::PandaInfo::Builder InitData::Builder::getPandaInfo() {
-  return ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::get(_builder.getPointerField(
-      ::capnp::bounded<7>() * ::capnp::POINTERS));
-}
-#if !CAPNP_LITE
-inline  ::cereal::InitData::PandaInfo::Pipeline InitData::Pipeline::getPandaInfo() {
-  return  ::cereal::InitData::PandaInfo::Pipeline(_typeless.getPointerField(7));
-}
-#endif  // !CAPNP_LITE
-inline void InitData::Builder::setPandaInfo( ::cereal::InitData::PandaInfo::Reader value) {
-  ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::set(_builder.getPointerField(
-      ::capnp::bounded<7>() * ::capnp::POINTERS), value);
-}
-inline  ::cereal::InitData::PandaInfo::Builder InitData::Builder::initPandaInfo() {
-  return ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::init(_builder.getPointerField(
-      ::capnp::bounded<7>() * ::capnp::POINTERS));
-}
-inline void InitData::Builder::adoptPandaInfo(
-    ::capnp::Orphan< ::cereal::InitData::PandaInfo>&& value) {
-  ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::adopt(_builder.getPointerField(
-      ::capnp::bounded<7>() * ::capnp::POINTERS), kj::mv(value));
-}
-inline ::capnp::Orphan< ::cereal::InitData::PandaInfo> InitData::Builder::disownPandaInfo() {
-  return ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::disown(_builder.getPointerField(
-      ::capnp::bounded<7>() * ::capnp::POINTERS));
-}
-
 inline bool InitData::Reader::getDirty() const {
   return _reader.getDataField<bool>(
       ::capnp::bounded<16>() * ::capnp::ELEMENTS);
@@ -25268,20 +25258,6 @@ inline ::capnp::Orphan< ::capnp::Text> InitData::Builder::disownGitBranch() {
       ::capnp::bounded<9>() * ::capnp::POINTERS));
 }
 
-inline bool InitData::Reader::getPassive() const {
-  return _reader.getDataField<bool>(
-      ::capnp::bounded<17>() * ::capnp::ELEMENTS);
-}
-
-inline bool InitData::Builder::getPassive() {
-  return _builder.getDataField<bool>(
-      ::capnp::bounded<17>() * ::capnp::ELEMENTS);
-}
-inline void InitData::Builder::setPassive(bool value) {
-  _builder.setDataField<bool>(
-      ::capnp::bounded<17>() * ::capnp::ELEMENTS, value);
-}
-
 inline bool InitData::Reader::hasGitRemote() const {
   return !_reader.getPointerField(
       ::capnp::bounded<10>() * ::capnp::POINTERS).isNull();
@@ -25348,45 +25324,6 @@ inline void InitData::Builder::adoptKernelVersion(
 inline ::capnp::Orphan< ::capnp::Text> InitData::Builder::disownKernelVersion() {
   return ::capnp::_::PointerHelpers< ::capnp::Text>::disown(_builder.getPointerField(
       ::capnp::bounded<12>() * ::capnp::POINTERS));
-}
-
-inline bool InitData::Reader::hasAndroidProperties() const {
-  return !_reader.getPointerField(
-      ::capnp::bounded<13>() * ::capnp::POINTERS).isNull();
-}
-inline bool InitData::Builder::hasAndroidProperties() {
-  return !_builder.getPointerField(
-      ::capnp::bounded<13>() * ::capnp::POINTERS).isNull();
-}
-inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Reader InitData::Reader::getAndroidProperties() const {
-  return ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::get(_reader.getPointerField(
-      ::capnp::bounded<13>() * ::capnp::POINTERS));
-}
-inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Builder InitData::Builder::getAndroidProperties() {
-  return ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::get(_builder.getPointerField(
-      ::capnp::bounded<13>() * ::capnp::POINTERS));
-}
-#if !CAPNP_LITE
-inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Pipeline InitData::Pipeline::getAndroidProperties() {
-  return  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Pipeline(_typeless.getPointerField(13));
-}
-#endif  // !CAPNP_LITE
-inline void InitData::Builder::setAndroidProperties( ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Reader value) {
-  ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::set(_builder.getPointerField(
-      ::capnp::bounded<13>() * ::capnp::POINTERS), value);
-}
-inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Builder InitData::Builder::initAndroidProperties() {
-  return ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::init(_builder.getPointerField(
-      ::capnp::bounded<13>() * ::capnp::POINTERS));
-}
-inline void InitData::Builder::adoptAndroidProperties(
-    ::capnp::Orphan< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>&& value) {
-  ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::adopt(_builder.getPointerField(
-      ::capnp::bounded<13>() * ::capnp::POINTERS), kj::mv(value));
-}
-inline ::capnp::Orphan< ::cereal::Map< ::capnp::Text,  ::capnp::Text>> InitData::Builder::disownAndroidProperties() {
-  return ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::disown(_builder.getPointerField(
-      ::capnp::bounded<13>() * ::capnp::POINTERS));
 }
 
 inline bool InitData::Reader::hasParams() const {
@@ -25952,6 +25889,59 @@ inline ::capnp::Orphan< ::cereal::InitData::ChffrAndroidExtra> InitData::Depreca
       ::capnp::bounded<6>() * ::capnp::POINTERS));
 }
 
+inline bool InitData::Deprecated::Reader::hasPandaInfo() const {
+  return !_reader.getPointerField(
+      ::capnp::bounded<7>() * ::capnp::POINTERS).isNull();
+}
+inline bool InitData::Deprecated::Builder::hasPandaInfo() {
+  return !_builder.getPointerField(
+      ::capnp::bounded<7>() * ::capnp::POINTERS).isNull();
+}
+inline  ::cereal::InitData::PandaInfo::Reader InitData::Deprecated::Reader::getPandaInfo() const {
+  return ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::get(_reader.getPointerField(
+      ::capnp::bounded<7>() * ::capnp::POINTERS));
+}
+inline  ::cereal::InitData::PandaInfo::Builder InitData::Deprecated::Builder::getPandaInfo() {
+  return ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::get(_builder.getPointerField(
+      ::capnp::bounded<7>() * ::capnp::POINTERS));
+}
+#if !CAPNP_LITE
+inline  ::cereal::InitData::PandaInfo::Pipeline InitData::Deprecated::Pipeline::getPandaInfo() {
+  return  ::cereal::InitData::PandaInfo::Pipeline(_typeless.getPointerField(7));
+}
+#endif  // !CAPNP_LITE
+inline void InitData::Deprecated::Builder::setPandaInfo( ::cereal::InitData::PandaInfo::Reader value) {
+  ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::set(_builder.getPointerField(
+      ::capnp::bounded<7>() * ::capnp::POINTERS), value);
+}
+inline  ::cereal::InitData::PandaInfo::Builder InitData::Deprecated::Builder::initPandaInfo() {
+  return ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::init(_builder.getPointerField(
+      ::capnp::bounded<7>() * ::capnp::POINTERS));
+}
+inline void InitData::Deprecated::Builder::adoptPandaInfo(
+    ::capnp::Orphan< ::cereal::InitData::PandaInfo>&& value) {
+  ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::adopt(_builder.getPointerField(
+      ::capnp::bounded<7>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::cereal::InitData::PandaInfo> InitData::Deprecated::Builder::disownPandaInfo() {
+  return ::capnp::_::PointerHelpers< ::cereal::InitData::PandaInfo>::disown(_builder.getPointerField(
+      ::capnp::bounded<7>() * ::capnp::POINTERS));
+}
+
+inline bool InitData::Deprecated::Reader::getPassive() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<17>() * ::capnp::ELEMENTS);
+}
+
+inline bool InitData::Deprecated::Builder::getPassive() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<17>() * ::capnp::ELEMENTS);
+}
+inline void InitData::Deprecated::Builder::setPassive(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<17>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool InitData::Deprecated::Reader::hasIosBuildInfo() const {
   return !_reader.getPointerField(
       ::capnp::bounded<11>() * ::capnp::POINTERS).isNull();
@@ -25989,6 +25979,45 @@ inline void InitData::Deprecated::Builder::adoptIosBuildInfo(
 inline ::capnp::Orphan< ::cereal::IosBuildInfo> InitData::Deprecated::Builder::disownIosBuildInfo() {
   return ::capnp::_::PointerHelpers< ::cereal::IosBuildInfo>::disown(_builder.getPointerField(
       ::capnp::bounded<11>() * ::capnp::POINTERS));
+}
+
+inline bool InitData::Deprecated::Reader::hasAndroidProperties() const {
+  return !_reader.getPointerField(
+      ::capnp::bounded<13>() * ::capnp::POINTERS).isNull();
+}
+inline bool InitData::Deprecated::Builder::hasAndroidProperties() {
+  return !_builder.getPointerField(
+      ::capnp::bounded<13>() * ::capnp::POINTERS).isNull();
+}
+inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Reader InitData::Deprecated::Reader::getAndroidProperties() const {
+  return ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::get(_reader.getPointerField(
+      ::capnp::bounded<13>() * ::capnp::POINTERS));
+}
+inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Builder InitData::Deprecated::Builder::getAndroidProperties() {
+  return ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::get(_builder.getPointerField(
+      ::capnp::bounded<13>() * ::capnp::POINTERS));
+}
+#if !CAPNP_LITE
+inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Pipeline InitData::Deprecated::Pipeline::getAndroidProperties() {
+  return  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Pipeline(_typeless.getPointerField(13));
+}
+#endif  // !CAPNP_LITE
+inline void InitData::Deprecated::Builder::setAndroidProperties( ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Reader value) {
+  ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::set(_builder.getPointerField(
+      ::capnp::bounded<13>() * ::capnp::POINTERS), value);
+}
+inline  ::cereal::Map< ::capnp::Text,  ::capnp::Text>::Builder InitData::Deprecated::Builder::initAndroidProperties() {
+  return ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::init(_builder.getPointerField(
+      ::capnp::bounded<13>() * ::capnp::POINTERS));
+}
+inline void InitData::Deprecated::Builder::adoptAndroidProperties(
+    ::capnp::Orphan< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>&& value) {
+  ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::adopt(_builder.getPointerField(
+      ::capnp::bounded<13>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::cereal::Map< ::capnp::Text,  ::capnp::Text>> InitData::Deprecated::Builder::disownAndroidProperties() {
+  return ::capnp::_::PointerHelpers< ::cereal::Map< ::capnp::Text,  ::capnp::Text>>::disown(_builder.getPointerField(
+      ::capnp::bounded<13>() * ::capnp::POINTERS));
 }
 
 inline  ::uint32_t FrameData::Reader::getFrameId() const {
@@ -29535,6 +29564,34 @@ inline void PandaState::Builder::setControlsAllowedLongitudinal(bool value) {
       ::capnp::bounded<482>() * ::capnp::ELEMENTS, value);
 }
 
+inline bool PandaState::Reader::getNmiReset() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<483>() * ::capnp::ELEMENTS);
+}
+
+inline bool PandaState::Builder::getNmiReset() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<483>() * ::capnp::ELEMENTS);
+}
+inline void PandaState::Builder::setNmiReset(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<483>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool PandaState::Reader::getHardfaultReset() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<484>() * ::capnp::ELEMENTS);
+}
+
+inline bool PandaState::Builder::getHardfaultReset() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<484>() * ::capnp::ELEMENTS);
+}
+inline void PandaState::Builder::setHardfaultReset(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<484>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool PandaState::PandaCanState::Reader::getBusOff() const {
   return _reader.getDataField<bool>(
       ::capnp::bounded<0>() * ::capnp::ELEMENTS);
@@ -30128,6 +30185,20 @@ inline void UsbState::Builder::adoptDevices(
 inline ::capnp::Orphan< ::capnp::List< ::cereal::UsbState::Device,  ::capnp::Kind::STRUCT>> UsbState::Builder::disownDevices() {
   return ::capnp::_::PointerHelpers< ::capnp::List< ::cereal::UsbState::Device,  ::capnp::Kind::STRUCT>>::disown(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
+}
+
+inline bool UsbState::Reader::getConnected() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+
+inline bool UsbState::Builder::getConnected() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+inline void UsbState::Builder::setConnected(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
 }
 
 inline  ::uint8_t UsbState::Device::Reader::getBusnum() const {
@@ -31636,6 +31707,7 @@ inline typename SelfdriveState::Deprecated::Pipeline SelfdriveState::Pipeline::g
 }
 #endif  // !CAPNP_LITE
 inline typename SelfdriveState::Deprecated::Builder SelfdriveState::Builder::initDeprecated() {
+  _builder.setDataField<bool>(::capnp::bounded<19>() * ::capnp::ELEMENTS, 0);
   _builder.setDataField< ::uint16_t>(::capnp::bounded<4>() * ::capnp::ELEMENTS, 0);
   return typename SelfdriveState::Deprecated::Builder(_builder);
 }
@@ -31651,20 +31723,6 @@ inline bool SelfdriveState::Builder::getEngageable() {
 inline void SelfdriveState::Builder::setEngageable(bool value) {
   _builder.setDataField<bool>(
       ::capnp::bounded<18>() * ::capnp::ELEMENTS, value);
-}
-
-inline bool SelfdriveState::Reader::getExperimentalMode() const {
-  return _reader.getDataField<bool>(
-      ::capnp::bounded<19>() * ::capnp::ELEMENTS);
-}
-
-inline bool SelfdriveState::Builder::getExperimentalMode() {
-  return _builder.getDataField<bool>(
-      ::capnp::bounded<19>() * ::capnp::ELEMENTS);
-}
-inline void SelfdriveState::Builder::setExperimentalMode(bool value) {
-  _builder.setDataField<bool>(
-      ::capnp::bounded<19>() * ::capnp::ELEMENTS, value);
 }
 
 inline  ::cereal::LongitudinalPersonality SelfdriveState::Reader::getPersonality() const {
@@ -31721,6 +31779,20 @@ inline  ::cereal::CarControl::HUDControl::AudibleAlert SelfdriveState::Deprecate
 inline void SelfdriveState::Deprecated::Builder::setAlertSound( ::cereal::CarControl::HUDControl::AudibleAlert value) {
   _builder.setDataField< ::cereal::CarControl::HUDControl::AudibleAlert>(
       ::capnp::bounded<4>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool SelfdriveState::Deprecated::Reader::getExperimentalMode() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<19>() * ::capnp::ELEMENTS);
+}
+
+inline bool SelfdriveState::Deprecated::Builder::getExperimentalMode() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<19>() * ::capnp::ELEMENTS);
+}
+inline void SelfdriveState::Deprecated::Builder::setExperimentalMode(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<19>() * ::capnp::ELEMENTS, value);
 }
 
 inline typename ControlsState::Deprecated::Reader ControlsState::Reader::getDeprecated() const {
@@ -37059,6 +37131,20 @@ inline bool LongitudinalPlan::Builder::getAllowBrake() {
 inline void LongitudinalPlan::Builder::setAllowBrake(bool value) {
   _builder.setDataField<bool>(
       ::capnp::bounded<14>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlan::Reader::getAccelBoost() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<21>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlan::Builder::getAccelBoost() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<21>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlan::Builder::setAccelBoost(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<21>() * ::capnp::ELEMENTS, value);
 }
 
 inline bool LongitudinalPlan::Deprecated::Reader::getLateralValid() const {
@@ -48468,6 +48554,20 @@ inline void DriverMonitoringState::VisionPolicyState::DistractedTypes::Builder::
       ::capnp::bounded<2>() * ::capnp::ELEMENTS, value);
 }
 
+inline bool DriverMonitoringState::VisionPolicyState::DistractedTypes::Reader::getSleep() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+
+inline bool DriverMonitoringState::VisionPolicyState::DistractedTypes::Builder::getSleep() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+inline void DriverMonitoringState::VisionPolicyState::DistractedTypes::Builder::setSleep(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, value);
+}
+
 inline float DriverMonitoringState::VisionPolicyState::Pose::Reader::getPitch() const {
   return _reader.getDataField<float>(
       ::capnp::bounded<0>() * ::capnp::ELEMENTS);
@@ -56008,109 +56108,109 @@ inline ::capnp::Orphan< ::capnp::List< ::cereal::PandaState,  ::capnp::Kind::STR
       ::capnp::bounded<0>() * ::capnp::POINTERS));
 }
 
-inline bool Event::Reader::isNavInstructionDEPRECATED() const {
-  return which() == Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D;
+inline bool Event::Reader::isNavInstruction() const {
+  return which() == Event::NAV_INSTRUCTION;
 }
-inline bool Event::Builder::isNavInstructionDEPRECATED() {
-  return which() == Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D;
+inline bool Event::Builder::isNavInstruction() {
+  return which() == Event::NAV_INSTRUCTION;
 }
-inline bool Event::Reader::hasNavInstructionDEPRECATED() const {
-  if (which() != Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D) return false;
+inline bool Event::Reader::hasNavInstruction() const {
+  if (which() != Event::NAV_INSTRUCTION) return false;
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
 }
-inline bool Event::Builder::hasNavInstructionDEPRECATED() {
-  if (which() != Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D) return false;
+inline bool Event::Builder::hasNavInstruction() {
+  if (which() != Event::NAV_INSTRUCTION) return false;
   return !_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
 }
-inline  ::cereal::NavInstruction::Reader Event::Reader::getNavInstructionDEPRECATED() const {
-  KJ_IREQUIRE((which() == Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D),
+inline  ::cereal::NavInstruction::Reader Event::Reader::getNavInstruction() const {
+  KJ_IREQUIRE((which() == Event::NAV_INSTRUCTION),
               "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::cereal::NavInstruction>::get(_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
 }
-inline  ::cereal::NavInstruction::Builder Event::Builder::getNavInstructionDEPRECATED() {
-  KJ_IREQUIRE((which() == Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D),
+inline  ::cereal::NavInstruction::Builder Event::Builder::getNavInstruction() {
+  KJ_IREQUIRE((which() == Event::NAV_INSTRUCTION),
               "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::cereal::NavInstruction>::get(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
 }
-inline void Event::Builder::setNavInstructionDEPRECATED( ::cereal::NavInstruction::Reader value) {
+inline void Event::Builder::setNavInstruction( ::cereal::NavInstruction::Reader value) {
   _builder.setDataField<Event::Which>(
-      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D);
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_INSTRUCTION);
   ::capnp::_::PointerHelpers< ::cereal::NavInstruction>::set(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS), value);
 }
-inline  ::cereal::NavInstruction::Builder Event::Builder::initNavInstructionDEPRECATED() {
+inline  ::cereal::NavInstruction::Builder Event::Builder::initNavInstruction() {
   _builder.setDataField<Event::Which>(
-      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D);
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_INSTRUCTION);
   return ::capnp::_::PointerHelpers< ::cereal::NavInstruction>::init(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
 }
-inline void Event::Builder::adoptNavInstructionDEPRECATED(
+inline void Event::Builder::adoptNavInstruction(
     ::capnp::Orphan< ::cereal::NavInstruction>&& value) {
   _builder.setDataField<Event::Which>(
-      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D);
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_INSTRUCTION);
   ::capnp::_::PointerHelpers< ::cereal::NavInstruction>::adopt(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS), kj::mv(value));
 }
-inline ::capnp::Orphan< ::cereal::NavInstruction> Event::Builder::disownNavInstructionDEPRECATED() {
-  KJ_IREQUIRE((which() == Event::NAV_INSTRUCTION_D_E_P_R_E_C_A_T_E_D),
+inline ::capnp::Orphan< ::cereal::NavInstruction> Event::Builder::disownNavInstruction() {
+  KJ_IREQUIRE((which() == Event::NAV_INSTRUCTION),
               "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::cereal::NavInstruction>::disown(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
 }
 
-inline bool Event::Reader::isNavRouteDEPRECATED() const {
-  return which() == Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D;
+inline bool Event::Reader::isNavRoute() const {
+  return which() == Event::NAV_ROUTE;
 }
-inline bool Event::Builder::isNavRouteDEPRECATED() {
-  return which() == Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D;
+inline bool Event::Builder::isNavRoute() {
+  return which() == Event::NAV_ROUTE;
 }
-inline bool Event::Reader::hasNavRouteDEPRECATED() const {
-  if (which() != Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D) return false;
+inline bool Event::Reader::hasNavRoute() const {
+  if (which() != Event::NAV_ROUTE) return false;
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
 }
-inline bool Event::Builder::hasNavRouteDEPRECATED() {
-  if (which() != Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D) return false;
+inline bool Event::Builder::hasNavRoute() {
+  if (which() != Event::NAV_ROUTE) return false;
   return !_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
 }
-inline  ::cereal::NavRoute::Reader Event::Reader::getNavRouteDEPRECATED() const {
-  KJ_IREQUIRE((which() == Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D),
+inline  ::cereal::NavRoute::Reader Event::Reader::getNavRoute() const {
+  KJ_IREQUIRE((which() == Event::NAV_ROUTE),
               "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::cereal::NavRoute>::get(_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
 }
-inline  ::cereal::NavRoute::Builder Event::Builder::getNavRouteDEPRECATED() {
-  KJ_IREQUIRE((which() == Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D),
+inline  ::cereal::NavRoute::Builder Event::Builder::getNavRoute() {
+  KJ_IREQUIRE((which() == Event::NAV_ROUTE),
               "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::cereal::NavRoute>::get(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
 }
-inline void Event::Builder::setNavRouteDEPRECATED( ::cereal::NavRoute::Reader value) {
+inline void Event::Builder::setNavRoute( ::cereal::NavRoute::Reader value) {
   _builder.setDataField<Event::Which>(
-      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D);
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_ROUTE);
   ::capnp::_::PointerHelpers< ::cereal::NavRoute>::set(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS), value);
 }
-inline  ::cereal::NavRoute::Builder Event::Builder::initNavRouteDEPRECATED() {
+inline  ::cereal::NavRoute::Builder Event::Builder::initNavRoute() {
   _builder.setDataField<Event::Which>(
-      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D);
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_ROUTE);
   return ::capnp::_::PointerHelpers< ::cereal::NavRoute>::init(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
 }
-inline void Event::Builder::adoptNavRouteDEPRECATED(
+inline void Event::Builder::adoptNavRoute(
     ::capnp::Orphan< ::cereal::NavRoute>&& value) {
   _builder.setDataField<Event::Which>(
-      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D);
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, Event::NAV_ROUTE);
   ::capnp::_::PointerHelpers< ::cereal::NavRoute>::adopt(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS), kj::mv(value));
 }
-inline ::capnp::Orphan< ::cereal::NavRoute> Event::Builder::disownNavRouteDEPRECATED() {
-  KJ_IREQUIRE((which() == Event::NAV_ROUTE_D_E_P_R_E_C_A_T_E_D),
+inline ::capnp::Orphan< ::cereal::NavRoute> Event::Builder::disownNavRoute() {
+  KJ_IREQUIRE((which() == Event::NAV_ROUTE),
               "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::cereal::NavRoute>::disown(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));

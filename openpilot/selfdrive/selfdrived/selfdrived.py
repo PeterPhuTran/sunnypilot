@@ -30,7 +30,6 @@ from openpilot.common.hardware import HARDWARE
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
-from openpilot.sunnypilot.selfdrive.car.cruise_helpers import CruiseHelper
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
 from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import ButtonStateTracker
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
@@ -65,7 +64,7 @@ IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 BIG_MODEL_WARMUP_SEC = 5.
 
 
-class SelfdriveD(CruiseHelper):
+class SelfdriveD:
   def __init__(self, CP=None, CP_SP=None):
     self.params = Params()
 
@@ -139,8 +138,6 @@ class SelfdriveD(CruiseHelper):
     # cleanup old params
     if not self.CP.alphaLongitudinalAvailable:
       self.params.remove("AlphaLongitudinalEnabled")
-    if not self.CP.openpilotLongitudinalControl:
-      self.params.remove("ExperimentalMode")
 
     self.CS_prev = car.CarState.new_message()
     self.AM = AlertManager()
@@ -157,7 +154,6 @@ class SelfdriveD(CruiseHelper):
     self.events_prev = []
     self.logged_comm_issue = None
     self.not_running_prev = None
-    self.experimental_mode = False
     self.personality = get_sanitize_int_param(
       "LongitudinalPersonality",
       min(log.LongitudinalPersonality.schema.enumerants.values()),
@@ -198,7 +194,6 @@ class SelfdriveD(CruiseHelper):
 
     self.car_events_sp = CarSpecificEventsSP(self.CP, self.CP_SP)
 
-    CruiseHelper.__init__(self, self.CP)
     self.button_state_tracker = ButtonStateTracker()
 
   def _big_model_settling(self) -> bool:
@@ -237,12 +232,16 @@ class SelfdriveD(CruiseHelper):
     # VBSM_GPU_ALERTS: modeld marks the big model active ~2 s before its first
     # frame (it still loads the small model in between), so "active but no
     # modelV2" inside the settling window is the load finishing, not a failure
-    # -- it raised a false "Big Model Failed" banner on 2026-09-13
+    # -- it raised a false "Big Model Failed" banner on 2026-09-13. A failure already
+    # raised stays raised: upstream restarts the settling window on bigModelFailed,
+    # and without this latch the mask cleared the failure and re-raised it every 5 s.
     big_model_settling = self._big_model_settling()
-    model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2'] and not big_model_settling
+    model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2'] and \
+      (self.big_model_failed or not big_model_settling)
     big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
     if big_failed and not self.big_model_failed:
       self.events.add(EventName.bigModelFailed)
+      self.big_model_ready_t = time.monotonic()
     self.big_model_failed = big_failed
 
     # soft disable if the big model fails
@@ -270,7 +269,9 @@ class SelfdriveD(CruiseHelper):
 
     # Check for user bookmark press
     if self.sm.updated['userBookmark']:
-      self.events.add(EventName.userBookmark)
+      prime_type = self.params.get("PrimeType")
+      paired = prime_type is not None and int(prime_type) >= 0
+      self.events.add(EventName.userBookmark if paired else EventName.userBookmarkNotPaired)
 
     # Don't add any more events while in dashcam mode
     if self.CP.passive:
@@ -388,8 +389,10 @@ class SelfdriveD(CruiseHelper):
     self._vbsm_counter += 1
     if self._vbsm_counter % VBSM_CONFIG_INTERVAL == 0:
       # VBSM_HUD: adopt external personality changes (the HUD profile chip and
-      # the settings page write the param, but upstream only reads it at boot
-      # and from the wheel button). Self-written values are a no-op here.
+      # the settings page write the param). Upstream's params_thread adopts them
+      # too, at 10 Hz, so this mostly finds them adopted already and the chip's
+      # own flash is the feedback; the alert fires only when this catches one
+      # first. Self-written values are a no-op here.
       try:
         p = int(self.params.get("LongitudinalPersonality") or 0)
         if 0 <= p <= 2 and p != self.personality:
@@ -400,6 +403,8 @@ class SelfdriveD(CruiseHelper):
       try:
         with open(VBSM_CONFIG) as f:
           config = json.load(f)
+        if not isinstance(config, dict):   # VBSM_CONFIG: valid JSON that is not an object reads as the defaults
+          raise ValueError("vision_bsm.json is not an object")
         # VBSM_HUD: "chime" is the master switch for the blind spot chime;
         # "chime_always" is its sub-option (fire on entry, not just on signal).
         # Absent means on, matching the settings toggle's default.
@@ -543,7 +548,9 @@ class SelfdriveD(CruiseHelper):
       held = not dm.posenetOK or not dm.inputsOK or \
         (not self.sm['vehicleParameters'].valid and cal_status == log.ExtrinsicsCalibration.Status.calibrated and
          not TESTING_CLOSET and (not SIMULATION or REPLAY))
-      if not self.sm.all_checks() or (not self.CP.notCar and held):
+      # upstream's modeldLagging mask (below) lifts on engagement too, so a lagging model blocks the engage here
+      lagging = self.sm['modelV2'].frameDropPerc > 1 and (not SIMULATION or REPLAY)
+      if not self.sm.all_checks() or (not self.CP.notCar and held) or lagging:
         self.events.add(EventName.bigModelLoading)
 
     # conservative HW alert. if the data or frequency are off, locationd will throw an error
@@ -590,28 +597,19 @@ class SelfdriveD(CruiseHelper):
 
     # TODO: fix simulator
     if not SIMULATION or REPLAY:
-      if self.sm['modelV2'].frameDropPerc > 1:
+      if self.sm['modelV2'].frameDropPerc > 1 and not big_model_settling:
         self.events.add(EventName.modeldLagging)
 
     # mute canBusMissing event if in Park, as it sometimes may trigger a false alarm with MADS in Paused state
     if CS.gearShifter == car.CarState.GearShifter.park and self.mads.enabled:
       self.events.remove(EventName.canBusMissing)
 
-    CruiseHelper.update(self, CS, self.events_sp, self.experimental_mode)
-
-    # decrement personality on distance button press
+    # Decrement personality on distance button press
     if self.CP.openpilotLongitudinalControl:
       if any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents):
-        if not self.experimental_mode_switched:
-          self.personality = (self.personality - 1) % 3
-          self.params.put('LongitudinalPersonality', self.personality)
-          self.events.add(EventName.personalityChanged)
-        self.experimental_mode_switched = False
-
-      # VBSM_EXP_TOGGLE: the LKAS wheel button used to toggle experimental vs
-      # stock mode here. Since 2026-09-08 it does its stock MADS duty again
-      # (mads.py, VBSM_LKAS_REPURPOSED = False); experimental switching is the
-      # upstream distance-button hold above (CruiseHelper, 0.5 s).
+        self.personality = (self.personality - 1) % 3
+        self.params.put('LongitudinalPersonality', self.personality)
+        self.events.add(EventName.personalityChanged)
 
     self.icbm.run(CS, self.sm['carControl'], self.sm['longitudinalPlanSP'], self.is_metric)
 
@@ -666,7 +664,7 @@ class SelfdriveD(CruiseHelper):
     clear_event_types = set()
     if ET.WARNING not in self.state_machine.current_alert_types:
       clear_event_types.add(ET.WARNING)
-    if self.enabled:
+    if self.enabled or (ET.NO_ENTRY not in (c := self.state_machine.current_alert_types) and (ET.ENABLE in c or ET.USER_DISABLE in c)):
       clear_event_types.add(ET.NO_ENTRY)
 
     pers = LONGITUDINAL_PERSONALITY_MAP[self.personality]
@@ -688,7 +686,6 @@ class SelfdriveD(CruiseHelper):
     ss.active = self.active
     ss.state = self.state_machine.state
     ss.engageable = not self.events.contains(ET.NO_ENTRY)
-    ss.experimentalMode = self.experimental_mode
     ss.personality = self.personality
 
     ss.alertText1 = self.AM.current_alert.alert_text_1
@@ -755,7 +752,6 @@ class SelfdriveD(CruiseHelper):
       self.is_metric = self.params.get_bool("IsMetric")
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
-      self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
       self.personality = self.params.get("LongitudinalPersonality", return_default=True)
 
       self.mads.read_params()

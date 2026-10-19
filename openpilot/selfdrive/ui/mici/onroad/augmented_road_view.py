@@ -3,18 +3,20 @@ import pyray as rl
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.cereal.visionipc import VisionStreamType
-from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus, ChestnutState
+from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.mici.onroad import SIDE_PANEL_WIDTH
 from openpilot.selfdrive.ui.mici.onroad.alert_renderer import Alert, AlertRenderer
 from openpilot.selfdrive.ui.mici.onroad.driver_state import DriverStateRenderer
-from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer, GPU_KICK_REQUEST_FILE, CHESTNUT_HOLD_REBOOT_S
+from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer
+from openpilot.selfdrive.ui.mici.onroad.long_indicator import LongIndicator
 from openpilot.selfdrive.ui.mici.onroad.model_renderer import ModelRenderer
+from openpilot.selfdrive.ui.mici.onroad.navigation import NavigationPanel, PANEL_WIDTH
 from openpilot.selfdrive.ui.mici.onroad.confidence_ball import ConfidenceBall
 from openpilot.selfdrive.ui.mici.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import FontWeight, gui_app, MousePos, MouseEvent, TextAlignment, TextAlignmentVertical
 from openpilot.system.ui.widgets.label import UnifiedLabel
 from openpilot.system.ui.widgets import Widget
-from openpilot.common.filter_simple import BounceFilter
+from openpilot.common.filter_simple import BounceFilter, FirstOrderFilter
 from openpilot.common.swaglog import cloudlog
 import json
 import os
@@ -46,42 +48,10 @@ class BookmarkState(IntEnum):
   DRAGGING = 1
   TRIGGERED = 2
 
-WIDE_CAM_MAX_SPEED = 5.0  # m/s (10 mph)
-ROAD_CAM_MIN_SPEED = 10  # m/s (25 mph)
+WIDE_CAM_MAX_SPEED = 5.0  # m/s (11 mph)
+ROAD_CAM_MIN_SPEED = 10.0  # m/s (22 mph)
 
 CAM_Y_OFFSET = 20
-
-
-def chestnut_touch_action(hud, pos, hold_s: float, moved_px: float) -> str:
-  """VBSM_GPU_HUD_TAP: decide and perform the chestnut-icon gesture. Returns what was done: 'reboot' (held
-  CHESTNUT_HOLD_REBOOT_S on the icon in any state), 'request' / 'cancel' (tap on the orange icon toggles
-  ui_watchdog's retry marker), or '' (not on the icon, a swipe, or a tap on a non-failed icon). Never raises:
-  an exception in a touch handler takes the whole UI down."""
-  try:
-    if hud is None or moved_px >= 20:
-      return ''
-    rect = hud.chestnut_icon_rect
-    if rect.width <= 0 or not rl.check_collision_point_rec(pos, rect):
-      return ''
-    if hold_s >= CHESTNUT_HOLD_REBOOT_S:
-      cloudlog.warning(f"VBSM_GPU_HUD_TAP: reboot requested from the HUD (held {hold_s:.1f}s, chestnut {ui_state.chestnut_state.name})")
-      ui_state.params.put_bool("DoReboot", True)
-      return 'reboot'
-    if ui_state.chestnut_state not in (ChestnutState.UNCOMPILED, ChestnutState.FAILED):
-      return ''
-    if os.path.exists(GPU_KICK_REQUEST_FILE):
-      os.remove(GPU_KICK_REQUEST_FILE)
-      cloudlog.warning("VBSM_GPU_HUD_TAP: eGPU retry request cancelled from the HUD")
-      hud.chestnut_requested = False
-      return 'cancel'
-    with open(GPU_KICK_REQUEST_FILE, 'w') as f:
-      f.write(f"hud {int(time.time())}")
-    cloudlog.warning("VBSM_GPU_HUD_TAP: eGPU retry requested from the HUD; ui_watchdog kicks at the next disengaged standstill")
-    hud.chestnut_requested = True
-    return 'request'
-  except Exception:
-    cloudlog.exception("VBSM_GPU_HUD_TAP: chestnut touch handler failed")
-    return ''
 
 
 def open_restart_prompt() -> None:
@@ -89,7 +59,7 @@ def open_restart_prompt() -> None:
   disengaged, "Disengage to reboot" when engaged, with the same DoReboot action). Imported on use, so a rename
   upstream only disables the gesture (logged) and never stops the UI from starting."""
   try:
-    from openpilot.selfdrive.ui.mici.layouts.settings.device import _engaged_confirmation_click
+    from openpilot.selfdrive.ui.mici.layouts.settings.device.device_layout import _engaged_confirmation_click
     _engaged_confirmation_click(lambda: ui_state.params.put_bool("DoReboot", True, block=True), "reboot",
                                 gui_app.texture("icons_mici/settings/device/reboot.png", 64, 70), exit_on_confirm=False)
     cloudlog.warning("VBSM_HOLD_RESTART: restart prompt opened from the road view")
@@ -98,7 +68,7 @@ def open_restart_prompt() -> None:
 
 
 class BookmarkIcon(Widget):
-  PEEK_THRESHOLD = 50  # If icon peeks out this much, snap it fully visible
+  PEEK_THRESHOLD = 150 # If icon peeks out this much, snap it fully visible
   FULL_VISIBLE_OFFSET = 200  # How far onscreen when fully visible
   HIDDEN_OFFSET = -50  # How far offscreen when hidden
 
@@ -106,7 +76,9 @@ class BookmarkIcon(Widget):
     super().__init__()
     self._bookmark_callback = bookmark_callback
     self._icon = gui_app.texture("icons_mici/onroad/bookmark.png", 180, 180)
+    self._filled_icon = gui_app.texture("icons_mici/onroad/bookmark_fill.png", 180, 180)
     self._offset_filter = BounceFilter(0.0, 0.1, 1 / gui_app.target_fps)
+    self._active_alpha = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
 
     # State
     self._interacting = False
@@ -116,13 +88,15 @@ class BookmarkIcon(Widget):
     self._is_swiping = False
     self._is_swiping_left: bool = False
     self._triggered_time: float = 0.0
-    self._press_time: float = 0.0      # VBSM_GPU_HUD_TAP: hold duration for the reboot gesture
-    # VBSM_HOLD_RESTART: whether this touch opened the restart prompt, started on the chestnut icon (which owns its
-    # own hold), and how far it has moved from where it started
+    self._triggered_duration = 1.5
+    self._swipe_expired = False
+    # VBSM_HOLD_RESTART: when this touch started, whether it opened the restart prompt, and how far it has moved
+    # from where it started
+    self._press_time: float = 0.0
     self._hold_fired = False
-    self._hold_on_chestnut = False
     self._hold_start_y = 0.0
     self._hold_moved_px = 0.0
+    self._last_update_t = 0.0
 
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""
@@ -137,32 +111,54 @@ class BookmarkIcon(Widget):
     """VBSM_HOLD_RESTART: the current touch opened the restart prompt; its release must not act as a tap."""
     return self._hold_fired
 
+  def _parent_touch_ok(self) -> bool:
+    """VBSM_HOLD_RESTART / VBSM_HUD: a widget pushed over the road view (the restart prompt itself) turns the road
+    view's touches off but not this icon's, so the gestures that act (prompt, profile chip) check the road view."""
+    cb = getattr(self, "parent_touch_valid", None)
+    return cb is None or bool(cb())
+
   def _update_state(self):
+    # VBSM_HOLD_RESTART: this icon sees touches only while the road view draws it (onroad and on screen). A touch
+    # whose release came while it was not drawn (car turned off, view scrolled away) is over, not a 3 s hold.
+    now = rl.get_time()
+    if now - self._last_update_t > 0.5 and self._press_time <= self._last_update_t:
+      self._is_swiping = False
+      self._is_swiping_left = False
+      if self._state == BookmarkState.DRAGGING:
+        self._state = BookmarkState.HIDDEN
+    self._last_update_t = now
+    if self._is_swiping and not self._parent_touch_ok():
+      self._hold_moved_px = HOLD_RESTART_SLOP_PX + 1  # a touch made over a pushed widget, or a scroll, is never a hold
+
     # VBSM_HOLD_RESTART: a finger held still for HOLD_RESTART_S opens the restart prompt. The prompt takes over the
     # touch, so this view may never see the release: end the swipe here, and mark the touch so nothing else acts on it
-    if (ui_state.started and self._is_swiping and not self._hold_fired and not self._hold_on_chestnut and
-        self._hold_moved_px <= HOLD_RESTART_SLOP_PX and rl.get_time() - self._press_time >= HOLD_RESTART_S):
+    if (ui_state.started and self._is_swiping and not self._hold_fired and self._parent_touch_ok() and
+        self._hold_moved_px <= HOLD_RESTART_SLOP_PX and now - self._press_time >= HOLD_RESTART_S):
       self._hold_fired = True
       self._is_swiping = False
       self._is_swiping_left = False
       self._state = BookmarkState.HIDDEN
-      hud = getattr(self, "hud_renderer", None)
-      if hud is not None:
-        hud.chestnut_hold_since = None
       open_restart_prompt()
 
+    if self._state == BookmarkState.TRIGGERED and rl.get_time() - self._triggered_time >= self._triggered_duration:
+      self._state = BookmarkState.HIDDEN
+      self._swipe_expired = self._is_swiping
+
+    swipe_offset = self._swipe_start_x - self._swipe_current_x
+    armed = self._state == BookmarkState.DRAGGING and swipe_offset > self.PEEK_THRESHOLD
     if self._state == BookmarkState.DRAGGING:
-      # Allow pulling past activated position with rubber band effect
-      swipe_offset = self._swipe_start_x - self._swipe_current_x
+      # Snap to the released position when armed, while allowing further dragging or cancellation.
+      if armed:
+        swipe_offset += self.FULL_VISIBLE_OFFSET - self.PEEK_THRESHOLD
       swipe_offset = min(swipe_offset, self.FULL_VISIBLE_OFFSET + 50)
       self._offset_filter.update(swipe_offset)
 
     elif self._state == BookmarkState.TRIGGERED:
-      # Continue animating to fully visible
-      self._offset_filter.update(self.FULL_VISIBLE_OFFSET)
-      # Stay in TRIGGERED state for 1 second
-      if rl.get_time() - self._triggered_time >= 1.5:
-        self._state = BookmarkState.HIDDEN
+      # Let another left swipe move the same bookmark.
+      offset = self.FULL_VISIBLE_OFFSET
+      if self._is_swiping and self._is_swiping_left:
+        offset += min(swipe_offset, 50)
+      self._offset_filter.update(offset)
 
     elif self._state == BookmarkState.HIDDEN:
       self._offset_filter.update(self.HIDDEN_OFFSET)
@@ -170,27 +166,27 @@ class BookmarkIcon(Widget):
       if self._offset_filter.x < 1e-3:
         self._interacting = False
 
+    self._active_alpha.update(float(armed or self._state == BookmarkState.TRIGGERED))
+
   def _handle_mouse_event(self, mouse_event: MouseEvent):
     if not ui_state.started:
       return
 
     if mouse_event.left_pressed:
+      if self._state == BookmarkState.TRIGGERED:
+        self._triggered_time = rl.get_time()
+        self._triggered_duration = 0.5
+
       # Store relative position within widget
       self._swipe_start_x = mouse_event.pos.x
       self._swipe_current_x = mouse_event.pos.x
       self._is_swiping = True
       self._is_swiping_left = False
-      self._state = BookmarkState.DRAGGING
-      # VBSM_GPU_HUD_TAP: start the hold clock; the HUD grows the icon while a finger rests on it
-      self._press_time = rl.get_time()
-      hud = getattr(self, "hud_renderer", None)
-      self._hold_fired = False   # VBSM_HOLD_RESTART: every touch decides afresh
-      self._hold_on_chestnut = False
+      self._swipe_expired = False
+      self._press_time = rl.get_time()   # VBSM_HOLD_RESTART: every touch decides afresh
+      self._hold_fired = False
       self._hold_start_y = mouse_event.pos.y
       self._hold_moved_px = 0.0
-      if hud is not None and hud.chestnut_icon_rect.width > 0 and rl.check_collision_point_rec(mouse_event.pos, hud.chestnut_icon_rect):
-        hud.chestnut_hold_since = self._press_time
-        self._hold_on_chestnut = True
 
     elif mouse_event.left_down and self._is_swiping:
       self._swipe_current_x = mouse_event.pos.x
@@ -200,10 +196,15 @@ class BookmarkIcon(Widget):
       self._is_swiping_left = swipe_offset > 0
       if self._is_swiping_left:
         self._interacting = True
+        if self._state == BookmarkState.HIDDEN and not self._swipe_expired:
+          self._state = BookmarkState.DRAGGING
 
     elif mouse_event.left_released and self._hold_fired:
-      # VBSM_HOLD_RESTART: this touch already opened the restart prompt; its release does nothing else
-      self._hold_fired = False
+      # VBSM_HOLD_RESTART: this touch already opened the restart prompt; its release does nothing else. The flag
+      # stays set until the next press: the parent's _handle_mouse_release reads it after this handler has run
+      # (Widget.render() runs _render(), which renders this icon, before the parent's _process_mouse_events()).
+      self._is_swiping = False
+      self._is_swiping_left = False
 
     elif mouse_event.left_released:
       # VBSM_HUD: a tap (no meaningful swipe) on the profile chip cycles the
@@ -214,38 +215,36 @@ class BookmarkIcon(Widget):
       # self._hud_renderer here crashed the whole UI on any tap: BookmarkIcon
       # never had that attribute.)
       hud = getattr(self, "hud_renderer", None)
-      # VBSM_GPU_HUD_TAP: tap / hold on the chestnut icon (see chestnut_touch_action)
-      if hud is not None:
-        hud.chestnut_hold_since = None
-        if self._is_swiping:
-          chestnut_touch_action(hud, mouse_event.pos, rl.get_time() - self._press_time, abs(self._swipe_start_x - self._swipe_current_x))
-      if hud is not None and self._is_swiping and abs(self._swipe_start_x - self._swipe_current_x) < 20:
+      if hud is not None and self._is_swiping and abs(self._swipe_start_x - self._swipe_current_x) < 20 and self._parent_touch_ok():
         chip = hud.profile_chip_rect
         if chip.width > 0 and rl.check_collision_point_rec(mouse_event.pos, chip):
           cur = int(ui_state.sm['selfdriveState'].personality.raw)
           ui_state.params.put("LongitudinalPersonality", (cur - 1) % 3)
-      if self._is_swiping:
+          self._interacting = True  # the parent's click (scroll to home) must not fire for a chip tap
+      if self._is_swiping and self._state == BookmarkState.DRAGGING:
         swipe_distance = self._swipe_start_x - self._swipe_current_x
 
         # If peeking past threshold, transition to animating to fully visible and bookmark
         if swipe_distance > self.PEEK_THRESHOLD:
           self._state = BookmarkState.TRIGGERED
           self._triggered_time = rl.get_time()
+          self._triggered_duration = 1.5
           self._bookmark_callback()
         else:
           # Otherwise, transition back to hidden
           self._state = BookmarkState.HIDDEN
 
-        # Reset swipe state
-        self._is_swiping = False
-        self._is_swiping_left = False
+      # Reset swipe state
+      self._is_swiping = False
+      self._is_swiping_left = False
 
   def _render(self, _):
     """Render the bookmark icon."""
     if self._offset_filter.x > 0:
       icon_x = self.rect.x + self.rect.width - round(self._offset_filter.x)
       icon_y = self.rect.y + (self.rect.height - self._icon.height) / 2  # Vertically centered
-      rl.draw_texture_ex(self._icon, rl.Vector2(icon_x, icon_y), 0.0, 1.0, rl.WHITE)
+      for icon, alpha in ((self._icon, 1.0 - self._active_alpha.x), (self._filled_icon, self._active_alpha.x)):
+        rl.draw_texture_ex(icon, rl.Vector2(icon_x, icon_y), 0.0, 1.0, rl.Color(255, 255, 255, round(255 * alpha)))
 
 
 class ReverseAlertRenderer(AlertRenderer):
@@ -293,11 +292,14 @@ class AugmentedRoadView(CameraView):
     # Bookmark icon with swipe gesture
     self._bookmark_icon = BookmarkIcon(bookmark_callback)
 
+    self._navigation = NavigationPanel()
     self._model_renderer = ModelRenderer()
     self._hud_renderer = HudRenderer()
     # VBSM_HUD: the profile-chip tap target lives in BookmarkIcon's touch
     # handler (the only receiver of road-view touches); give it the renderer
     self._bookmark_icon.hud_renderer = self._hud_renderer
+    self._bookmark_icon.parent_touch_valid = lambda: self.enabled and self._touch_valid()
+    self._long_indicator = LongIndicator()
     self._alert_renderer = ReverseAlertRenderer()
     self._driver_state_renderer = DriverStateRenderer()
     self._confidence_ball = ConfidenceBall()
@@ -341,11 +343,14 @@ class AugmentedRoadView(CameraView):
     try:
       with open(BSM_CONFIG_PATH) as f:
         config = json.load(f)
+      if not isinstance(config, dict):
+        raise ValueError("vision_bsm.json is not an object")
       # VBSM_HUD: the window view needs only camera_view + zones. `enabled`
       # gates the detector (model, chevrons, chime, icons); with it off the
       # view is a plain mirror of the signalled side and no CPU goes to the model.
       self._bsm_enabled = bool(config.get("camera_view"))
-      self._bsm_zones = config.get("zones", {}) if self._bsm_enabled else {}
+      zones = config.get("zones", {}) if self._bsm_enabled else {}
+      self._bsm_zones = zones if isinstance(zones, dict) else {}
       self._reverse_view = bool(config.get("reverse_view", True))
     except (OSError, ValueError):
       self._bsm_enabled = False
@@ -355,9 +360,10 @@ class AugmentedRoadView(CameraView):
   def _bsm_bounds(self, side: str) -> tuple[float, float, float, float] | None:
     """Bounding box of a side's calibrated polygons, as (x, y, w, h) in 0..1."""
     xs, ys = [], []
-    for polygon in self._bsm_zones.get(side, []):
-      for point in polygon:
-        if len(point) == 2:
+    polygons = self._bsm_zones.get(side, [])
+    for polygon in polygons if isinstance(polygons, list) else []:
+      for point in polygon if isinstance(polygon, list) else []:
+        if isinstance(point, list) and len(point) == 2 and all(isinstance(v, (int, float)) for v in point):
           xs.append(float(point[0]))
           ys.append(float(point[1]))
     if not xs:
@@ -444,11 +450,14 @@ class AugmentedRoadView(CameraView):
     # Update calibration before rendering
     self._update_calibration()
 
+    alert_to_render, not_animating_out = self._alert_renderer.will_render()
+    show_navigation = ui_state.navigation_enabled and ui_state.nav_destination_set and alert_to_render is None
+
     # Create inner content area with border padding
     self._content_rect = rl.Rectangle(
       self.rect.x,
       self.rect.y,
-      self.rect.width - SIDE_PANEL_WIDTH,
+      self.rect.width - (PANEL_WIDTH if show_navigation else SIDE_PANEL_WIDTH),
       self.rect.height,
     )
 
@@ -472,8 +481,6 @@ class AugmentedRoadView(CameraView):
     # Fade out bottom of overlays for looks
     rl.draw_texture_ex(self._fade_texture, rl.Vector2(self._content_rect.x, self._content_rect.y), 0.0, 1.0, rl.WHITE)
 
-    alert_to_render, not_animating_out = self._alert_renderer.will_render()
-
     # VBSM_HUD: the dmoji lives in the bottom-right eGPU slot now -- it shows
     # once the chestnut status icon has faded (the persistent set-speed owns its
     # old top-left slot, which kept it hidden whenever engaged). Hidden when
@@ -486,6 +493,8 @@ class AugmentedRoadView(CameraView):
       self._content_rect.x + self._content_rect.width - 10 - dm_size,
       self._content_rect.y + self._content_rect.height - 14 - (50 + dm_size) / 2)  # 50 = wheel row height, same math as the eGPU icon
     self._driver_state_renderer.render()
+    self._long_indicator.set_should_draw(not self._hud_renderer.drawing_top_icons())
+    self._long_indicator.render(self._content_rect)
 
     self._hud_renderer.set_can_draw_top_icons(alert_to_render is None)
     self._hud_renderer.set_wheel_critical_icon(alert_to_render is not None and not not_animating_out and
@@ -501,9 +510,16 @@ class AugmentedRoadView(CameraView):
 
     # Custom UI extension point - add custom overlays here
     # Use self._content_rect for positioning within camera bounds
-    self._confidence_ball.render(self.rect)
+    if show_navigation:
+      self._navigation.render(rl.Rectangle(self._content_rect.x + self._content_rect.width, self.rect.y, PANEL_WIDTH, self.rect.height))
+    else:
+      self._confidence_ball.render(self.rect)
 
     self._bookmark_icon.render(self.rect)
+
+  def close(self):
+    self._navigation.close()
+    super().close()
 
   def _cancel_pending_switch(self):
     """Abandon an in-flight stream switch.
@@ -533,7 +549,7 @@ class AugmentedRoadView(CameraView):
       target = DRIVER_CAM  # VBSM_REVERSE_CAM
     elif self._bsm_zone is not None and DRIVER_CAM in self.available_streams:
       target = DRIVER_CAM
-    elif sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
+    elif sm['carParams'].openpilotLongitudinalControl and WIDE_CAM in self.available_streams:
       v_ego = sm['carState'].vEgo
       if v_ego < WIDE_CAM_MAX_SPEED:
         target = WIDE_CAM
@@ -543,7 +559,8 @@ class AugmentedRoadView(CameraView):
         # Hysteresis zone - keep whatever we are showing or heading to, but
         # only ever a road-facing stream. Holding "current" unconditionally
         # latched the DRIVER view here: end a turn signal at 11-22 mph - the
-        # normal speed coming out of a street turn, with experimental mode on -
+        # normal speed coming out of a street turn, with the wide camera in
+        # play (then experimental mode, now any openpilot-longitudinal car) -
         # and the blind spot preview stayed on screen until speed left the
         # band. Measured on the 2026-08-10 drive: experimental active 100% of
         # the time, so every turn ending in the band latched.

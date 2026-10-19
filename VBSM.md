@@ -80,7 +80,7 @@ Managed files:
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | settings UI |
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | cabin-camera preview while signalling |
 | `openpilot/system/athena/athenad.py` | privacy guards (`VBSM_PRIVACY`) |
-| `openpilot/sunnypilot/modeld_v2/modeld.py` | temporary upstream compatibility fix (`VBSM_COMPAT`) |
+| `openpilot/sunnypilot/modeld_v2/modeld.py` | eGPU integration (MODS.md §4); no BSM code (`VBSM_COMPAT` retired) |
 
 ## Measured dead ends
 
