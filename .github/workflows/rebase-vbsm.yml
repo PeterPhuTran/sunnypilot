@@ -138,6 +138,14 @@ jobs:
           check VBSM_SETTLE_GATE openpilot/selfdrive/selfdrived/selfdrived.py
           check VBSM_GPU_COLDWAIT openpilot/sunnypilot/modeld_v2/modeld.py
           check VBSM_GPU_COLDWAIT openpilot/sunnypilot/ui_watchdog.py
+          check VBSM_GPU_12V_GRACE openpilot/sunnypilot/modeld_v2/modeld.py
+          check VBSM_REVERSE_CAM openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
+          check VBSM_REVERSE_CAM openpilot/selfdrive/ui/mici/layouts/settings/toggles.py
+          check ReverseAlertRenderer openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
+          check VBSM_HOLD_RESTART openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py
+          # the hold-to-restart gesture opens upstream's own settings prompt; a rename there would only disable
+          # the gesture silently (it is imported when the gesture fires), so stop the port instead
+          check "def _engaged_confirmation_click" openpilot/selfdrive/ui/mici/layouts/settings/device.py
           # a lost restart policy is silent until something dies mid-drive, so
           # assert the call sites too, not just the marker comment
           test "$(git cat-file blob "$C:openpilot/system/manager/process.py" \
