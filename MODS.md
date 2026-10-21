@@ -664,14 +664,23 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   view for 3 s (`HOLD_RESTART_S`) and the restart prompt of Settings > Device > reboot opens, unchanged: "slide to
   reboot" when disengaged, "Disengage to reboot" when engaged, the same `DoReboot` action, and the same exits
   (swipe down from the top to go back; the nav stack also closes it when the car leaves standstill).
-- **Rules**: a touch that moves more than 20 px (`HOLD_RESTART_SLOP_PX`) is a swipe, not a hold; a hold on the chestnut
+- **Rules**: a touch that stays within 20 px (`HOLD_RESTART_SLOP_PX`) for 0.5 s (`HOLD_RESTART_LOCK_S`) locks as a
+  hold. From then on the main scroller ignores it (`AugmentedRoadView.is_swiping_left()` also answers True while a
+  locked hold is down: the hook `main.py` already uses to stop scrolling during a bookmark swipe), it is no bookmark
+  swipe and no tap, it may drift up to 60 px (`HOLD_RESTART_LOCKED_SLOP_PX`), and a ring on the other half of the view
+  fills up to the prompt (it vanishes the moment the hold cancels). Before the lock existed (2026-10-20), a drift of more
+  than 12 px to the right became the main scroller's drag and a drift of more than 20 px any way ended the hold, with
+  nothing on screen: a finger resting for 3 s in a moving car drifts that far, so the gesture felt unreliable (the
+  headless sim missed the prompt in 5 of 6 drift paths), and the release of a failed hold went to home. A hold let go
+  early or moved past 60 px now does nothing on release and logs `VBSM_HOLD_RESTART: hold ended without the prompt
+  after <s> s, moved <px> px: <why>` (released / moved / covered or scrolled / view not drawn). A hold on the chestnut
   icon opens the prompt like anywhere else (its own tap/hold gestures were retired 2026-10-19); the release of a hold
-  that opened the prompt does nothing else (no personality cycle, no bookmark, no tap-to-home: the flag stays set until
+  that opened the prompt does nothing else (no personality cycle, no bookmark, no tap-to-home: the flags stay set until
   the next press, because the parent view handles a frame's events after this icon); the prompt opens once per touch.
   Only a touch the road view itself owns counts: one made over a pushed widget (the prompt itself) or one the main
-  scroller has taken (a drag of more than 12 px to the right) is never a hold, and a touch whose release was missed
-  while the view was not drawn (car off, view scrolled away; a gap of more than 0.5 s) is dropped instead of opening
-  the prompt at the next drive.
+  scroller took before the lock (a drag of more than 12 px to the right in the first 0.5 s) is never a hold, and a touch
+  whose release was missed while the view was not drawn (car off, view scrolled away; a gap of more than 0.5 s) is
+  dropped instead of opening the prompt at the next drive.
 - **Why**: Settings > Device > reboot takes several taps and a scroll while the car is on.
 - **Coupling**: the prompt is upstream's `_engaged_confirmation_click` in `layouts/settings/device/device_layout.py`
   (upstream turned `layouts/settings/device.py` into a package on 2026-10-18), imported when the gesture fires. A
@@ -679,7 +688,9 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   checks the function's signature there and the import line in `augmented_road_view.py`.
 - **Tested**: `pending/port-2026-10-19/notes/integrated/tests/test_hold_restart_order.py` replays touches through the real handlers
   in the real event order (the child icon before the parent view; prompt pushed over the view, offroad gap), 10 cases, and
-  `test_hold_restart_dm.py` (13 cases: upstream's new bookmark state, 150 px swipe threshold). End to end:
+  `test_hold_restart_dm.py` (13 cases: upstream's new bookmark state, 150 px swipe threshold). The 2026-10-20 lock:
+  `pending/hold-drift-2026-10-20/tests/` (the two replays updated for the lock, 10 + 18 cases, and `test_hold_drift.py`,
+  14 cases on the real main scroller: six drift paths, early release, a big move, tap, swipes, bookmark). End to end:
   `pending/port-2026-10-19/notes/review-ui.d/` (`setup_sim.sh`, then `test_ui_sim.py` / `test_ui_findings.py`) boots
   the real mici UI headless. The old `pending/hold-restart/test_hold_restart.py` fails on upstream's new bookmark
   (`_active_alpha`).
