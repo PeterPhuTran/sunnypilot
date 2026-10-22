@@ -37,7 +37,10 @@ DRIVER_CAM = VisionStreamType.VISION_STREAM_CABIN
 BSM_PARAM_INTERVAL = 2.0  # seconds between blind spot camera config checks
 REVERSE_ALERT_S = 5.0  # VBSM_REVERSE_CAM: how long the full-size "Reverse" alert may cover the cabin view
 HOLD_RESTART_S = 3.0  # VBSM_HOLD_RESTART: hold a finger still on the road view this long for the restart prompt
-HOLD_RESTART_SLOP_PX = 20  # farther than this and the touch is a swipe, not a hold (the profile-chip tap tolerance)
+HOLD_RESTART_SLOP_PX = 20  # farther than this before the lock and the touch is a swipe, not a hold (the profile-chip tap tolerance)
+HOLD_RESTART_LOCK_S = 0.5  # still this long: the touch locks as a hold (no scroll, no bookmark, no tap) and shows its progress ring
+HOLD_RESTART_LOCKED_SLOP_PX = 60  # a locked hold may drift this far (a finger resting through 3 s of road bumps) before it cancels
+HOLD_RING_R = 46  # progress ring radius, px
 BSM_CONFIG_PATH = "/data/vision_bsm.json"
 BSM_STATE_PATH = "/dev/shm/vision_bsm_state"  # written by vision_bsm; the night notice that read it was retired with the model (VBSM_HUD)
 DEFAULT_DEVICE_CAMERA = DEVICE_CAMERAS["tici", "ar0231"]
@@ -97,6 +100,12 @@ class BookmarkIcon(Widget):
     self._hold_start_y = 0.0
     self._hold_moved_px = 0.0
     self._last_update_t = 0.0
+    # VBSM_HOLD_RESTART: the touch stayed still for HOLD_RESTART_LOCK_S (kept until the next press, like _hold_fired),
+    # and whether this touch's end was logged
+    self._hold_locked = False
+    self._hold_end_logged = False
+    self._hold_icon = None
+    self._hold_icon_tried = False
 
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""
@@ -111,6 +120,29 @@ class BookmarkIcon(Widget):
     """VBSM_HOLD_RESTART: the current touch opened the restart prompt; its release must not act as a tap."""
     return self._hold_fired
 
+  @property
+  def hold_locked(self) -> bool:
+    """VBSM_HOLD_RESTART: the current touch is a hold (still for HOLD_RESTART_LOCK_S): the main scroller must not
+    scroll it and its release is not a tap."""
+    return self._hold_locked
+
+  @property
+  def hold_down(self) -> bool:
+    """VBSM_HOLD_RESTART: a locked hold's finger is still on the screen."""
+    return self._hold_locked and self._is_swiping
+
+  def _hold_active(self) -> bool:
+    """VBSM_HOLD_RESTART: a locked hold that is still counting toward the restart prompt."""
+    return (self._hold_locked and self._is_swiping and not self._hold_fired and
+            self._hold_moved_px <= HOLD_RESTART_LOCKED_SLOP_PX and self._parent_touch_ok())
+
+  def _log_hold_end(self, why: str) -> None:
+    """VBSM_HOLD_RESTART: say once why a locked hold ended without the prompt (data for tuning the tolerances)."""
+    if self._hold_locked and not self._hold_fired and not self._hold_end_logged:
+      self._hold_end_logged = True
+      cloudlog.warning(f"VBSM_HOLD_RESTART: hold ended without the prompt after {rl.get_time() - self._press_time:.1f} s, "
+                       f"moved {self._hold_moved_px:.0f} px: {why}")
+
   def _parent_touch_ok(self) -> bool:
     """VBSM_HOLD_RESTART / VBSM_HUD: a widget pushed over the road view (the restart prompt itself) turns the road
     view's touches off but not this icon's, so the gestures that act (prompt, profile chip) check the road view."""
@@ -122,18 +154,32 @@ class BookmarkIcon(Widget):
     # whose release came while it was not drawn (car turned off, view scrolled away) is over, not a 3 s hold.
     now = rl.get_time()
     if now - self._last_update_t > 0.5 and self._press_time <= self._last_update_t:
+      if self._is_swiping:
+        self._log_hold_end("view not drawn for %.1f s" % (now - self._last_update_t))
       self._is_swiping = False
       self._is_swiping_left = False
       if self._state == BookmarkState.DRAGGING:
         self._state = BookmarkState.HIDDEN
     self._last_update_t = now
     if self._is_swiping and not self._parent_touch_ok():
-      self._hold_moved_px = HOLD_RESTART_SLOP_PX + 1  # a touch made over a pushed widget, or a scroll, is never a hold
+      self._log_hold_end("covered or scrolled")
+      self._hold_moved_px = HOLD_RESTART_LOCKED_SLOP_PX + 1  # a touch made over a pushed widget, or a scroll, is never a hold
+    if self._is_swiping and self._hold_moved_px > HOLD_RESTART_LOCKED_SLOP_PX:
+      self._log_hold_end("moved")
 
-    # VBSM_HOLD_RESTART: a finger held still for HOLD_RESTART_S opens the restart prompt. The prompt takes over the
+    # VBSM_HOLD_RESTART: a touch still (within HOLD_RESTART_SLOP_PX) for HOLD_RESTART_LOCK_S locks as a hold. From then
+    # on the main scroller ignores it (AugmentedRoadView.is_swiping_left), it is no bookmark swipe and no tap, and it
+    # may drift up to HOLD_RESTART_LOCKED_SLOP_PX. Before the lock, the scroller's 12 px drag threshold ended most holds.
+    if (ui_state.started and self._is_swiping and not self._hold_locked and not self._hold_fired and self._parent_touch_ok() and
+        self._hold_moved_px <= HOLD_RESTART_SLOP_PX and now - self._press_time >= HOLD_RESTART_LOCK_S):
+      self._hold_locked = True
+      self._is_swiping_left = False
+      if self._state == BookmarkState.DRAGGING:
+        self._state = BookmarkState.HIDDEN
+
+    # VBSM_HOLD_RESTART: a locked hold that reaches HOLD_RESTART_S opens the restart prompt. The prompt takes over the
     # touch, so this view may never see the release: end the swipe here, and mark the touch so nothing else acts on it
-    if (ui_state.started and self._is_swiping and not self._hold_fired and self._parent_touch_ok() and
-        self._hold_moved_px <= HOLD_RESTART_SLOP_PX and now - self._press_time >= HOLD_RESTART_S):
+    if ui_state.started and self._hold_active() and now - self._press_time >= HOLD_RESTART_S:
       self._hold_fired = True
       self._is_swiping = False
       self._is_swiping_left = False
@@ -187,22 +233,27 @@ class BookmarkIcon(Widget):
       self._hold_fired = False
       self._hold_start_y = mouse_event.pos.y
       self._hold_moved_px = 0.0
+      self._hold_locked = False
+      self._hold_end_logged = False
 
     elif mouse_event.left_down and self._is_swiping:
       self._swipe_current_x = mouse_event.pos.x
       self._hold_moved_px = max(self._hold_moved_px, abs(mouse_event.pos.x - self._swipe_start_x),
                                 abs(mouse_event.pos.y - self._hold_start_y))   # VBSM_HOLD_RESTART
       swipe_offset = self._swipe_start_x - self._swipe_current_x
-      self._is_swiping_left = swipe_offset > 0
+      self._is_swiping_left = swipe_offset > 0 and not self._hold_locked  # VBSM_HOLD_RESTART: a locked hold is no bookmark swipe
       if self._is_swiping_left:
         self._interacting = True
         if self._state == BookmarkState.HIDDEN and not self._swipe_expired:
           self._state = BookmarkState.DRAGGING
 
-    elif mouse_event.left_released and self._hold_fired:
-      # VBSM_HOLD_RESTART: this touch already opened the restart prompt; its release does nothing else. The flag
-      # stays set until the next press: the parent's _handle_mouse_release reads it after this handler has run
-      # (Widget.render() runs _render(), which renders this icon, before the parent's _process_mouse_events()).
+    elif mouse_event.left_released and (self._hold_fired or self._hold_locked):
+      # VBSM_HOLD_RESTART: this touch already opened the restart prompt, or was a hold let go early (or moved off);
+      # its release does nothing else. The flags stay set until the next press: the parent's _handle_mouse_release
+      # reads them after this handler has run (Widget.render() runs _render(), which renders this icon, before the
+      # parent's _process_mouse_events()).
+      if self._is_swiping:
+        self._log_hold_end("released")
       self._is_swiping = False
       self._is_swiping_left = False
 
@@ -245,6 +296,28 @@ class BookmarkIcon(Widget):
       icon_y = self.rect.y + (self.rect.height - self._icon.height) / 2  # Vertically centered
       for icon, alpha in ((self._icon, 1.0 - self._active_alpha.x), (self._filled_icon, self._active_alpha.x)):
         rl.draw_texture_ex(icon, rl.Vector2(icon_x, icon_y), 0.0, 1.0, rl.Color(255, 255, 255, round(255 * alpha)))
+    self._render_hold_ring()
+
+  def _render_hold_ring(self):
+    """VBSM_HOLD_RESTART: a locked hold shows a ring that fills up to the restart prompt, on the other half of the
+    view from the finger so the finger does not cover it. The ring vanishes the moment the hold cancels."""
+    if not ui_state.started or not self._hold_active():
+      return
+    frac = float(np.clip((rl.get_time() - self._press_time - HOLD_RESTART_LOCK_S) / (HOLD_RESTART_S - HOLD_RESTART_LOCK_S), 0.0, 1.0))
+    left_half = self._swipe_start_x < self.rect.x + self.rect.width / 2
+    center = rl.Vector2(self.rect.x + self.rect.width * (0.75 if left_half else 0.25), self.rect.y + self.rect.height / 2)
+    rl.draw_circle_v(center, HOLD_RING_R + 16, rl.Color(0, 0, 0, 160))
+    rl.draw_ring(center, HOLD_RING_R - 5, HOLD_RING_R + 5, 0.0, 360.0, 48, rl.Color(255, 255, 255, 60))
+    rl.draw_ring(center, HOLD_RING_R - 5, HOLD_RING_R + 5, -90.0, -90.0 + 360.0 * frac, 48, rl.WHITE)
+    if not self._hold_icon_tried:
+      self._hold_icon_tried = True
+      try:
+        self._hold_icon = gui_app.texture("icons_mici/settings/device/reboot.png", 42, 46)
+      except Exception:
+        cloudlog.exception("VBSM_HOLD_RESTART: no reboot icon; the ring alone shows the progress")
+    if self._hold_icon is not None:
+      rl.draw_texture_ex(self._hold_icon, rl.Vector2(center.x - self._hold_icon.width / 2, center.y - self._hold_icon.height / 2),
+                         0.0, 1.0, rl.WHITE)
 
 
 class ReverseAlertRenderer(AlertRenderer):
@@ -412,8 +485,9 @@ class AugmentedRoadView(CameraView):
     return self._reversing
 
   def is_swiping_left(self) -> bool:
-    """Check if currently swiping left (for scroller to disable)."""
-    return self._bookmark_icon.is_swiping_left()
+    """Check if currently swiping left (for scroller to disable). VBSM_HOLD_RESTART: also while a locked hold is
+    down, so the finger's drift never scrolls the main layout and ends the hold."""
+    return self._bookmark_icon.is_swiping_left() or self._bookmark_icon.hold_down
 
   def _update_state(self):
     super()._update_state()
@@ -427,8 +501,8 @@ class AugmentedRoadView(CameraView):
       self._offroad_label.set_text("start the car to\nuse sunnypilot")
 
   def _handle_mouse_release(self, mouse_pos: MousePos):
-    # Don't trigger click callback if bookmark was triggered, or if this touch opened the restart prompt (VBSM_HOLD_RESTART)
-    if not self._bookmark_icon.interacting() and not self._bookmark_icon.hold_fired:
+    # Don't trigger click callback if bookmark was triggered, or if this touch was a hold (VBSM_HOLD_RESTART)
+    if not self._bookmark_icon.interacting() and not self._bookmark_icon.hold_fired and not self._bookmark_icon.hold_locked:
       super()._handle_mouse_release(mouse_pos)
 
   def _render(self, _):
