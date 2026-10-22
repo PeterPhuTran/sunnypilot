@@ -644,13 +644,14 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   ("driver camera in reverse"). A missing, unreadable or malformed file (valid JSON that is not an object) reads
   as on. With `NavigationEnabled` on (default off) upstream's navigation panel narrows the mirror, as it does the
   blind spot window view (not changed).
-- **Reverse alert timeout** (2026-10-15): the stock `reverseGear/permanent` alert is full size and stays up for the
-  whole time in reverse, so it covered the cabin view. `ReverseAlertRenderer` draws it for `REVERSE_ALERT_S` = 5 s,
-  then lets it fade out. Only the drawing changes: selfdrived still raises `reverseGear` (engagement stays blocked),
-  the `reverseGear/noEntry` alert shown on an engage attempt is untouched, and every other alert draws as before.
-  The alert also kept the screen awake (sunnypilot's onroad brightness timer resets while an alert shows), so the
-  view resets that timer itself while in reverse. With `reverse_view` off the alert behaves as stock. Test:
-  `pending/reverse-alert/test_reverse_alert.py`.
+- **Reverse alert timeout** (2026-10-15; 5 s -> 2 s on 2026-10-21): the stock `reverseGear/permanent` alert is full
+  size and stays up for the whole time in reverse, so it covered the cabin view. `ReverseAlertRenderer` draws it for
+  `REVERSE_ALERT_S` = 2 s, then lets it fade out. Only the drawing changes: selfdrived still raises `reverseGear`
+  (engagement stays blocked), the `reverseGear/noEntry` alert shown on an engage attempt is untouched, and every other
+  alert draws as before. The alert also kept the screen awake (sunnypilot's onroad brightness timer resets while an
+  alert shows), so the view resets that timer itself while in reverse. With `reverse_view` off the alert behaves as
+  stock. Test: `pending/reverse-alert/test_reverse_alert.py`; `pending/reverse-alert-2s/test_reverse_alert_2s.py` runs
+  the same cases with the timeout read from the file.
 - **Trust rule**: as for the window view, the gear only counts while `carState` is alive and valid,
   so a frozen `carState` cannot hold the cabin view on screen.
 - **Why**: the comma four has no rear camera; the cabin camera is the only one facing backward.
