@@ -193,8 +193,9 @@ files. This was a hand-merge; substantive changes to the fork layer:
 - `hardwared.py`, `selfdrived.py`, `card.py`, `process.py`, `home.py`, `fetcher.py`: upstream-only
   edits that merged cleanly (sentry removal, `sm.seen` guards on the localizer errors, the bridge
   state thread, the alert-pill icon callback, catalog v27).
-- Watch on the first drives: `chestnut_state_thread` opens the bridge over libusb next to modeld's
-  own EP0 reads (`VBSM_GPU_READY`) and `chestnut_power.py`. Confirm cold-boot loads are unaffected.
+- `chestnut_state_thread` opens the bridge over libusb next to modeld's own EP0 reads (`VBSM_GPU_READY`) and
+  `chestnut_power.py`. Field check, 2026-10-20 to 10-24: all 33 eGPU starts on the ported builds were `ready` at
+  the first read (wait 0.0 s, no unreadable reads, no `no_12v`), so cold-boot loads are unaffected.
 - The selector bump invalidates the cached model bundles (as on 2026-09-07), so both model slots
   must be re-selected and re-downloaded after the first boot on this base.
 
@@ -239,14 +240,17 @@ fork layer:
 
 ## 4. eGPU (chestnut) integration — `VBSM_GPU_*`
 The enclosure runs from the 12 V accessory outlet, which shaped everything (measured ~0.45 Ω supply
-path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
+path in August 2026; a 2026-10-21 fit of car-bus minus dock voltage against dock current, over 41 drives, gives
+~0.23 Ω). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
 - **Power cap** (`VBSM_GPU_PPT`, `modeld_v2/modeld.py`): SMU package-power limit, default 80 W (the knob on this
   car: 60 W), clamp 40–220 W, from `/data/vbsm_gpu_ppt_w`; bounds the boost transients that browned out the supply.
   Since 2026-10-19 modeld exports it as `AM_POWER_LIMIT` before anything imports tinygrad: tinygrad applies that
   value inside every AMD boot and stock modeld only `setdefault`s 100 W, so the eGPU never boots above the cap.
   `apply_ppt_cap()` still writes the same limit after the bridge is up and before the transfer, and logs the
   read-back (`chestnut ppt limit` requested/applied/open_ms). `0` now means upstream's 100 W, not uncapped. The
-  driving model draws 24–34 W; CTV3M pinned 57 W at the 60 W cap (2026-10-18).
+  driving model draws 24–34 W; CTV3M pinned 57 W at the 60 W cap (2026-10-18). MDMV3 (from 2026-10-20) draws
+  50–52 W at the cap with supply-current peaks of 14–14.8 A; the dock input then dips to ~9.3 V (single samples to
+  ~8 V) with no supply fault and no model gap. CTV3M had the same peaks and dips (routes of 2026-10-15 to 10-18).
 - **Upstream retry, session gate** (`VBSM_GPU_FALLBACK`, `modeld_v2/modeld.py`, 2026-10-19): upstream's retry-once
   is used unchanged. A failed big-model load sets `ChestnutRetry` (cleared at ignition-on and manager start) and
   `OnroadCycleRequested`; hardwared holds the car offroad for 1 s, the manager restarts every onroad process, and the
@@ -260,7 +264,8 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   active" in between and flashes "Big Model Ready" before "Big Model Failed". (2) Final at once: the readiness outcomes
   `no_12v` and `absent` (`CHESTNUT_FINAL_REASONS`) mark the retry as used (`ChestnutRetry`, written blocking) and take
   upstream's verdict with no cycle: a 1 s cycle does not switch the outlet or make a missing bridge enumerate
-  (2026-10-18: the outlet came back only after a car restart). So do `fw_mismatch` / `flashing` from the wait
+  (2026-10-18: no 12 V at the dock for a whole drive; the dock's 12 V plug was likely not fully seated, and after a
+  reseat the next drive, 5 min later, had power from its first sample). So do `fw_mismatch` / `flashing` from the wait
   (`CHESTNUT_FW_REASONS`, firmware gate below), whatever `CHESTNUT_FINAL_REASONS` says. `timeout`, `unreadable`, load
   exceptions, timeouts and wedges take upstream's retry. (3) After a first failure modeld loads
   nothing more: an in-process load behind a loader still inside a C call can hang (route 7f), so it waits up to 5 s
@@ -500,8 +505,9 @@ path). Full forensic history in [CHESTNUT.md](CHESTNUT.md).
   rail command while the firmware is out of date (unless the flasher gave up after its 3 attempts; the rails then
   resume on the old firmware, where F3 was validated) or while `flash.py` runs, and `chestnut_power.py` refuses
   (exit 3) any bridge that is not on a custom runtime firmware, the ROM bootloader included, re-checked at the moment
-  of the command. F3=0 is unverified on 8516b768: check `chestnut gpu rails cmd=off success=True` and ~1 mA in
-  `chestnut_power.py status` after the first park of 120 s or more with 12 V held.
+  of the command. On 8516b768 the F3=0 rail cut is accepted: 40 of 40 `chestnut gpu rails cmd=off` succeeded from
+  2026-10-20 to 10-23. Still unmeasured: the ~1 mA in `chestnut_power.py status` after a park of 120 s or more with
+  12 V held.
 
 ### 5. Driver HUD — `VBSM_HUD`
 - Experimental mode (retired 2026-10-19): upstream b50b82f9 made the e2e plan permanent and deleted the
