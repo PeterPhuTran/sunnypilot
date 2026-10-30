@@ -475,6 +475,35 @@ path in August 2026; a 2026-10-21 fit of car-bus minus dock voltage against dock
   while `ChestnutLoading`, which is a NO_ENTRY; upstream's UI behind `_engaged_confirmation_click`), so this is a
   backstop for a future requester. A refused modeld request ends in its 5 s exit and a SoC respawn. Event: `onroad
   cycle refused while engaged`.
+- **In-session recovery** (`VBSM_GPU_RECOVER`, `modeld_v2/modeld.py` + `selfdrived.py`, 2026-10-30): since the
+  10-19 port's tinygrad (`cde4bd47`: "usb fail fast", "hcq2 error state") one failed or short USB transfer to the
+  chestnut fails the whole run with `AMD failed with -1`, and upstream then runs the SoC model until the car
+  restarts. From 10-20 to 10-30 that ended the big model in 17 sessions (on MDMV3, FFM and LSM; one more
+  failed the load the same way). The weights survive it, so modeld now brings the eGPU back in place. When: on
+  modeld's main thread, between frames (the reset also resets the host timeline the SoC model runs on), at a
+  disengaged standstill held 1 s: openpilot off, MADS off (a paused MADS resumes by itself when its pause ends, so it
+  counts only in Park), no lateral or longitudinal control, stopped (modeld subscribes to
+  `selfdriveState`/`selfdriveStateSP`). The first attempt comes at least 5 s after the failure, a failed one waits
+  60 s, at most 3 per modeld; native adapters only (a legacy adapter keeps its queues through
+  `reset_warmup_buffers()`). How: read the bridge (12 V and PCIe L0 through `chestnut_raw()`, else stop before
+  tinygrad), let libusb finish the batch transfers in flight (1 s, then cancel; a never-submitted one is marked
+  idle), then tinygrad's own hang recovery on its error-state path (`is_err_state`, then
+  `_collect_interrupts(reset=True)`: MEC reset without the graceful 10 s dequeue waits, SDMA re-init, rings,
+  timelines, error word, `usb_reset`), so an attempt stays well under a second and far from ui_watchdog's 15 s freeze
+  kill. Check: the model must give, twice and from a zeroed state, the same outputs as its load-time warmup for the
+  same dummy inputs (tolerance 1e-3, non-finite fails); otherwise the SoC model stays. Swap: only if the gate still
+  holds once the attempt is over (else the checked model waits for it); the big model starts from an empty history,
+  as at a drive start, and so does the SoC model on a later fallback. modeld writes `ChestnutActive` after the big
+  model's first modelV2 is out; selfdrived treats False -> True without a load like the end of one ("Big Model
+  Ready", the 5 s settling window, `VBSM_SETTLE_GATE`) and clears its failure latch, or a late first frame re-raised
+  "Big Model Failed". upstream's HUD icon stays orange for the session (its FAILED state is sticky) and
+  `Offroad_ChestnutModelError` still latches for the drive. Events: `chestnut failure probe` (each failure: error
+  word, both batch transfers' libusb status, the bridge's supply and LTSSM, the kernel's USB lines of the last 300 s;
+  its own thread) and `chestnut recovery` (each attempt: ok, why, worst reference difference, supply and LTSSM, link
+  state before and after, seconds). Bench trigger: `touch /dev/shm/vbsm_gpu_inject_link_error` with the car on,
+  stopped and disengaged marks the link failed before the next big-model run, so the whole fallback and recovery can
+  be watched without driving. It covers the common case (the run skips the link and the eGPU queue starves at its
+  first copy-in), not a degraded link or a transfer left in flight.
 - **Retired 2026-10-19** (upstream's retry adopted): the automatic kick (`VBSM_GPU_KICK`) and its cooldown fix,
   `VBSM_GPU_KICK_ARMED`, the rail-gated mid-drive retry (`VBSM_GPU_RETRY`) and the driver request
   (`VBSM_GPU_KICK_REQUEST`, `/dev/shm/vbsm_gpu_kick_request`): competing retry paths, and a failed kick reload with
@@ -713,7 +742,7 @@ path in August 2026; a 2026-10-21 fit of car-bus minus dock voltage against dock
 | `openpilot/system/manager/process.py` | §3 | `VBSM_RESTART` |
 | `openpilot/system/manager/process_config.py` | §1, §2b, §3 process entries, backup_manager sigkill | `VBSM_EXIT`, `VBSM_PARKWATCH` |
 | `openpilot/selfdrive/car/card.py` | §1 | — |
-| `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §4 big-model alerts + latch + settle gate, §5 personality re-read | `VBSM_CHIME_HOLD`, `VBSM_CONFIG`, `VBSM_GPU_ALERTS`, `VBSM_SETTLE_GATE`, `VBSM_HUD` |
+| `openpilot/selfdrive/selfdrived/selfdrived.py` | §1 chime, §4 big-model alerts + latch + settle gate + recovery ready, §5 personality re-read | `VBSM_CHIME_HOLD`, `VBSM_CONFIG`, `VBSM_GPU_ALERTS`, `VBSM_SETTLE_GATE`, `VBSM_GPU_RECOVER`, `VBSM_HUD` |
 | `openpilot/sunnypilot/models/fetcher.py` | §6 offline fetch backoff | `VBSM_QUIET` |
 | `openpilot/selfdrive/ui/mici/layouts/settings/toggles.py` | §1, §9 settings | `BigConfigControl`, `VBSM_REVERSE_CAM` |
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | §1 preview, §5 profile-chip tap, §9 reverse view, §10 hold to restart | `BSM_STATE_PATH`, `VBSM_HUD`, `VBSM_REVERSE_CAM`, `VBSM_HOLD_RESTART` |
@@ -721,7 +750,7 @@ path in August 2026; a 2026-10-21 fit of car-bus minus dock voltage against dock
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | §5 parked voltage | `VBSM_HUD` |
 | `openpilot/selfdrive/ui/mici/onroad/cameraview.py` | §8 reader-slot pool | `VBSM_VIPC_POOL` |
 | `openpilot/system/athena/athenad.py` | §2; §6 oversized-log skip | `VBSM_PRIVACY`, `VBSM_QUIET` |
-| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, upstream retry + session gate, readiness, 12 V grace, cold-boot wait, cold cache, firmware gate; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_12V_GRACE`, `VBSM_GPU_COLDWAIT`, `VBSM_GPU_COLDCACHE`, `VBSM_GPU_FW_GATE`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
+| `openpilot/sunnypilot/modeld_v2/modeld.py` | §4 cap, upstream retry + session gate, readiness, 12 V grace, cold-boot wait, cold cache, firmware gate, in-session recovery; §3 exit; §6 levels | `VBSM_GPU_PPT`, `VBSM_GPU_FALLBACK`, `VBSM_GPU_READY`, `VBSM_GPU_12V_GRACE`, `VBSM_GPU_COLDWAIT`, `VBSM_GPU_COLDCACHE`, `VBSM_GPU_FW_GATE`, `VBSM_GPU_RECOVER`, `VBSM_EXIT`, `VBSM_LOG_LEVEL` |
 | `openpilot/system/hardware/hardwared.py` | §2b park, §3 boot cause, §4 idle power + flash hold + cycle guard, §6 shutdown debounce + rails/flash log level | `VBSM_GPU_IDLE`, `VBSM_CYCLE_GUARD`, `VBSM_PARK`, `VBSM_LOG_LEVEL`, `VBSM_BOOTCAUSE` |
 | `openpilot/selfdrive/pandad/pandad.py` | §2b parkwatch window + park events; §3 boot health | `VBSM_PARKWATCH`, `VBSM_BOOTCAUSE` |
 | `openpilot/sunnypilot/parkwatchd.py` | §2b (additive file) | — |
@@ -749,6 +778,7 @@ left the managed set with it).
 | `/data/vbsm_park_budget_wh` | parked energy allowance in whole Wh (clamped 5–30; absent = stock 30), §2b |
 | `/data/parkwatch.json` | its presence enables `parkwatchd` (process_config); ntfy server and topic, parked watch window `window_s` (default 1200 s), §2b |
 | `/dev/shm/vbsm_sync_active` | touched by the Pi's footage sync per batch; fresh (<30 min) = budget/timer shutdown rules suspended, voltage rule kept |
+| `/dev/shm/vbsm_gpu_inject_link_error` | bench trigger for `VBSM_GPU_RECOVER` (§4): at a disengaged standstill only, the next big-model run starts with the USB link marked failed; one-shot, removed when used |
 
 ## Operational notes
 

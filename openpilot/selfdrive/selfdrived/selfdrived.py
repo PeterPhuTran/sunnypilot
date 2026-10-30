@@ -101,6 +101,7 @@ class SelfdriveD:
     self.big_model_active = False
     self.big_model_failed = False
     self.big_model_ready_t = 0.
+    self.big_active_prev = None   # VBSM_GPU_RECOVER
 
     # Setup sockets
     self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'] + ['selfdriveStateSP', 'onroadEventsSP'])
@@ -224,6 +225,14 @@ class SelfdriveD:
       # after a real "Big Model Failed" (2026-09-13)
       if big_active is True:
         self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
+    elif not loading and big_active is True and self.big_active_prev is False:
+      # VBSM_GPU_RECOVER: modeld got the eGPU back after a failure, with no load: the same "Big Model Ready" and
+      # settling window a load ends with (modeld only swaps at a disengaged standstill), and the failure latch
+      # cleared, or "active but no modelV2" below would re-raise "Big Model Failed" through a late first frame
+      self.big_model_ready_t = time.monotonic()
+      self.big_model_failed = False
+      self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
+    self.big_active_prev = big_active
     self.big_model_loading = loading
     if self.big_model_loading:
       self.events.add(EventName.bigModelLoading)

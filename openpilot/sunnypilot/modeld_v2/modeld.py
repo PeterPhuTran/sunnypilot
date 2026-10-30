@@ -120,6 +120,7 @@ class FrameMeta:
 class ModelState(ModelStateBase):
   inputs: dict[str, np.ndarray]
   prev_desire: np.ndarray
+  reference: dict[str, np.ndarray] | None = None   # VBSM_GPU_RECOVER: warmup()'s outputs, see chestnut_recover()
 
   def __init__(self, cam_w: int, cam_h: int, chestnut: bool = False):
     ModelStateBase.__init__(self)
@@ -176,7 +177,9 @@ class ModelState(ModelStateBase):
 
   def warmup(self) -> None:
     dummy_frames, transforms, dummy_inputs = self.adapter.get_dummy_inputs()
-    self.run(dummy_frames, transforms, dummy_inputs)
+    outputs = self.run(dummy_frames, transforms, dummy_inputs)
+    # VBSM_GPU_RECOVER: this model's answer to the dummy inputs from a zeroed state, which a recovered eGPU must repeat
+    self.reference = None if outputs is None else {k: np.array(v, copy=True) for k, v in outputs.items()}
     self.adapter.reset_warmup_buffers()
     self.prev_desire[:] = 0
 
@@ -640,6 +643,230 @@ def wait_chestnut_ready(t_main: float) -> str:
   return reason
 
 
+# VBSM_GPU_RECOVER: get the big model back after it fails inside an onroad session. Since the 2026-10-19 port (tinygrad
+# cde4bd47: "usb fail fast" #18663, "hcq2 error state" #18608) a failed or short USB transfer to the chestnut latches
+# the link's error word, the rest of that run skips the link, and exec_hcq raises "AMD failed with <code>"; the older
+# tinygrad ignored those return codes. Upstream then runs the SoC model until the car restarts ("Big Model Failed /
+# Restart the car to retry"): from 2026-10-20 to 10-30, 17 sessions lost the big model that way mid-drive, every one
+# "AMD failed with -1" (LIBUSB_ERROR_IO or a short bulk read), on MDMV3, FFM and LSM alike. The weights stay in eGPU
+# memory through it, and tinygrad's own hang recovery (PCIIface._collect_interrupts(reset=True): MEC reset, SDMA
+# re-init, rings, timelines, error word, usb_reset) clears the rest with no reload. It runs on the main thread between
+# frames, because it also resets the host timeline the SoC model runs on; and only at a disengaged standstill held
+# CHESTNUT_RECOVER_HOLD_S (openpilot off, MADS off or paused in Park, no lateral or longitudinal control, stopped: the
+# moment install_model_device.py switches models at), because an attempt holds modelV2 back and the recovered model
+# starts from an empty history, as at a drive start. An attempt first reads the bridge (12 V, PCIe L0) and lets
+# in-flight transfers finish or cancels them, then resets on tinygrad's error-state path; that keeps it well under a
+# second normally and out of tinygrad's 10-30 s timeouts, so far under ui_watchdog's 15 s freeze kill. Before the big
+# model drives again it must give, twice and from a zeroed state, the outputs its load-time warmup gave for the same
+# dummy inputs, and the gate must still hold once the attempt is over; otherwise the SoC model stays (a good model
+# waits for the gate). modeld writes ChestnutActive after the big model's first modelV2 is out; selfdrived then shows
+# "Big Model Ready" and runs the load's settling window. At most CHESTNUT_RECOVER_MAX attempts per modeld; native
+# adapters only. Each failure also logs "chestnut failure probe" (link state, bridge supply and LTSSM, the kernel's
+# USB lines) to find out what breaks the link.
+CHESTNUT_RECOVER_HOLD_S = 1.0
+CHESTNUT_RECOVER_FIRST_S = 5.0     # from a failure to the first attempt
+CHESTNUT_RECOVER_RETRY_S = 60.0    # from a failed attempt to the next one
+CHESTNUT_RECOVER_MAX = 3
+CHESTNUT_RECOVER_STOPPED_V = 0.3   # m/s
+CHESTNUT_RECOVER_SETTLE_S = 1.0    # batch transfers still in flight get this long to finish before an attempt
+CHESTNUT_RECOVER_TOL = 1e-3        # relative and absolute tolerance of the reference check
+CHESTNUT_RECOVER_RUNS = 2          # reference runs per attempt: the first starts from usb_reset's zeroed chunk count,
+                                   # the second from the count the first left (usb_begin's fence), as every frame does
+CHESTNUT_RECOVER_SERVICES = ("selfdriveState", "selfdriveStateSP", "carControl", "carState")
+# bench trigger: while this file exists and the car sits at a disengaged standstill, the next big-model run starts with
+# the link marked failed, which is what a real transfer error leaves (every later transfer skipped, the eGPU queue
+# starved); the file is removed when used. Checked once a second
+CHESTNUT_INJECT_FILE = "/dev/shm/vbsm_gpu_inject_link_error"
+
+
+def chestnut_safe_to_swap(sm) -> bool:
+  """VBSM_GPU_RECOVER: openpilot off, MADS off, no lateral or longitudinal control, stopped. A paused MADS resumes by
+  itself when its pause ends (brake released, door closed, gear), so it counts as on except in Park. A service not
+  heard from within 10 of its periods reads unsafe."""
+  if not all(sm.alive[s] for s in CHESTNUT_RECOVER_SERVICES):
+    return False
+  cc, cs, mads = sm["carControl"], sm["carState"], sm["selfdriveStateSP"].mads
+  mads_off = not mads.enabled or (not mads.active and cs.gearShifter == car.CarState.GearShifter.park)
+  return (not sm["selfdriveState"].enabled and mads_off and not cc.latActive and not cc.longActive and cs.standstill and
+          cs.vEgo < CHESTNUT_RECOVER_STOPPED_V)
+
+
+def chestnut_inject_link_error(dev) -> bool:
+  """VBSM_GPU_RECOVER bench trigger (CHESTNUT_INJECT_FILE), one-shot; the caller checks the standstill. Never raises."""
+  try:
+    os.remove(CHESTNUT_INJECT_FILE)
+  except OSError:
+    return False
+  try:
+    dev.error_state.host.view(fmt='q')[0] = -1
+    cloudlog.event("chestnut link error injected", error=True)
+    return True
+  except Exception:
+    cloudlog.exception("chestnut link error injection failed")
+    return False
+
+
+def chestnut_link_state(dev) -> dict:
+  """VBSM_GPU_RECOVER: the link's error word and libusb's [status, length, actual_length] of both batch transfers
+  (status 0xff = in flight), read from host memory: no USB traffic. Never raises."""
+  try:
+    if not getattr(dev, "is_usb", False):
+      return {"err": int(dev.error_state.host.view(fmt='q')[0]), "xfers": None}
+    from tinygrad.runtime.autogen import libusb
+    from tinygrad.runtime.support.usb import _host_block
+    xfers = [libusb.struct_libusb_transfer.from_address(a) for a in _host_block(dev).host.view(fmt='Q')[3:5]]
+    return {"err": int(dev.error_state.host.view(fmt='q')[0]), "xfers": [[t.status, t.length, t.actual_length] for t in xfers]}
+  except Exception as e:
+    return {"err": None, "xfers": None, "state_error": repr(e)[:160]}
+
+
+def chestnut_settle_transfers(dev, timeout_s: float) -> bool:
+  """VBSM_GPU_RECOVER: run libusb's event loop until neither batch transfer is in flight, at most timeout_s. A transfer
+  left in flight by the failure keeps status 0xff until someone handles events, usb_reset keeps that status, and the
+  first run after it would reap the old failure."""
+  import ctypes
+  from tinygrad.runtime.autogen import libusb
+  from tinygrad.runtime.support.usb import USB3, _host_block
+  xfers = [libusb.struct_libusb_transfer.from_address(a) for a in _host_block(dev).host.view(fmt='Q')[3:5]]
+  tv = libusb.struct_timeval()
+  tv.tv_sec, tv.tv_usec = 0, 50000
+
+  def pump(end):
+    while any(t.status == 0xff for t in xfers) and time.monotonic() < end:
+      libusb.libusb_handle_events_timeout(USB3.ctx(), ctypes.byref(tv))
+
+  pump(time.monotonic() + timeout_s)
+  # still 0xff: either stuck in flight (cancel it; it completes as cancelled on the next events) or never submitted
+  # (usb_send writes 0xff before libusb_submit_transfer, so a failed submit leaves it there for good: NOT_FOUND)
+  idle = [t for t in xfers if t.status == 0xff and libusb.libusb_cancel_transfer(ctypes.byref(t)) == libusb.LIBUSB_ERROR_NOT_FOUND]
+  pump(time.monotonic() + timeout_s)
+  for t in idle:
+    if t.status == 0xff:
+      t.status = 0
+  return not any(t.status == 0xff for t in xfers)
+
+
+def chestnut_reference_diff(reference, outputs) -> float:
+  """VBSM_GPU_RECOVER: the largest |out - ref| / (tol * (1 + |ref|)) over every output, so <= 1 passes; inf for a
+  missing or extra key, a changed shape or a non-finite value."""
+  if reference is None or outputs is None or reference.keys() != outputs.keys():
+    return math.inf
+  worst = 0.0
+  for k, ref in reference.items():
+    ref, out = np.asarray(ref, dtype=np.float64), np.asarray(outputs[k], dtype=np.float64)
+    if ref.shape != out.shape or not np.all(np.isfinite(ref)) or not np.all(np.isfinite(out)):
+      return math.inf
+    if ref.size:
+      worst = max(worst, float(np.max(np.abs(out - ref) / (CHESTNUT_RECOVER_TOL * (1.0 + np.abs(ref))))))
+  return worst
+
+
+def chestnut_recover(model) -> dict:
+  """VBSM_GPU_RECOVER: one attempt on the main thread, between frames. 'ok' only when the model gave its load-time
+  reference again from a zeroed state, and it is left zeroed. Raises when the link is dead (the SoC model stays)."""
+  t0 = time.monotonic()
+  dev = Device[model.DEV]
+  res = {"before": chestnut_link_state(dev)}
+  # a legacy (non-native) adapter keeps its frame and feature queues on the device through reset_warmup_buffers(), so
+  # its runs never start from the warmup's state and the check below could never pass
+  if not getattr(dev, "can_recover", False) or model.reference is None or not model.adapter.is_native:
+    return res | {"ok": False, "why": "no recovery path"}
+  if getattr(dev, "is_usb", False):
+    # a dead link or a dropped supply would only run tinygrad into its 10-30 s timeouts: read the bridge first
+    # (own usbdevfs fd, 2 s per read at worst)
+    res |= chestnut_fields(raw := chestnut_raw())
+    if raw is None or raw[0] < CHESTNUT_POWERED_MV or raw[2] != CHESTNUT_PCIE_L0:
+      return res | {"ok": False, "why": "link not up"}
+    if not chestnut_settle_transfers(dev, CHESTNUT_RECOVER_SETTLE_S):
+      return res | {"ok": False, "why": "a batch transfer is still in flight"}
+  # tinygrad's own hang recovery (ops_amd PCIIface), on its error-state path: the MEC reset then skips the graceful
+  # dequeue of each active queue (up to 10 s apiece) that a queue starved by the link would run out
+  dev.iface.dev_impl.is_err_state = True
+  dev.iface._collect_interrupts(reset=True)
+  worst = 0.0
+  for _ in range(CHESTNUT_RECOVER_RUNS):
+    model.adapter.reset_warmup_buffers()
+    model.prev_desire[:] = 0
+    frames, transforms, inputs = model.adapter.get_dummy_inputs()
+    worst = max(worst, chestnut_reference_diff(model.reference, model.run(frames, transforms, inputs)))
+  model.adapter.reset_warmup_buffers()
+  model.prev_desire[:] = 0
+  ok = worst <= 1.0
+  return res | {"ok": ok, "why": None if ok else "outputs differ from the load-time reference",
+                "worst": round(worst, 4) if math.isfinite(worst) else None, "after": chestnut_link_state(dev),
+                "s": round(time.monotonic() - t0, 2)}
+
+
+def chestnut_failure_probe(state: dict, attempts: int) -> None:
+  """VBSM_GPU_RECOVER: one event per big-model failure: the link state at the failure, then the bridge's supply and
+  LTSSM over its own usbdevfs fd (chestnut_raw: read-only, no tinygrad) and the kernel's USB lines of the last 300 s.
+  Its own thread: each read can block for 2 s, and the SoC model takes over on the main thread meanwhile."""
+  import re
+  import subprocess
+  cloudlog.bind(daemon=PROCESS_NAME)   # the daemon tag is thread-local
+  fields: dict = {"enumerated": chestnut_enumerated()}
+  try:
+    fields.update(chestnut_fields(chestnut_raw()))
+  except Exception as e:
+    fields["probe_error"] = repr(e)[:160]
+  try:
+    now = time.clock_gettime(time.CLOCK_BOOTTIME)
+    lines = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5).stdout.splitlines()
+    fields["kernel"] = [ln[:200] for ln in lines if re.search(r"xhci|usb \d+-|usbfs", ln) and
+                        (m := re.match(r"\[\s*(\d+\.\d+)\]", ln)) and float(m.group(1)) > now - 300][-12:]
+  except Exception as e:
+    fields["kernel"] = repr(e)[:160]
+  cloudlog.event("chestnut failure probe", error=True, attempts=attempts, **state, **fields)
+
+
+class ChestnutRecovery:
+  """VBSM_GPU_RECOVER: failed() at a big-model failure, then due() each frame while pending, attempt() when it is.
+  A good attempt leaves the big model ready, to be swapped in while the gate still holds; announce asks for
+  ChestnutActive once its first modelV2 is out."""
+  def __init__(self, big):
+    self.big = big
+    self.pending = False   # a failure not recovered from yet
+    self.ready = False     # recovered and checked, not swapped in yet
+    self.announce = False
+    self.next_t = 0.0
+    self.safe_since: float | None = None
+    self.attempts = 0
+    self.probe: threading.Thread | None = None
+
+  def failed(self, now: float) -> None:
+    self.pending, self.ready, self.announce = True, False, False
+    self.next_t, self.safe_since = now + CHESTNUT_RECOVER_FIRST_S, None
+    self.probe = threading.Thread(target=chestnut_failure_probe, args=(chestnut_link_state(Device[self.big.DEV]), self.attempts),
+                                  daemon=True)
+    self.probe.start()
+
+  def due(self, now: float, safe: bool) -> bool:
+    if not self.pending or self.attempts >= CHESTNUT_RECOVER_MAX or (self.probe is not None and self.probe.is_alive()):
+      return False
+    if not safe:
+      self.safe_since = None
+      return False
+    if self.safe_since is None:
+      self.safe_since = now
+    return now >= self.next_t and now - self.safe_since >= CHESTNUT_RECOVER_HOLD_S
+
+  def attempt(self) -> bool:
+    try:
+      res = chestnut_recover(self.big)
+    except Exception as e:
+      cloudlog.exception("chestnut recovery raised")
+      res = {"ok": False, "why": repr(e)[:200]}
+    self.attempts += 1
+    self.pending, self.ready = not res["ok"], res["ok"]
+    self.next_t, self.safe_since = time.monotonic() + CHESTNUT_RECOVER_RETRY_S, None
+    fields = dict(attempt=self.attempts, max_attempts=CHESTNUT_RECOVER_MAX, **res)
+    if res["ok"]:
+      cloudlog.event("chestnut recovery", **fields)  # VBSM_LOG_LEVEL: no error kwarg on success
+    else:
+      cloudlog.event("chestnut recovery", error=True, **fields)
+    return res["ok"]
+
+
 def main(demo=False):
   t_main = time.monotonic()   # VBSM_GPU_READY: ui_watchdog's clock starts at the setproctitle() just below
   cloudlog.warning("modeld init")
@@ -838,6 +1065,7 @@ def main(demo=False):
   params.put_bool("ChestnutLoading", False)
   assert model is not None
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
+  chestnut_recovery = ChestnutRecovery(model) if model.chestnut else None   # VBSM_GPU_RECOVER
 
   config_realtime_process(7, 54)
 
@@ -845,7 +1073,8 @@ def main(demo=False):
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
-                  "carControl", "controlsState", "lateralDelay"])
+                  "carControl", "controlsState", "lateralDelay"] +
+                 (["selfdriveState", "selfdriveStateSP"] if chestnut_recovery is not None else []))   # VBSM_GPU_RECOVER
 
   publish_state = PublishState()
   chestnut_state = ChestnutGpuState(pm, model.chestnut) if CHESTNUT else None
@@ -913,6 +1142,30 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
+    # VBSM_GPU_RECOVER: between frames, at a disengaged standstill only (see chestnut_recover)
+    if chestnut_recovery is not None and model is small_model:
+      attempted = chestnut_recovery.pending and chestnut_recovery.due(time.monotonic(), chestnut_safe_to_swap(sm))
+      if attempted:
+        chestnut_recovery.attempt()
+        sm.update(0)   # the attempt took time: the swap below reads the gate afresh
+      if chestnut_recovery.ready and chestnut_safe_to_swap(sm):
+        chestnut_recovery.ready, chestnut_recovery.announce = False, True
+        model = chestnut_recovery.big
+        if chestnut_state is not None:
+          chestnut_state.big = True
+        if small_model.adapter.is_native:   # a later fallback starts the SoC model from an empty history, as the first does
+          try:
+            small_model.adapter.reset_warmup_buffers()
+            small_model.prev_desire[:] = 0
+          except Exception:
+            cloudlog.exception("chestnut recovery: SoC model reset failed")
+        run_count = 0
+      if attempted:
+        run_count = 0   # the attempt held frames back: the drop filter warms up again
+        continue        # and the frame in hand is stale
+    if chestnut_recovery is not None and model.chestnut and sm.frame % 20 == 0 and \
+       os.path.exists(CHESTNUT_INJECT_FILE) and chestnut_safe_to_swap(sm):   # VBSM_GPU_RECOVER bench trigger
+      chestnut_inject_link_error(Device[model.DEV])
     desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
@@ -983,6 +1236,8 @@ def main(demo=False):
         chestnut_state.big = False
       run_count = 0
       model_output = None
+      if chestnut_recovery is not None:   # VBSM_GPU_RECOVER
+        chestnut_recovery.failed(time.monotonic())
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
@@ -1019,6 +1274,10 @@ def main(demo=False):
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
       pm.send('modelDataV2SP', mdv2sp_send)
+      if chestnut_recovery is not None and chestnut_recovery.announce and model.chestnut:
+        # VBSM_GPU_RECOVER: only now, with modelV2 flowing again, or selfdrived would read "active but no modelV2"
+        chestnut_recovery.announce = False
+        params.put_bool("ChestnutActive", True)
     last_vipc_frame_id = meta_main.frame_id
 
 if __name__ == "__main__":
