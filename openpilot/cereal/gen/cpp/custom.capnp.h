@@ -855,7 +855,7 @@ struct ModelDataV2SP {
 
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(a1680744031fdb2d, 1, 0)
+    CAPNP_DECLARE_STRUCT_HEADER(a1680744031fdb2d, 4, 0)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -4673,6 +4673,20 @@ public:
 
   inline bool getRightLaneChangeEdgeBlock() const;
 
+  inline float getBlendfulCurvature() const;
+
+  inline float getBlendfulTrust() const;
+
+  inline float getModelCurvature() const;
+
+  inline bool getBlendfulGoingAround() const;
+
+  inline float getBlendfulLeftProb() const;
+
+  inline float getBlendfulRightProb() const;
+
+  inline float getBlendfulLaneWidth() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -4709,6 +4723,27 @@ public:
 
   inline bool getRightLaneChangeEdgeBlock();
   inline void setRightLaneChangeEdgeBlock(bool value);
+
+  inline float getBlendfulCurvature();
+  inline void setBlendfulCurvature(float value);
+
+  inline float getBlendfulTrust();
+  inline void setBlendfulTrust(float value);
+
+  inline float getModelCurvature();
+  inline void setModelCurvature(float value);
+
+  inline bool getBlendfulGoingAround();
+  inline void setBlendfulGoingAround(bool value);
+
+  inline float getBlendfulLeftProb();
+  inline void setBlendfulLeftProb(float value);
+
+  inline float getBlendfulRightProb();
+  inline void setBlendfulRightProb(float value);
+
+  inline float getBlendfulLaneWidth();
+  inline void setBlendfulLaneWidth(float value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -9117,6 +9152,104 @@ inline bool ModelDataV2SP::Builder::getRightLaneChangeEdgeBlock() {
 inline void ModelDataV2SP::Builder::setRightLaneChangeEdgeBlock(bool value) {
   _builder.setDataField<bool>(
       ::capnp::bounded<17>() * ::capnp::ELEMENTS, value);
+}
+
+inline float ModelDataV2SP::Reader::getBlendfulCurvature() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline float ModelDataV2SP::Builder::getBlendfulCurvature() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void ModelDataV2SP::Builder::setBlendfulCurvature(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
+}
+
+inline float ModelDataV2SP::Reader::getBlendfulTrust() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+
+inline float ModelDataV2SP::Builder::getBlendfulTrust() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+inline void ModelDataV2SP::Builder::setBlendfulTrust(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS, value);
+}
+
+inline float ModelDataV2SP::Reader::getModelCurvature() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+
+inline float ModelDataV2SP::Builder::getModelCurvature() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+inline void ModelDataV2SP::Builder::setModelCurvature(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool ModelDataV2SP::Reader::getBlendfulGoingAround() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<18>() * ::capnp::ELEMENTS);
+}
+
+inline bool ModelDataV2SP::Builder::getBlendfulGoingAround() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<18>() * ::capnp::ELEMENTS);
+}
+inline void ModelDataV2SP::Builder::setBlendfulGoingAround(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<18>() * ::capnp::ELEMENTS, value);
+}
+
+inline float ModelDataV2SP::Reader::getBlendfulLeftProb() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+
+inline float ModelDataV2SP::Builder::getBlendfulLeftProb() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+inline void ModelDataV2SP::Builder::setBlendfulLeftProb(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, value);
+}
+
+inline float ModelDataV2SP::Reader::getBlendfulRightProb() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS);
+}
+
+inline float ModelDataV2SP::Builder::getBlendfulRightProb() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS);
+}
+inline void ModelDataV2SP::Builder::setBlendfulRightProb(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS, value);
+}
+
+inline float ModelDataV2SP::Reader::getBlendfulLaneWidth() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+
+inline float ModelDataV2SP::Builder::getBlendfulLaneWidth() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+inline void ModelDataV2SP::Builder::setBlendfulLaneWidth(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, value);
 }
 
 }  // namespace

@@ -238,6 +238,13 @@ fork layer:
   not hidden by a stale chestnut fade, malformed `/data/vision_bsm.json` reads as defaults; the verify step checks
   code, not comments, for every engagement guard (§4, §5, §9, §10).
 
+#### Port note — 2026-11-02 onto sunnypilot `5a5c9ea7` (Blendful)
+Upstream squashed staging again and changed one managed file, `modeld.py`, so the daily port stopped from 2026-10-29.
+The three-way merge was clean. Upstream added Blendful (`modeld_v2/blendful.py`, param `Blendful`, default off), a
+correction that pulls the model's curvature toward the lane center: `get_action_from_model()` takes a `blendful`
+callback, and modeld publishes seven new `modelDataV2SP` fields. With the param off the callback returns 0.0, so the
+curvature is unchanged. The fork's eGPU code (§4) does not call it and is not changed.
+
 ## 4. eGPU (chestnut) integration — `VBSM_GPU_*`
 The enclosure runs from the 12 V accessory outlet, which shaped everything (measured ~0.45 Ω supply
 path in August 2026; a 2026-10-21 fit of car-bus minus dock voltage against dock current, over 41 drives, gives
