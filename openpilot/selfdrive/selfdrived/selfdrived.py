@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import time
 import threading
@@ -34,6 +35,11 @@ from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import Butto
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
 REPLAY = "REPLAY" in os.environ
+
+# camera blind spot monitor drop-in
+VBSM_CONFIG = "/data/vision_bsm.json"
+VBSM_CONFIG_INTERVAL = 100  # cycles between config reads at 100Hz
+VBSM_CHIME_HOLD = 150  # ~1.5s of alert per blind spot entry
 SIMULATION = "SIMULATION" in os.environ
 TESTING_CLOSET = "TESTING_CLOSET" in os.environ
 
@@ -54,9 +60,19 @@ TurnDirection = custom.ModelDataV2SP.TurnDirection
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 
 
+# VBSM_GPU_ALERTS: seconds after a load ends during which modelV2 gaps are the swap, not a failure
+BIG_MODEL_WARMUP_SEC = 5.
+
+
 class SelfdriveD:
   def __init__(self, CP=None, CP_SP=None):
     self.params = Params()
+
+    self._vbsm_counter = 0
+    self._vbsm_chime = True
+    self._vbsm_chime_always = False
+    self._vbsm_detected_prev = False
+    self._vbsm_hold = 0
 
     # Ensure the current branch is cached, otherwise the first cycle lags
     build_metadata = get_build_metadata()
@@ -85,6 +101,7 @@ class SelfdriveD:
     self.big_model_active = False
     self.big_model_failed = False
     self.big_model_ready_t = 0.
+    self.big_active_prev = None   # VBSM_GPU_RECOVER
 
     # Setup sockets
     self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'] + ['selfdriveStateSP', 'onroadEventsSP'])
@@ -180,6 +197,15 @@ class SelfdriveD:
 
     self.button_state_tracker = ButtonStateTracker()
 
+  def _big_model_settling(self) -> bool:
+    # VBSM_SETTLE_GATE: a big-model load, and the warm-up after it, holds modelV2 and everything
+    # downstream of it back on purpose, so the load masks commIssue, the localization errors and
+    # "active but no modelV2". Only while disengaged: engaged (openpilot, or MADS steering; a paused
+    # MADS does not steer), a load means modeld died under the driver, and the mask would also cancel
+    # the soft disable commIssue already began.
+    settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + BIG_MODEL_WARMUP_SEC
+    return settling and not (self.enabled or self.mads.active)
+
   def update_events(self, CS):
     """Compute onroadEvents from carState"""
 
@@ -191,16 +217,36 @@ class SelfdriveD:
       self.startup_event = None
 
     loading = self.params.get_bool("ChestnutLoading")
+    big_active = self.params.get("ChestnutActive")
     if self.big_model_loading and not loading:
       self.big_model_ready_t = time.monotonic()
+      # VBSM_GPU_ALERTS: "ready" only for a load that succeeded -- the loading
+      # flag drops on failure too, which flashed "Big Model Ready" two seconds
+      # after a real "Big Model Failed" (2026-09-13)
+      if big_active is True:
+        self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
+    elif not loading and big_active is True and self.big_active_prev is False:
+      # VBSM_GPU_RECOVER: modeld got the eGPU back after a failure, with no load: the same "Big Model Ready" and
+      # settling window a load ends with (modeld only swaps at a disengaged standstill), and the failure latch
+      # cleared, or "active but no modelV2" below would re-raise "Big Model Failed" through a late first frame
+      self.big_model_ready_t = time.monotonic()
+      self.big_model_failed = False
       self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
+    self.big_active_prev = big_active
     self.big_model_loading = loading
     if self.big_model_loading:
       self.events.add(EventName.bigModelLoading)
 
-    big_active = self.params.get("ChestnutActive")
     chestnut_present = self.sm['deviceState'].chestnutPresent
-    model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2']
+    # VBSM_GPU_ALERTS: modeld marks the big model active ~2 s before its first
+    # frame (it still loads the small model in between), so "active but no
+    # modelV2" inside the settling window is the load finishing, not a failure
+    # -- it raised a false "Big Model Failed" banner on 2026-09-13. A failure already
+    # raised stays raised: upstream restarts the settling window on bigModelFailed,
+    # and without this latch the mask cleared the failure and re-raised it every 5 s.
+    big_model_settling = self._big_model_settling()
+    model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2'] and \
+      (self.big_model_failed or not big_model_settling)
     big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
     if big_failed and not self.big_model_failed:
       self.events.add(EventName.bigModelFailed)
@@ -346,6 +392,51 @@ class SelfdriveD:
       self.events.add(EventName.excessiveActuation)
     # ******************************************************************************************
 
+    # Camera blind spot monitor chime, reusing the stock "Car Detected in
+    # Blindspot" event. The lane change alert below only fires while openpilot is
+    # steering above the lane change speed, so this covers the rest of the time.
+    self._vbsm_counter += 1
+    if self._vbsm_counter % VBSM_CONFIG_INTERVAL == 0:
+      # VBSM_HUD: adopt external personality changes (the HUD profile chip and
+      # the settings page write the param). Upstream's params_thread adopts them
+      # too, at 10 Hz, so this mostly finds them adopted already and the chip's
+      # own flash is the feedback; the alert fires only when this catches one
+      # first. Self-written values are a no-op here.
+      try:
+        p = int(self.params.get("LongitudinalPersonality") or 0)
+        if 0 <= p <= 2 and p != self.personality:
+          self.personality = p
+          self.events.add(EventName.personalityChanged)
+      except (ValueError, TypeError):
+        pass
+      try:
+        with open(VBSM_CONFIG) as f:
+          config = json.load(f)
+        if not isinstance(config, dict):   # VBSM_CONFIG: valid JSON that is not an object reads as the defaults
+          raise ValueError("vision_bsm.json is not an object")
+        # VBSM_HUD: "chime" is the master switch for the blind spot chime;
+        # "chime_always" is its sub-option (fire on entry, not just on signal).
+        # Absent means on, matching the settings toggle's default.
+        self._vbsm_chime = bool(config.get("chime", True))
+        self._vbsm_chime_always = bool(config.get("enabled")) and bool(config.get("chime_always"))
+      except (OSError, ValueError):
+        self._vbsm_chime = True
+        self._vbsm_chime_always = False
+
+    detected = CS.leftBlindspot or CS.rightBlindspot
+    signalled = (CS.leftBlinker and CS.leftBlindspot) or (CS.rightBlinker and CS.rightBlindspot)
+
+    # hold briefly on the leading edge rather than nagging the whole time a car
+    # sits alongside in traffic
+    if self._vbsm_chime_always and detected and not self._vbsm_detected_prev:
+      self._vbsm_hold = VBSM_CHIME_HOLD
+    self._vbsm_detected_prev = detected
+    self._vbsm_hold = max(0, self._vbsm_hold - 1)
+
+    if self._vbsm_chime and (signalled or self._vbsm_hold > 0):
+      if self.sm['modelV2'].meta.laneChangeState != LaneChangeState.preLaneChange:
+        self.events.add(EventName.laneChangeBlocked)
+
     # Handle lane change
     if self.sm['modelV2'].meta.laneChangeState == LaneChangeState.preLaneChange:
       direction = self.sm['modelV2'].meta.laneChangeDirection
@@ -429,8 +520,7 @@ class SelfdriveD:
     # generic catch-all. ideally, a more specific event should be added above instead
     has_disable_events = self.events.contains(ET.NO_ENTRY) and (self.events.contains(ET.SOFT_DISABLE) or self.events.contains(ET.IMMEDIATE_DISABLE))
     no_system_errors = (not has_disable_events) or (len(self.events) == num_events)
-    warmup_sec = 5.
-    big_model_settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + warmup_sec
+    big_model_settling = self._big_model_settling()
     if not self.sm.all_checks() and no_system_errors and not big_model_settling:  # the load holds modelV2 and friends back on purpose
       if not self.sm.all_alive():
         self.events.add(EventName.commIssue)
@@ -459,6 +549,18 @@ class SelfdriveD:
       if (self.sm.seen['vehicleParameters'] and not self.sm['vehicleParameters'].valid and cal_status == log.ExtrinsicsCalibration.Status.calibrated and
           not TESTING_CLOSET and (not SIMULATION or REPLAY)):
         self.events.add(EventName.paramsdTemporaryError)
+
+    # VBSM_SETTLE_GATE: what the load masks is no alert while disengaged, but it must not be engaged
+    # into either: the masks lift on engagement and the soft disable would follow at once
+    if big_model_settling and not self.events.has(EventName.bigModelLoading):
+      dm = self.sm['deviceMotion']
+      held = not dm.posenetOK or not dm.inputsOK or \
+        (not self.sm['vehicleParameters'].valid and cal_status == log.ExtrinsicsCalibration.Status.calibrated and
+         not TESTING_CLOSET and (not SIMULATION or REPLAY))
+      # upstream's modeldLagging mask (below) lifts on engagement too, so a lagging model blocks the engage here
+      lagging = self.sm['modelV2'].frameDropPerc > 1 and (not SIMULATION or REPLAY)
+      if not self.sm.all_checks() or (not self.CP.notCar and held) or lagging:
+        self.events.add(EventName.bigModelLoading)
 
     # conservative HW alert. if the data or frequency are off, locationd will throw an error
     if any((self.sm.frame - self.sm.recv_frame[s])*DT_CTRL > 10. for s in self.sensor_packets):
