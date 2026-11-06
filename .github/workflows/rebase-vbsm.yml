@@ -8,10 +8,14 @@ name: port vbsm onto sunnypilot staging
 # the result as a merge of both - so the branch survives force-pushes, keeps
 # its own history reachable, and works identically for ordinary advances.
 #
-# The one thing it refuses to do is guess: if upstream changed any file the
-# mod manages (relative to the recorded base in .github/vbsm-base.json), it
-# fails loudly and leaves the branch alone. The device keeps running the last
-# good build until a human merges.
+# When upstream changed a file the mod manages (relative to the recorded base
+# in .github/vbsm-base.json), it three-way merges upstream's edit into the
+# mod's copy first (base = the recorded base's version). A clean merge carries
+# on through the same verify battery as any port, and the commit names every
+# file it merged. What it refuses to do is guess: a conflict, or a managed
+# file that upstream added or deleted, fails loudly and leaves the branch
+# alone. The device keeps running the last good build until a human merges.
+# (Hand-merge-only mode: dispatch with auto_merge off.)
 #
 # Everything runs on git plumbing against a blobless clone - no worktree
 # checkout, so the multi-gigabyte prebuilts are never downloaded.
@@ -29,6 +33,10 @@ on:
         description: port and verify, but do not publish
         type: boolean
         default: false
+      auto_merge:
+        description: three-way merge upstream edits to managed files (off = stop on any drift, the old rule)
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -74,15 +82,35 @@ jobs:
           FILES=$(git show "HEAD:$MANIFEST" | jq -r '.files[]')
           echo "recorded base ${BASE:0:8} -> new upstream ${NEW:0:8}"
 
-          # refuse to clobber upstream work on the files the mod manages
-          drift=""
+          # never clobber upstream work on the files the mod manages: where upstream changed one, merge its edit
+          # into ours (base = the recorded base's version). Only a clean merge goes on; the verify step below
+          # still has to pass before anything is published. auto_merge is null on schedule, so it reads as on.
+          declare -A merged=()
+          drift=""; stop=""
+          T=$(mktemp -d)
           for f in $FILES; do
             old=$(git rev-parse -q --verify "$BASE:$f" 2>/dev/null || echo absent)
             new=$(git rev-parse -q --verify "$NEW:$f" 2>/dev/null || echo absent)
-            [ "$old" = "$new" ] || drift="$drift $f"
+            [ "$old" = "$new" ] && continue
+            drift="$drift $f"
+            if [ "${{ inputs.auto_merge }}" = "false" ]; then stop="$stop $f"; continue; fi
+            if [ "$old" = absent ] || [ "$new" = absent ]; then stop="$stop $f(upstream added/deleted it)"; continue; fi
+            git cat-file blob "$OLD_HEAD:$f" > "$T/ours"
+            git cat-file blob "$old" > "$T/base"
+            git cat-file blob "$new" > "$T/upstream"
+            if git merge-file -q -p "$T/ours" "$T/base" "$T/upstream" > "$T/merged"; then
+              merged[$f]=$(git hash-object -w "$T/merged")
+              echo "auto-merged upstream's edit to $f (clean)"
+            else
+              stop="$stop $f"
+              echo "::group::conflicts in $f (ours / recorded base / upstream)"
+              git merge-file -p --diff3 -L ours -L base -L upstream "$T/ours" "$T/base" "$T/upstream" \
+                | awk '/^<<<<<<< /{c=1} c{print NR": "$0} /^>>>>>>> /{c=0}' || true
+              echo "::endgroup::"
+            fi
           done
-          if [ -n "$drift" ]; then
-            echo "::error::sunnypilot changed mod-managed file(s) since the recorded base:$drift - merge by hand, update $MANIFEST, and push."
+          if [ -n "$stop" ]; then
+            echo "::error::sunnypilot changed mod-managed file(s) since the recorded base and they need a hand merge:$stop - merge by hand, update $MANIFEST, and push."
             exit 1
           fi
 
@@ -90,7 +118,7 @@ jobs:
           git read-tree "$NEW"
           for f in $FILES; do
             mode=$(git ls-tree "$OLD_HEAD" -- "$f" | awk '{print $1}')
-            blob=$(git rev-parse "$OLD_HEAD:$f")
+            blob=${merged[$f]:-$(git rev-parse "$OLD_HEAD:$f")}
             git update-index --add --cacheinfo "$mode,$blob,$f"
           done
           git show "HEAD:$MANIFEST" | jq --arg b "$NEW" '.base = $b' > /tmp/manifest.json
@@ -106,6 +134,11 @@ jobs:
             exit 0
           fi
           MSG=$(printf 'vision_bsm: port onto sunnypilot staging %s\n\nUpstream tree with the mod overlaid, carried unchanged from %s.\nA merge of both parents, so the branch history stays reachable whether\nupstream advanced or rewrote staging.\n' "${NEW:0:8}" "${OLD_HEAD:0:8}")
+          if [ -n "$drift" ]; then
+            MSG=${MSG/carried unchanged from/carried from}
+            MSG=$(printf '%s\n\nAuto-merged: upstream edited managed file(s) since %s, and a three-way\nmerge into the mod'"'"'s copy was clean:\n%s\n' "$MSG" "${BASE:0:8}" "$(printf '  %s\n' $drift)")
+            { echo "### Auto-merged upstream edits"; printf -- '- `%s`\n' $drift; } >> "$GITHUB_STEP_SUMMARY"
+          fi
           COMMIT=$(printf '%s' "$MSG" | git commit-tree "$TREE" -p "$NEW" -p "$OLD_HEAD")
           git update-ref "refs/heads/$BRANCH" "$COMMIT"
           echo "ported: $COMMIT"
