@@ -109,8 +109,17 @@ class CameraView(Widget):
   def __init__(self, name: str, stream_type: VisionStreamType):
     super().__init__()
     self._name = name
+    # VBSM_VIPC_POOL: one VisionIpcClient per stream, reused for the life of this view.
+    # Each VisionIpcClient takes a msgq reader slot when it is constructed, and msgq
+    # never gives a slot back (msgq_close_queue only munmaps). A new client per camera
+    # switch filled a queue's NUM_READERS=25 slots on long experimental-mode drives.
+    # The next registration then evicts every reader on that queue, and modeld's
+    # non-conflated wide reader loses the wide frame that is already published:
+    # "frames out of sync!" -> skipped frame -> cameraOdometry invalid -> commIssue.
+    # Reusing one client per stream bounds this view to one slot per queue per camerad session.
+    self._clients: dict[VisionStreamType, VisionIpcClient] = {}
     # Primary stream
-    self.client = VisionIpcClient(name, stream_type, conflate=True)
+    self.client = self._get_client(stream_type)
     self._stream_type: VisionStreamType = stream_type
     self.available_streams: list[VisionStreamType] = []
 
@@ -150,6 +159,23 @@ class CameraView(Widget):
 
     ui_state.add_offroad_transition_callback(self._offroad_transition)
 
+  def _get_client(self, stream_type: VisionStreamType) -> VisionIpcClient:
+    client = self._clients.get(stream_type)
+    if client is None:
+      client = VisionIpcClient(self._name, stream_type, conflate=True)
+      self._clients[stream_type] = client
+    return client
+
+  def _release_idle_clients(self) -> None:
+    # Drop pooled clients that are neither on screen nor pending, so they do not keep
+    # the previous camerad session's buffers mapped. Called at the offroad transition and
+    # when the on-screen client reconnects (a new camerad session). A dropped client is
+    # recreated at most once per stream per such event; camerad normally restarts then and
+    # clears every reader slot (msgq_init_publisher).
+    keep = {self._stream_type, self._target_stream_type}
+    for stream_type in [s for s in self._clients if s not in keep]:
+      del self._clients[stream_type]
+
   def _offroad_transition(self):
     # Drain queued SubSocket messages to prevent old frames from showing when going
     # onroad. Qt had a separate thread which drains the VisionIpcClient SubSocket for us.
@@ -157,6 +183,7 @@ class CameraView(Widget):
       while self.client.recv(timeout_ms=0) is not None:
         pass
     self.frame = None
+    self._release_idle_clients()
 
   def _set_placeholder_color(self, color: rl.Color):
     """Set a placeholder color to be drawn when no frame is available."""
@@ -171,11 +198,9 @@ class CameraView(Widget):
 
     cloudlog.debug(f'Preparing switch from {self._stream_type} to {stream_type}')
 
-    if self._target_client:
-      del self._target_client
-
+    # reuse the pooled client for this stream; never construct one per switch (see __init__)
     self._target_stream_type = stream_type
-    self._target_client = VisionIpcClient(self._name, stream_type, conflate=True)
+    self._target_client = self._get_client(stream_type)
     self._switching = True
 
   @property
@@ -198,6 +223,8 @@ class CameraView(Widget):
     self.frame = None
     self.available_streams.clear()
     self.client = None
+    self._target_client = None
+    self._clients.clear()
 
   def __del__(self):
     self.close()
@@ -342,6 +369,7 @@ class CameraView(Widget):
       cloudlog.debug(f"Connected to {self._name} stream: {self._stream_type}, buffers: {self.client.num_buffers}")
       self._initialize_textures()
       self.available_streams = self.client.available_streams(self._name, block=False)
+      self._release_idle_clients()  # VBSM_VIPC_POOL: new camerad session, let idle pooled clients go
 
     return True
 
@@ -366,9 +394,7 @@ class CameraView(Widget):
   def _complete_switch(self) -> None:
     """Instantly switch to target stream."""
     cloudlog.debug(f"Switching to {self._target_stream_type}")
-    # Clean up current resources
-    if self.client:
-      del self.client
+    # The previous client stays in self._clients for the next switch back (see __init__).
 
     # Switch to target
     assert self._target_client is not None and self._target_stream_type is not None
