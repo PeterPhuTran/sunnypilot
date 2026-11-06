@@ -4,8 +4,11 @@ This branch is sunnypilot staging plus a content-ported mod set for a comma four
 force-pushes staging with rewritten history, so the mods are never rebased: a daily GitHub workflow
 overlays the managed files onto the current upstream head as a fresh merge commit, gated by
 `.github/vbsm-base.json` and a battery of verify guards (marker presence, pyflakes undefined-name
-sweep, file-mode parity vs upstream). Any upstream drift in a managed file fails the port loudly
-for a hand-merge — auto-merging modified driving code is how incidents happen.
+sweep, file-mode parity vs upstream). Where upstream edited a managed file, the workflow three-way
+merges that edit into the mod's copy (base = the recorded base's version) and names the file in the
+commit message. A clean merge must still pass the verify battery before it is published. A conflict,
+or a managed file that upstream added or deleted, still fails the port loudly for a hand-merge. (Until
+2026-11-06 any drift stopped the port; dispatch with `auto_merge` off for that rule.)
 
 Deep dives: [VBSM.md](VBSM.md) (blind spot monitor), [CHESTNUT.md](CHESTNUT.md) (eGPU debugging log).
 
@@ -244,6 +247,13 @@ The three-way merge was clean. Upstream added Blendful (`modeld_v2/blendful.py`,
 correction that pulls the model's curvature toward the lane center: `get_action_from_model()` takes a `blendful`
 callback, and modeld publishes seven new `modelDataV2SP` fields. With the param off the callback returns 0.0, so the
 curvature is unchanged. The fork's eGPU code (§4) does not call it and is not changed.
+
+#### Port note — 2026-11-06 onto sunnypilot `78336a54`
+Upstream squashed staging again and changed one line of `modeld.py`, so the daily port stopped from 2026-11-05. For a
+model that outputs an action, the curvature is now the action's lateral acceleration divided by `max(2.5, v_ego)**2`
+(it was `max(1.0, v_ego)**2`), so it is smaller below 2.5 m/s. The merge was clean and carries that line unchanged.
+Upstream also changed `modeld_v2/helpers.py` and `convert_upstream_pkl.py`, which the fork does not manage. This is the
+last hand port for a clean merge: the workflow now does this merge itself (see the top of this file).
 
 ## 4. eGPU (chestnut) integration — `VBSM_GPU_*`
 The enclosure runs from the 12 V accessory outlet, which shaped everything (measured ~0.45 Ω supply
